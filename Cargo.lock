@@ -2025,7 +2025,7 @@ dependencies = [
 [[package]]
 name = "crossbeam-epoch"
 version = "0.9.20"
-source = "git+https://github.com/paulocsanz/crossbeam?rev=e6b6752bef58cf0e365609ea5284de07ec367de6#e6b6752bef58cf0e365609ea5284de07ec367de6"
+source = "git+https://github.com/crossbeam-rs/crossbeam?rev=e6b6752bef58cf0e365609ea5284de07ec367de6#e6b6752bef58cf0e365609ea5284de07ec367de6"
 dependencies = [
  "crossbeam-utils 0.8.22",
 ]
@@ -2068,7 +2068,7 @@ checksum = "22ec99545bb0ed0ea7bb9b8e1e9122ea386ff8a48c0922e43f36d45ab09e0e80"
 [[package]]
 name = "crossbeam-utils"
 version = "0.8.22"
-source = "git+https://github.com/paulocsanz/crossbeam?rev=e6b6752bef58cf0e365609ea5284de07ec367de6#e6b6752bef58cf0e365609ea5284de07ec367de6"
+source = "git+https://github.com/crossbeam-rs/crossbeam?rev=e6b6752bef58cf0e365609ea5284de07ec367de6#e6b6752bef58cf0e365609ea5284de07ec367de6"
 dependencies = [
  "atomic-maybe-uninit",
 ]
