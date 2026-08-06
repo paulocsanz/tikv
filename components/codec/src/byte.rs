@@ -1139,18 +1139,20 @@ mod tests {
                 &base_buffer[prefix_len + encoded_len..]
             );
 
-            // Test `dest` overlaps `src`
+            // Test `dest` overlaps `src` via the in-place API (sound under Stacked
+            // Borrows). Building aliasing `&[u8]` + `&mut [u8]` from the same raw
+            // pointer with from_raw_parts{_mut} is UB and is rejected by Miri.
             let mut buffer = payload_encoded.clone();
-            let output_len = unsafe {
-                let src_ptr = buffer.as_mut_ptr().add(encoded_prefix_len);
-                let slice_len = buffer.len() - encoded_prefix_len;
-                let src = std::slice::from_raw_parts(src_ptr, slice_len);
-                let dest = std::slice::from_raw_parts_mut(src_ptr, slice_len);
-                if is_desc {
-                    MemComparableByteCodec::try_decode_first_desc(src, dest).unwrap()
-                } else {
-                    MemComparableByteCodec::try_decode_first(src, dest).unwrap()
-                }
+            let output_len = if is_desc {
+                MemComparableByteCodec::try_decode_first_in_place_desc(
+                    &mut buffer[encoded_prefix_len..],
+                )
+                .unwrap()
+            } else {
+                MemComparableByteCodec::try_decode_first_in_place(
+                    &mut buffer[encoded_prefix_len..],
+                )
+                .unwrap()
             };
             assert_eq!(output_len.0, encoded_len);
             assert_eq!(output_len.1, payload_len);
