@@ -233,12 +233,16 @@ impl BufferVec {
             if len > 0 {
                 let mut data_write_offset = 0;
                 let mut offsets_write_offset = 0;
+                // One Unique provenance for both ends of the copy (Stacked Borrows).
+                // as_ptr() then as_mut_ptr() on the same allocation invalidates the
+                // shared tag; subsequent ptr::copy would be UB under SB/Miri.
+                let data_base = self.data.as_mut_ptr();
                 for (i, retain) in retain_arr.iter().enumerate().take(len - 1) {
                     if *retain {
                         let write_len = self.offsets[i + 1] - self.offsets[i];
                         std::ptr::copy(
-                            self.data.as_ptr().add(self.offsets[i]),
-                            self.data.as_mut_ptr().add(data_write_offset),
+                            data_base.add(self.offsets[i]),
+                            data_base.add(data_write_offset),
                             write_len,
                         );
                         self.offsets[offsets_write_offset] = data_write_offset;
@@ -250,8 +254,8 @@ impl BufferVec {
                 if retain_arr[len - 1] {
                     let write_len = self.data.len() - self.offsets[len - 1];
                     std::ptr::copy(
-                        self.data.as_ptr().add(self.offsets[len - 1]),
-                        self.data.as_mut_ptr().add(data_write_offset),
+                        data_base.add(self.offsets[len - 1]),
+                        data_base.add(data_write_offset),
                         write_len,
                     );
                     self.offsets[offsets_write_offset] = data_write_offset;
