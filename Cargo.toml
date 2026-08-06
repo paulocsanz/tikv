@@ -203,6 +203,11 @@ tokio = { version = "1.17", features = ["macros", "rt-multi-thread", "time"] }
 zipf = "6.1.0"
 
 [patch.crates-io]
+# Provenance-preserving crossbeam-epoch (AtomicPtr + map_addr) so Miri can
+# track skiplist node pointers. Fork of crossbeam-rs/crossbeam main at the
+# commit that replaced AtomicUsize with AtomicPtr. Drop this when crates.io
+# publishes a release that includes the provenance fix (crossbeam#1181).
+crossbeam-epoch = { git = "https://github.com/paulocsanz/crossbeam", rev = "e6b6752bef58cf0e365609ea5284de07ec367de6", package = "crossbeam-epoch" }
 # TODO: remove this when new raft-rs is published.
 raft = { git = "https://github.com/tikv/raft-rs", branch = "master" }
 raft-proto = { git = "https://github.com/tikv/raft-rs", branch = "master" }

@@ -7,8 +7,9 @@ use core::cmp;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem;
-use core::ops::{Bound, Deref, Index, RangeBounds};
+use core::ops::{Bound, Deref, RangeBounds};
 use core::ptr;
+use core::ptr::NonNull;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
 
 use crossbeam_epoch::{self as epoch, Atomic, Collector, Guard, Shared};
@@ -32,12 +33,42 @@ struct Tower<K, V> {
     pointers: [Atomic<Node<K, V>>; 0],
 }
 
-impl<K, V> Index<usize> for Tower<K, V> {
-    type Output = Atomic<Node<K, V>>;
-    fn index(&self, index: usize) -> &Atomic<Node<K, V>> {
-        // This implementation is actually unsafe since we don't check if the
-        // index is in-bounds. But this is fine since this is only used internally.
-        unsafe { &*(&self.pointers as *const Atomic<Node<K, V>>).add(index) }
+/// A "reference" to a Tower that preserves provenance for accessing the dynamically sized tower.
+///
+/// A regular `&'a Tower<K, V>` would not have permission to access any bytes under Stacked Borrows
+/// since Tower is a placeholder ZST. Raw `NonNull` keeps the parent allocation's provenance;
+/// only the final `&Atomic` is created at the in-bounds offset.
+///
+/// Note: under Tree Borrows this isn't strictly necessary, but the type is used for both models.
+struct TowerRef<'a, K, V> {
+    ptr: NonNull<Tower<K, V>>,
+    _marker: PhantomData<&'a Tower<K, V>>,
+}
+
+impl<K, V> Clone for TowerRef<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<K, V> Copy for TowerRef<'_, K, V> {}
+
+impl<'a, K, V> TowerRef<'a, K, V> {
+    /// # Safety
+    /// Same as `NonNull::as_ref`, except the pointer must be valid for accessing the actual
+    /// size of the tower (not just the ZST placeholder).
+    #[inline]
+    unsafe fn new(ptr: NonNull<Tower<K, V>>) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// Index must be in bounds of the real tower allocation.
+    #[inline]
+    unsafe fn get_level(self, index: usize) -> &'a Atomic<Node<K, V>> {
+        unsafe { &*(self.ptr.as_ptr() as *const Atomic<Node<K, V>>).add(index) }
     }
 }
 
@@ -59,14 +90,35 @@ impl<K, V> Head<K, V> {
             pointers: Default::default(),
         }
     }
-}
 
-impl<K, V> Deref for Head<K, V> {
-    type Target = Tower<K, V>;
-    fn deref(&self) -> &Tower<K, V> {
-        unsafe { &*(self as *const _ as *const Tower<K, V>) }
+    /// Gets a `TowerRef` with provenance covering the full `Head` allocation.
+    #[inline]
+    fn as_tower(&self) -> TowerRef<'_, K, V> {
+        unsafe { TowerRef::new(NonNull::from(self).cast::<Tower<K, V>>()) }
+    }
+
+    /// # Safety
+    /// Index must be in bounds (`< MAX_HEIGHT`).
+    #[inline]
+    unsafe fn get_level(&self, index: usize) -> &Atomic<Node<K, V>> {
+        unsafe { self.pointers.get_unchecked(index) }
     }
 }
+
+/// A "reference" to a Node that preserves provenance for accessing the dynamically sized
+/// tower at the end of the node allocation. Built from `Shared::as_raw()` (not `as_ref()`),
+/// so finalize/dealloc is not blocked by a Frozen tag under Tree Borrows.
+struct NodeRef<'a, K, V> {
+    ptr: NonNull<Node<K, V>>,
+    _marker: PhantomData<&'a Node<K, V>>,
+}
+
+impl<K, V> Clone for NodeRef<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<K, V> Copy for NodeRef<'_, K, V> {}
 
 /// A skip list node.
 ///
@@ -143,42 +195,6 @@ impl<K, V> Node<K, V> {
         (self.refs_and_height.load(Ordering::Relaxed) & HEIGHT_MASK) + 1
     }
 
-    /// Marks all pointers in the tower and returns `true` if the level 0 was not marked.
-    fn mark_tower(&self) -> bool {
-        let height = self.height();
-
-        for level in (0..height).rev() {
-            let tag = unsafe {
-                // We're loading the pointer only for the tag, so it's okay to use
-                // `epoch::unprotected()` in this situation.
-                // TODO(Amanieu): can we use release ordering here?
-                self.tower[level]
-                    .fetch_or(1, Ordering::SeqCst, epoch::unprotected())
-                    .tag()
-            };
-
-            // If the level 0 pointer was already marked, somebody else removed the node.
-            if level == 0 && tag == 1 {
-                return false;
-            }
-        }
-
-        // We marked the level 0 pointer, therefore we removed the node.
-        true
-    }
-
-    /// Returns `true` if the node is removed.
-    #[inline]
-    fn is_removed(&self) -> bool {
-        let tag = unsafe {
-            // We're loading the pointer only for the tag, so it's okay to use
-            // `epoch::unprotected()` in this situation.
-            self.tower[0]
-                .load(Ordering::Relaxed, epoch::unprotected())
-                .tag()
-        };
-        tag == 1
-    }
 
     /// Attempts to increment the reference count of a node and returns `true` on success.
     ///
@@ -217,9 +233,105 @@ impl<K, V> Node<K, V> {
         }
     }
 
+    /// Drops the key and value of a node, then deallocates it.
+    ///
+    /// Takes `*mut Self` (from `as_raw` / `NodeRef`) rather than `&Self`, so under Tree
+    /// Borrows the pointer is not Frozen from a shared reborrow.
+    #[cold]
+    unsafe fn finalize(ptr: *mut Self) {
+        unsafe {
+            // Call destructors: drop the key and the value.
+            ptr::drop_in_place(&mut (*ptr).key);
+            ptr::drop_in_place(&mut (*ptr).value);
+
+            // Finally, deallocate the memory occupied by the node.
+            Self::dealloc(ptr);
+        }
+    }
+}
+
+impl<'a, K, V> NodeRef<'a, K, V> {
+    /// # Safety
+    /// Same as `NonNull::as_ref`, and the pointer must also be valid for the actual
+    /// tower size at the end of the node allocation.
+    #[inline]
+    unsafe fn new(ptr: NonNull<Node<K, V>>) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// See [`Shared::as_ref`]. Builds from `as_raw()` so tower provenance is preserved.
+    #[inline]
+    unsafe fn from_shared(shared: Shared<'a, Node<K, V>>) -> Option<Self> {
+        NonNull::new(shared.as_raw() as *mut Node<K, V>).map(|ptr| unsafe { Self::new(ptr) })
+    }
+
+    /// Creates a `TowerRef` to the atomic pointers at the end of this Node allocation.
+    #[inline]
+    fn as_tower(self) -> TowerRef<'a, K, V> {
+        unsafe {
+            TowerRef::new(NonNull::new_unchecked(
+                ptr::addr_of!((*self.ptr.as_ptr()).tower) as *mut Tower<K, V>,
+            ))
+        }
+    }
+
+    /// # Safety
+    /// Index must be in bounds of this node's tower height.
+    #[inline]
+    unsafe fn get_level(self, index: usize) -> &'a Atomic<Node<K, V>> {
+        unsafe { self.as_tower().get_level(index) }
+    }
+
+    #[inline]
+    fn as_ref(self) -> &'a Node<K, V> {
+        unsafe { self.ptr.as_ref() }
+    }
+
+
+    /// Marks all pointers in the tower and returns `true` if the level 0 was not marked.
+    fn mark_tower(self) -> bool {
+        let height = self.height();
+
+        for level in (0..height).rev() {
+            let tag = unsafe {
+                // We're loading the pointer only for the tag, so it's okay to use
+                // `epoch::unprotected()` in this situation.
+                // TODO(Amanieu): can we use release ordering here?
+                self.get_level(level)
+                    .fetch_or(1, Ordering::SeqCst, epoch::unprotected())
+                    .tag()
+            };
+
+            // If the level 0 pointer was already marked, somebody else removed the node.
+            if level == 0 && tag == 1 {
+                return false;
+            }
+        }
+
+        // We marked the level 0 pointer, therefore we removed the node.
+        true
+    }
+
+    /// Returns `true` if the node is removed.
+    #[inline]
+    fn is_removed(self) -> bool {
+        let tag = unsafe {
+            // We're loading the pointer only for the tag, so it's okay to use
+            // `epoch::unprotected()` in this situation.
+            self.get_level(0)
+                .load(Ordering::Relaxed, epoch::unprotected())
+                .tag()
+        };
+        tag == 1
+    }
+
     /// Decrements the reference count of a node, destroying it if the count becomes zero.
     #[inline]
-    unsafe fn decrement(&self, guard: &Guard) {
+    unsafe fn decrement(self, guard: &Guard) {
         if self
             .refs_and_height
             .fetch_sub(1 << HEIGHT_BITS, Ordering::Release)
@@ -227,14 +339,15 @@ impl<K, V> Node<K, V> {
             == 1
         {
             fence(Ordering::Acquire);
-            unsafe { guard.defer_unchecked(move || Self::finalize(self)) }
+            let ptr = self.ptr.as_ptr();
+            unsafe { guard.defer_unchecked(move || Node::finalize(ptr)) }
         }
     }
 
     /// Decrements the reference count of a node, pinning the thread and destroying the node
     /// if the count become zero.
     #[inline]
-    unsafe fn decrement_with_pin<F>(&self, parent: &SkipList<K, V>, pin: F)
+    unsafe fn decrement_with_pin<F>(self, parent: &SkipList<K, V>, pin: F)
     where
         F: FnOnce() -> Guard,
     {
@@ -247,23 +360,30 @@ impl<K, V> Node<K, V> {
             fence(Ordering::Acquire);
             let guard = &pin();
             parent.check_guard(guard);
-            unsafe { guard.defer_unchecked(move || Self::finalize(self)) }
+            let ptr = self.ptr.as_ptr();
+            unsafe { guard.defer_unchecked(move || Node::finalize(ptr)) }
         }
     }
+}
 
-    /// Drops the key and value of a node, then deallocates it.
-    #[cold]
-    unsafe fn finalize(ptr: *const Self) {
-        let ptr = ptr as *mut Self;
+impl<K, V> Deref for NodeRef<'_, K, V> {
+    type Target = Node<K, V>;
+    #[inline]
+    fn deref(&self) -> &Node<K, V> {
+        self.as_ref()
+    }
+}
 
-        unsafe {
-            // Call destructors: drop the key and the value.
-            ptr::drop_in_place(&mut (*ptr).key);
-            ptr::drop_in_place(&mut (*ptr).value);
-
-            // Finally, deallocate the memory occupied by the node.
-            Self::dealloc(ptr);
-        }
+impl<K, V> fmt::Debug for NodeRef<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("key", &self.key)
+            .field("value", &self.value)
+            .finish()
     }
 }
 
@@ -288,10 +408,10 @@ struct Position<'a, K, V> {
     /// Reference to a node with the given key, if found.
     ///
     /// If this is `Some` then it will point to the same node as `right[0]`.
-    found: Option<&'a Node<K, V>>,
+    found: Option<NodeRef<'a, K, V>>,
 
     /// Adjacent nodes with smaller keys (predecessors).
-    left: [&'a Tower<K, V>; MAX_HEIGHT],
+    left: [TowerRef<'a, K, V>; MAX_HEIGHT],
 
     /// Adjacent nodes with equal or greater keys (successors).
     right: [Shared<'a, Node<K, V>>; MAX_HEIGHT],
@@ -388,7 +508,7 @@ where
     /// Returns the entry with the smallest key.
     pub fn front<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V>> {
         self.check_guard(guard);
-        let n = self.next_node(&self.head, Bound::Unbounded, guard)?;
+        let n = self.next_node(self.head.as_tower(), Bound::Unbounded, guard)?;
         Some(Entry {
             parent: self,
             node: n,
@@ -583,7 +703,9 @@ where
             // Note that we're loading the pointer only to check whether it is null, so it's okay
             // to use `epoch::unprotected()` in this situation.
             while height >= 4
-                && self.head[height - 2]
+                && self
+                    .head
+                    .get_level(height - 2)
                     .load(Ordering::Relaxed, epoch::unprotected())
                     .is_null()
             {
@@ -616,14 +738,14 @@ where
     unsafe fn help_unlink<'a>(
         &'a self,
         pred: &'a Atomic<Node<K, V>>,
-        curr: &'a Node<K, V>,
+        curr: NodeRef<'a, K, V>,
         succ: Shared<'a, Node<K, V>>,
         guard: &'a Guard,
     ) -> Option<Shared<'a, Node<K, V>>> {
         // If `succ` is marked, that means `curr` is removed. Let's try
         // unlinking it from the skip list at this level.
         match pred.compare_exchange(
-            Shared::from(curr as *const _),
+            Shared::from(curr.as_ref() as *const _),
             succ.with_tag(0),
             Ordering::Release,
             Ordering::Relaxed,
@@ -643,13 +765,13 @@ where
     /// node is reached then a search is performed using the given key.
     fn next_node<'a>(
         &'a self,
-        pred: &'a Tower<K, V>,
+        pred: TowerRef<'a, K, V>,
         lower_bound: Bound<&K>,
         guard: &'a Guard,
-    ) -> Option<&'a Node<K, V>> {
+    ) -> Option<NodeRef<'a, K, V>> {
         unsafe {
             // Load the level 0 successor of the current node.
-            let mut curr = pred[0].load_consume(guard);
+            let mut curr = pred.get_level(0).load_consume(guard);
 
             // If `curr` is marked, that means `pred` is removed and we have to use
             // a key search.
@@ -657,11 +779,11 @@ where
                 return self.search_bound(lower_bound, false, guard);
             }
 
-            while let Some(c) = curr.as_ref() {
-                let succ = c.tower[0].load_consume(guard);
+            while let Some(c) = NodeRef::from_shared(curr) {
+                let succ = c.get_level(0).load_consume(guard);
 
                 if succ.tag() == 1 {
-                    if let Some(c) = self.help_unlink(&pred[0], c, succ, guard) {
+                    if let Some(c) = self.help_unlink(pred.get_level(0), c, succ, guard) {
                         // On success, continue searching through the current level.
                         curr = c;
                         continue;
@@ -685,13 +807,13 @@ where
     /// node is reached then a search is performed using the given key.
     fn next_node_acquire(
         &self,
-        pred: &Tower<K, V>,
+        pred: TowerRef<'_, K, V>,
         lower_bound: Bound<&K>,
         guard: &Guard,
     ) -> Option<OwnedEntry<K, V>> {
         unsafe {
             // Load the level 0 successor of the current node.
-            let mut curr = pred[0].load_consume(guard);
+            let mut curr = pred.get_level(0).load_consume(guard);
 
             // If `curr` is marked, that means `pred` is removed and we have to use
             // a key search.
@@ -699,11 +821,11 @@ where
                 return self.search_bound_for_node_acquire(lower_bound, false, guard);
             }
 
-            while let Some(c) = curr.as_ref() {
-                let succ = c.tower[0].load_consume(guard);
+            while let Some(c) = NodeRef::from_shared(curr) {
+                let succ = c.get_level(0).load_consume(guard);
 
                 if succ.tag() == 1 {
-                    if let Some(c) = self.help_unlink(&pred[0], c, succ, guard) {
+                    if let Some(c) = self.help_unlink(pred.get_level(0), c, succ, guard) {
                         // On success, continue searching through the current level.
                         curr = c;
                         continue;
@@ -758,7 +880,7 @@ where
         bound: Bound<&Q>,
         upper_bound: bool,
         guard: &'a Guard,
-    ) -> Option<&'a Node<K, V>>
+    ) -> Option<NodeRef<'a, K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -770,7 +892,9 @@ where
 
                 // Fast loop to skip empty tower levels.
                 while level >= 1
-                    && self.head[level - 1]
+                    && self
+                        .head
+                        .get_level(level - 1)
                         .load(Ordering::Relaxed, guard)
                         .is_null()
                 {
@@ -781,13 +905,13 @@ where
                 let mut result = None;
 
                 // The predecessor node
-                let mut pred = &*self.head;
+                let mut pred = self.head.as_tower();
 
                 while level >= 1 {
                     level -= 1;
 
                     // Two adjacent nodes at the current level.
-                    let mut curr = pred[level].load_consume(guard);
+                    let mut curr = pred.get_level(level).load_consume(guard);
 
                     // If `curr` is marked, that means `pred` is removed and we have to restart the
                     // search.
@@ -797,11 +921,13 @@ where
 
                     // Iterate through the current level until we reach a node with a key greater
                     // than or equal to `key`.
-                    while let Some(c) = curr.as_ref() {
-                        let succ = c.tower[level].load_consume(guard);
+                    while let Some(c) = NodeRef::from_shared(curr) {
+                        let succ = c.get_level(level).load_consume(guard);
 
                         if succ.tag() == 1 {
-                            if let Some(c) = self.help_unlink(&pred[level], c, succ, guard) {
+                            if let Some(c) =
+                                self.help_unlink(pred.get_level(level), c, succ, guard)
+                            {
                                 // On success, continue searching through the current level.
                                 curr = c;
                                 continue;
@@ -829,7 +955,7 @@ where
                         }
 
                         // Move one step forward.
-                        pred = &c.tower;
+                        pred = c.as_tower();
                         curr = succ;
                     }
                 }
@@ -850,7 +976,7 @@ where
                 // The result of this search.
                 let mut result = Position {
                     found: None,
-                    left: [&*self.head; MAX_HEIGHT],
+                    left: [self.head.as_tower(); MAX_HEIGHT],
                     right: [Shared::null(); MAX_HEIGHT],
                 };
 
@@ -859,7 +985,9 @@ where
 
                 // Fast loop to skip empty tower levels.
                 while level >= 1
-                    && self.head[level - 1]
+                    && self
+                        .head
+                        .get_level(level - 1)
                         .load(Ordering::Relaxed, guard)
                         .is_null()
                 {
@@ -867,13 +995,13 @@ where
                 }
 
                 // The predecessor node
-                let mut pred = &*self.head;
+                let mut pred = self.head.as_tower();
 
                 while level >= 1 {
                     level -= 1;
 
                     // Two adjacent nodes at the current level.
-                    let mut curr = pred[level].load_consume(guard);
+                    let mut curr = pred.get_level(level).load_consume(guard);
 
                     // If `curr` is marked, that means `pred` is removed and we have to restart the
                     // search.
@@ -883,11 +1011,13 @@ where
 
                     // Iterate through the current level until we reach a node with a key greater
                     // than or equal to `key`.
-                    while let Some(c) = curr.as_ref() {
-                        let succ = c.tower[level].load_consume(guard);
+                    while let Some(c) = NodeRef::from_shared(curr) {
+                        let succ = c.get_level(level).load_consume(guard);
 
                         if succ.tag() == 1 {
-                            if let Some(c) = self.help_unlink(&pred[level], c, succ, guard) {
+                            if let Some(c) =
+                                self.help_unlink(pred.get_level(level), c, succ, guard)
+                            {
                                 // On success, continue searching through the current level.
                                 curr = c;
                                 continue;
@@ -910,7 +1040,7 @@ where
                         }
 
                         // Move one step forward.
-                        pred = &c.tower;
+                        pred = c.as_tower();
                         curr = succ;
                     }
 
@@ -974,7 +1104,11 @@ where
                 ptr::addr_of_mut!((*n).key).write(key);
                 ptr::addr_of_mut!((*n).value).write(value);
 
-                (Shared::<Node<K, V>>::from(n as *const _), &*n)
+                // NodeRef from the allocation pointer keeps full tower provenance.
+                (
+                    Shared::<Node<K, V>>::from(n as *const _),
+                    NodeRef::new(NonNull::new_unchecked(n)),
+                )
             };
 
             // Optimistically increment `len`.
@@ -982,11 +1116,13 @@ where
 
             loop {
                 // Set the lowest successor of `n` to `search.right[0]`.
-                n.tower[0].store(search.right[0], Ordering::Relaxed);
+                n.get_level(0).store(search.right[0], Ordering::Relaxed);
 
                 // Try installing the new node into the skip list (at level 0).
                 // TODO(Amanieu): can we use release ordering here?
-                if search.left[0][0]
+                if search
+                    .left[0]
+                    .get_level(0)
                     .compare_exchange(
                         search.right[0],
                         node,
@@ -1008,13 +1144,13 @@ where
                 // We failed. Let's search for the key and try again.
                 {
                     // Create a guard that destroys the new node in case search panics.
-                    struct ScopeGuard<K, V>(*const Node<K, V>);
+                    struct ScopeGuard<K, V>(*mut Node<K, V>);
                     impl<K, V> Drop for ScopeGuard<K, V> {
                         fn drop(&mut self) {
                             unsafe { Node::finalize(self.0) }
                         }
                     }
-                    let sg = ScopeGuard(node.as_raw());
+                    let sg = ScopeGuard(node.as_raw() as *mut Node<K, V>);
                     search = self.search_position(&n.key, guard);
                     mem::forget(sg);
                 }
@@ -1026,7 +1162,7 @@ where
                         // let's try returning it as an entry.
                         if let Some(e) = RefEntry::try_acquire(self, r) {
                             // Destroy the new node.
-                            Node::finalize(node.as_raw());
+                            Node::finalize(node.as_raw() as *mut Node<K, V>);
                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
 
                             return e;
@@ -1053,7 +1189,7 @@ where
 
                     // Load the current value of the pointer in the tower at this level.
                     // TODO(Amanieu): can we use relaxed ordering here?
-                    let next = n.tower[level].load(Ordering::SeqCst, guard);
+                    let next = n.get_level(level).load(Ordering::SeqCst, guard);
 
                     // If the current pointer is marked, that means another thread is already
                     // removing the node we've just inserted. In that case, let's just stop
@@ -1089,7 +1225,7 @@ where
                     // operation fails, that means another thread has marked the pointer and we
                     // should stop building the tower.
                     // TODO(Amanieu): can we use release ordering here?
-                    if n.tower[level]
+                    if n.get_level(level)
                         .compare_exchange(next, succ, Ordering::SeqCst, Ordering::SeqCst, guard)
                         .is_err()
                     {
@@ -1103,7 +1239,8 @@ where
 
                     // Try installing the new node at the current level.
                     // TODO(Amanieu): can we use release ordering here?
-                    if pred[level]
+                    if pred
+                        .get_level(level)
                         .compare_exchange(succ, node, Ordering::SeqCst, Ordering::SeqCst, guard)
                         .is_ok()
                     {
@@ -1132,7 +1269,7 @@ where
             // installation, we must repeat the search, which will unlink the new node at that
             // level.
             // TODO(Amanieu): can we use relaxed ordering here?
-            if n.tower[height - 1].load(Ordering::SeqCst, guard).tag() == 1 {
+            if n.get_level(height - 1).load(Ordering::SeqCst, guard).tag() == 1 {
                 self.search_bound(Bound::Included(&n.key), false, guard);
             }
 
@@ -1210,13 +1347,15 @@ where
                     // the `left` and `right` lists.
                     for level in (0..n.height()).rev() {
                         // TODO(Amanieu): can we use relaxed ordering here?
-                        let succ = n.tower[level].load(Ordering::SeqCst, guard).with_tag(0);
+                        let succ = n.get_level(level).load(Ordering::SeqCst, guard).with_tag(0);
 
                         // Try linking the predecessor and successor at this level.
                         // TODO(Amanieu): can we use release ordering here?
-                        if search.left[level][level]
+                        if search
+                            .left[level]
+                            .get_level(level)
                             .compare_exchange(
-                                Shared::from(n as *const _),
+                                Shared::from(n.as_ref() as *const _),
                                 succ,
                                 Ordering::SeqCst,
                                 Ordering::SeqCst,
@@ -1315,20 +1454,25 @@ where
 impl<K, V> Drop for SkipList<K, V> {
     fn drop(&mut self) {
         unsafe {
-            let mut node = self.head[0]
+            // as_raw() reborrows as *const without a shared ref / Frozen tag
+            // (unlike as_ref()), and without consuming the Shared (unlike into_ptr).
+            let mut node = self
+                .head
+                .get_level(0)
                 .load(Ordering::Relaxed, epoch::unprotected())
-                .as_ref();
+                .as_raw() as *mut Node<K, V>;
 
             // Iterate through the whole skip list and destroy every node.
-            while let Some(n) = node {
+            while !node.is_null() {
                 // Unprotected loads are okay because this function is the only one currently using
-                // the skip list.
-                let next = n.tower[0]
-                    .load(Ordering::Relaxed, epoch::unprotected())
-                    .as_ref();
+                // the skip list. Tower access via addr_of keeps allocation provenance.
+                let next = (*NodeRef::new(NonNull::new_unchecked(node))
+                    .get_level(0))
+                .load(Ordering::Relaxed, epoch::unprotected())
+                .as_raw() as *mut Node<K, V>;
 
                 // Deallocate every node.
-                Node::finalize(n);
+                Node::finalize(node);
 
                 node = next;
             }
@@ -1356,13 +1500,17 @@ impl<K, V> IntoIterator for SkipList<K, V> {
             //
             // Unprotected loads are okay because this function is the only one currently using
             // the skip list.
-            let front = self.head[0]
+            let front = self
+                .head
+                .get_level(0)
                 .load(Ordering::Relaxed, epoch::unprotected())
                 .as_raw();
 
             // Clear the skip list by setting all pointers in head to null.
             for level in 0..MAX_HEIGHT {
-                self.head[level].store(Shared::null(), Ordering::Relaxed);
+                self.head
+                    .get_level(level)
+                    .store(Shared::null(), Ordering::Relaxed);
             }
 
             IntoIter {
@@ -1379,7 +1527,7 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 /// not outlive the `SkipList`.
 pub struct Entry<'a: 'g, 'g, K, V> {
     parent: &'a SkipList<K, V>,
-    node: &'g Node<K, V>,
+    node: NodeRef<'g, K, V>,
     guard: &'g Guard,
 }
 
@@ -1391,12 +1539,12 @@ impl<'a: 'g, 'g, K: 'a, V: 'a> Entry<'a, 'g, K, V> {
 
     /// Returns a reference to the key.
     pub fn key(&self) -> &'g K {
-        &self.node.key
+        &self.node.as_ref().key
     }
 
     /// Returns a reference to the value.
     pub fn value(&self) -> &'g V {
-        &self.node.value
+        &self.node.as_ref().value
     }
 
     /// Returns a reference to the parent `SkipList`
@@ -1480,7 +1628,7 @@ where
     /// Returns the next entry in the skip list.
     pub fn next(&self) -> Option<Entry<'a, 'g, K, V>> {
         let n = self.parent.next_node(
-            &self.node.tower,
+            self.node.as_tower(),
             Bound::Excluded(&self.node.key),
             self.guard,
         )?;
@@ -1521,7 +1669,7 @@ where
 /// leaked. This is because releasing the entry requires a `Guard`.
 pub struct RefEntry<'a, K, V> {
     parent: &'a SkipList<K, V>,
-    node: &'a Node<K, V>,
+    node: NodeRef<'a, K, V>,
 }
 
 impl<'a, K: 'a, V: 'a> RefEntry<'a, K, V> {
@@ -1562,17 +1710,21 @@ impl<'a, K: 'a, V: 'a> RefEntry<'a, K, V> {
 
     /// Tries to create a new `RefEntry` by incrementing the reference count of
     /// a node.
+    ///
+    /// Rebinds the node lifetime to that of the skip list (`'a`), matching the
+    /// pre-NodeRef API where a shared ref was cast to the list lifetime after
+    /// a successful refcount bump.
     unsafe fn try_acquire(
         parent: &'a SkipList<K, V>,
-        node: &Node<K, V>,
+        node: NodeRef<'_, K, V>,
     ) -> Option<RefEntry<'a, K, V>> {
         if unsafe { node.try_increment() } {
             Some(RefEntry {
                 parent,
-
-                // We re-bind the lifetime of the node here to that of the skip
-                // list since we now hold a reference to it.
-                node: unsafe { &*(node as *const _) },
+                node: NodeRef {
+                    ptr: node.ptr,
+                    _marker: PhantomData,
+                },
             })
         } else {
             None
@@ -1611,7 +1763,7 @@ impl<K, V> Clone for RefEntry<'_, K, V> {
     fn clone(&self) -> Self {
         unsafe {
             // Incrementing will always succeed since we're already holding a reference to the node.
-            Node::try_increment(self.node);
+            self.node.try_increment();
         }
         Self {
             parent: self.parent,
@@ -1649,14 +1801,14 @@ where
     }
 
     /// Returns the next entry in the skip list.
-    pub fn next(&self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+    pub fn next<'g>(&'g self, guard: &'g Guard) -> Option<RefEntry<'a, K, V>> {
         self.parent.check_guard(guard);
         unsafe {
             let mut n = self.node;
             loop {
                 n = self
                     .parent
-                    .next_node(&n.tower, Bound::Excluded(&n.key), guard)?;
+                    .next_node(n.as_tower(), Bound::Excluded(&n.key), guard)?;
                 if let Some(e) = RefEntry::try_acquire(self.parent, n) {
                     return Some(e);
                 }
@@ -1676,7 +1828,7 @@ where
     }
 
     /// Returns the previous entry in the skip list.
-    pub fn prev(&self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+    pub fn prev<'g>(&'g self, guard: &'g Guard) -> Option<RefEntry<'a, K, V>> {
         self.parent.check_guard(guard);
         unsafe {
             let mut n = self.node;
@@ -1695,8 +1847,8 @@ where
 /// An iterator over the entries of a `SkipList`.
 pub struct Iter<'a: 'g, 'g, K, V> {
     parent: &'a SkipList<K, V>,
-    head: Option<&'g Node<K, V>>,
-    tail: Option<&'g Node<K, V>>,
+    head: Option<NodeRef<'g, K, V>>,
+    tail: Option<NodeRef<'g, K, V>>,
     guard: &'g Guard,
 }
 
@@ -1710,10 +1862,10 @@ where
         self.head = match self.head {
             Some(n) => self
                 .parent
-                .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
+                .next_node(n.as_tower(), Bound::Excluded(&n.key), self.guard),
             None => self
                 .parent
-                .next_node(&self.parent.head, Bound::Unbounded, self.guard),
+                .next_node(self.parent.head.as_tower(), Bound::Unbounded, self.guard),
         };
         if let (Some(h), Some(t)) = (self.head, self.tail) {
             if h.key >= t.key {
@@ -1761,8 +1913,8 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Iter")
-            .field("head", &self.head.map(|n| (&n.key, &n.value)))
-            .field("tail", &self.tail.map(|n| (&n.key, &n.value)))
+            .field("head", &self.head.as_ref().map(|n| (&n.key, &n.value)))
+            .field("tail", &self.tail.as_ref().map(|n| (&n.key, &n.value)))
             .finish()
     }
 }
@@ -1873,8 +2025,8 @@ where
     Q: Ord + ?Sized,
 {
     parent: &'a SkipList<K, V>,
-    head: Option<&'g Node<K, V>>,
-    tail: Option<&'g Node<K, V>>,
+    head: Option<NodeRef<'g, K, V>>,
+    tail: Option<NodeRef<'g, K, V>>,
     range: R,
     guard: &'g Guard,
     _marker: PhantomData<fn() -> Q>, // covariant over `Q`
@@ -1892,13 +2044,13 @@ where
         self.head = match self.head {
             Some(n) => self
                 .parent
-                .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
+                .next_node(n.as_tower(), Bound::Excluded(&n.key), self.guard),
             None => self
                 .parent
                 .search_bound(self.range.start_bound(), false, self.guard),
         };
         if let Some(h) = self.head {
-            let bound = match self.tail {
+            let bound = match self.tail.as_ref() {
                 Some(t) => Bound::Excluded(t.key.borrow()),
                 None => self.range.end_bound(),
             };
@@ -1931,7 +2083,7 @@ where
                 .search_bound(self.range.end_bound(), true, self.guard),
         };
         if let Some(t) = self.tail {
-            let bound = match self.head {
+            let bound = match self.head.as_ref() {
                 Some(h) => Bound::Excluded(h.key.borrow()),
                 None => self.range.start_bound(),
             };
@@ -2105,7 +2257,9 @@ impl<K, V> Drop for IntoIter<K, V> {
             unsafe {
                 // Unprotected loads are okay because this function is the only one currently using
                 // the skip list.
-                let next = (&(*self.node).tower)[0].load(Ordering::Relaxed, epoch::unprotected());
+                let next = NodeRef::new(NonNull::new_unchecked(self.node))
+                    .get_level(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
 
                 // We can safely do this without deferring because references to
                 // keys & values that we give out never outlive the SkipList.
@@ -2136,7 +2290,9 @@ impl<K, V> Iterator for IntoIter<K, V> {
                 //
                 // Unprotected loads are okay because this function is the only one currently using
                 // the skip list.
-                let next = (&(*self.node).tower)[0].load(Ordering::Relaxed, epoch::unprotected());
+                let next = NodeRef::new(NonNull::new_unchecked(self.node))
+                    .get_level(0)
+                    .load(Ordering::Relaxed, epoch::unprotected());
 
                 // Deallocate the current node and move to the next one.
                 Node::dealloc(self.node);
@@ -2194,17 +2350,18 @@ fn below_upper_bound<T: Ord + ?Sized>(bound: &Bound<&T>, other: &T) -> bool {
 /// You *must* call `release` to free this type, otherwise the node will be
 /// leaked. This is because releasing the entry requires a `Guard`.
 struct OwnedEntry<K, V> {
-    node: *const Node<K, V>,
+    /// Full-provenance node pointer (from `NodeRef`), not a shared-ref cast.
+    node: NonNull<Node<K, V>>,
     released: bool,
 }
 
 impl<K, V> OwnedEntry<K, V> {
     /// Tries to create a new `RefCountedEntry` by incrementing the reference count of
     /// a node.
-    fn try_acquire(node: &Node<K, V>) -> Option<OwnedEntry<K, V>> {
+    fn try_acquire(node: NodeRef<'_, K, V>) -> Option<OwnedEntry<K, V>> {
         if unsafe { node.try_increment() } {
             Some(OwnedEntry {
-                node: node as *const _,
+                node: node.ptr,
                 released: false,
             })
         } else {
@@ -2214,18 +2371,20 @@ impl<K, V> OwnedEntry<K, V> {
 
     /// Returns a reference to the key.
     fn key(&self) -> &K {
-        unsafe { &(*self.node).key }
+        unsafe { &(*self.node.as_ptr()).key }
     }
 
     /// Returns a reference to the value.
     fn value(&self) -> &V {
-        unsafe { &(*self.node).value }
+        unsafe { &(*self.node.as_ptr()).value }
     }
 
     /// Releases the reference on the entry.
     fn release(mut self, guard: &Guard) {
         self.released = true;
-        unsafe { (*self.node).decrement(guard) }
+        unsafe {
+            NodeRef::new(self.node).decrement(guard);
+        }
     }
 }
 
@@ -2315,7 +2474,7 @@ where
         self.cursor = match self.cursor.take() {
             Some(n) => {
                 let next_node = self.list.as_ref().next_node_acquire(
-                    unsafe { &(*n.node).tower },
+                    unsafe { NodeRef::new(n.node).as_tower() },
                     Bound::Excluded(n.key()),
                     guard,
                 );
@@ -2382,7 +2541,7 @@ where
         if let Some(n) = self.cursor.take() {
             n.release(guard);
         }
-        let pred = &self.list.as_ref().head;
+        let pred = self.list.as_ref().head.as_tower();
         self.cursor = self
             .list
             .as_ref()
