@@ -367,10 +367,14 @@ impl MemComparableByteCodec {
             let src_ptr_end = src_ptr.add(src_len);
 
             loop {
-                let src_ptr_next = src_ptr.add(MEMCMP_GROUP_SIZE + 1);
-                if std::intrinsics::unlikely(src_ptr_next > src_ptr_end) {
+                // Check remaining length before forming src_ptr + (GROUP+1). Computing
+                // that pointer when remaining < 9 is OOB arithmetic (UB under Rust/Miri)
+                // even if the pointer is never loaded — same class as #7751 / bench fix.
+                let remaining = src_ptr_end.offset_from(src_ptr) as usize;
+                if std::intrinsics::unlikely(remaining < MEMCMP_GROUP_SIZE + 1) {
                     return Err(ErrorInner::eof().into());
                 }
+                let src_ptr_next = src_ptr.add(MEMCMP_GROUP_SIZE + 1);
 
                 // Copy `MEMCMP_GROUP_SIZE` bytes any way. However we will truncate the returned
                 // length according to padding size if it is the last block.
