@@ -1631,9 +1631,11 @@ mod benches {
                 // it is semantically equivalent to C's memmove()
                 // and the src and dest may overlap
                 // if src == dest do nothing
+                // One Unique provenance for overlapping in-place copy (Stacked Borrows).
+                let base = data.as_mut_ptr();
                 std::ptr::copy(
-                    data.as_ptr().add(read_offset),
-                    data.as_mut_ptr().add(write_offset),
+                    base.add(read_offset),
+                    base.add(write_offset),
                     ENC_GROUP_SIZE,
                 );
             }

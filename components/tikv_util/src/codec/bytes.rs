@@ -241,9 +241,14 @@ pub fn decode_bytes_in_place(data: &mut Vec<u8>, desc: bool) -> Result<()> {
             // it is semantically equivalent to C's memmove()
             // and the src and dest may overlap
             // if src == dest do nothing
+            //
+            // Derive both pointers from one as_mut_ptr() so Stacked/Tree
+            // Borrows provenance stays valid when the ranges alias (in-place
+            // decode). as_ptr() then as_mut_ptr() invalidates the shared tag.
+            let base = data.as_mut_ptr();
             ptr::copy(
-                data.as_ptr().add(read_offset),
-                data.as_mut_ptr().add(write_offset),
+                base.add(read_offset),
+                base.add(write_offset),
                 ENC_GROUP_SIZE,
             );
         }
