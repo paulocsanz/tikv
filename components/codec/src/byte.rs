@@ -1405,7 +1405,10 @@ mod benches {
             let src_ptr_end = src_ptr.add(src.len());
             let dest_ptr_end = dest_ptr.add(dest.len());
 
-            while src_ptr <= src_ptr_end {
+            // Same group loop as before, but never advance src after the empty
+            // terminator group (remaining==0). That advance was past one-past-the-end
+            // and is UB (same class as tikv#7751). See break conditions below.
+            loop {
                 // We needs to write GROUP_SIZE + 1 bytes then, so we assert a bound.
                 assert!(
                     dest_ptr.add(super::MEMCMP_GROUP_SIZE + 1) <= dest_ptr_end,
@@ -1425,15 +1428,83 @@ mod benches {
                         padding_size,
                     );
                 }
-                src_ptr = src_ptr.add(super::MEMCMP_GROUP_SIZE);
                 dest_ptr = dest_ptr.add(super::MEMCMP_GROUP_SIZE);
 
                 let padding_marker = !(padding_size as u8);
                 dest_ptr.write(padding_marker);
                 dest_ptr = dest_ptr.add(1);
+
+                // Termination rules for mem-comparable groups:
+                // - remaining == 0: we just wrote the empty all-padding terminator → done
+                // - remaining < GROUP_SIZE: last data group had padding > 0 → done
+                // - remaining == GROUP_SIZE: last data group had padding 0 (marker 0xFF);
+                //   still need one more iteration for the empty terminator. Advance to end
+                //   (one-past-the-end is allowed); do NOT advance again after remaining==0.
+                // - remaining > GROUP_SIZE: more full groups remain
+                //
+                // Pre-fix always did src_ptr.add(GROUP_SIZE) after every group, including
+                // after remaining==0, which steps past one-past-the-end → UB under Miri.
+                if remaining_size == 0 || remaining_size < super::MEMCMP_GROUP_SIZE {
+                    break;
+                }
+                src_ptr = src_ptr.add(super::MEMCMP_GROUP_SIZE);
             }
 
             dest_ptr.offset_from(dest.as_mut_ptr()) as usize
+        }
+    }
+
+    /// Miri soundness regression for OOB `ptr::add` in the naive encode helper.
+    ///
+    /// # Unsoundness (pre-fix)
+    ///
+    /// The naive loop always advanced `src_ptr` by `MEMCMP_GROUP_SIZE` after every
+    /// group, including the final padded group:
+    ///
+    /// ```ignore
+    /// while src_ptr <= src_ptr_end {
+    ///     // encode group ...
+    ///     src_ptr = src_ptr.add(MEMCMP_GROUP_SIZE); // can go past one-past-the-end
+    /// }
+    /// ```
+    ///
+    /// When `src.len()` is a multiple of the group size (e.g. 8, 16, 1000), after the
+    /// last data group `src_ptr` is already at one-past-the-end. The next `add(8)`
+    /// produces a pointer **beyond** one-past-the-end → UB under Rust's in-bounds
+    /// pointer arithmetic rules (same class as historical codec Miri bugs / #7751).
+    /// Intermediate OOB pointers are UB even without a later load/store.
+    ///
+    /// # How this test proves it
+    ///
+    /// Under Miri with the pre-fix code this test fails with:
+    /// `Undefined Behavior: in-bounds pointer arithmetic failed: attempting to
+    /// offset pointer by 8 bytes, but got alloc+0x... which is at or beyond the
+    /// end of the allocation of size N bytes`
+    /// at `src_ptr.add(MEMCMP_GROUP_SIZE)`.
+    ///
+    /// Critical lengths are multiples of `MEMCMP_GROUP_SIZE` (8). We also check
+    /// empty and non-multiples, and assert equality with production `encode_all`.
+    ///
+    /// Run: `cargo +nightly miri test -p codec -- miri_soundness_mem_comparable_encode_all_naive`
+    #[test]
+    fn miri_soundness_mem_comparable_encode_all_naive() {
+        // 0 / 8 / 16 / 1000: multiples of group size are the OOB trigger cases.
+        // 1 / 7 / 9 / 15: non-multiples still exercise the final partial group.
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 64, 1000] {
+            let src = vec![0xABu8; len];
+            let enc_len = super::MemComparableByteCodec::encoded_len(len);
+            let mut dest = vec![0u8; enc_len];
+            let n = mem_comparable_encode_all_naive(src.as_slice(), dest.as_mut_slice());
+
+            let mut expected = vec![0u8; enc_len];
+            let e = super::MemComparableByteCodec::encode_all(src.as_slice(), expected.as_mut_slice());
+            assert_eq!(n, e, "naive encoded length mismatch for len={}", len);
+            assert_eq!(
+                &dest[..n],
+                &expected[..e],
+                "naive encoded bytes mismatch for len={}",
+                len
+            );
         }
     }
 
