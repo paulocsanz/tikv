@@ -1,3 +1,5 @@
+// Copyright 2024 TiKV Project Authors. Licensed under Apache-2.0.
+
 use std::{
     collections::{
         BTreeMap,
@@ -36,6 +38,17 @@ use std::{
 /// the compaction filter in real time. For example, if a region is migrated
 /// out, split, and then migrated back, the compaction filter might hold the old
 /// region-id while the apply-snapshot-ingest process holds the new region-id.
+///
+/// # Memory reclamation (Miri / Stacked & Tree Borrows)
+///
+/// `RangeLatchGuard` holds a `MutexGuard` that points into an `Arc<Mutex<()>>`
+/// stored in the map. Freeing that `Arc` **inside** `Drop` of the guard is
+/// undefined under Stacked Borrows and Tree Borrows (the dropped value
+/// *protects* the Mutex allocation for the duration of Drop).
+///
+/// We therefore **retire** the `Arc` to `retired` on release and only drop it
+/// later from `acquire` / `Drop for RangeLatch` — never while a
+/// `RangeLatchGuard` is being destroyed.
 #[derive(Debug, Default)]
 pub struct RangeLatch {
     /// A BTreeMap storing active range latches.
@@ -45,13 +58,24 @@ pub struct RangeLatch {
     ///   - `(Vec<u8>, Vec<u8>)`: The actual range definition (start_key,
     ///     end_key).
     range_latches: Mutex<BTreeMap<Vec<u8>, (Arc<Mutex<()>>, (Vec<u8>, Vec<u8>))>>,
+    /// Mutex Arcs removed from the map but not yet freed (see module note).
+    retired: Mutex<Vec<Arc<Mutex<()>>>>,
 }
 
 impl RangeLatch {
     pub fn new() -> Self {
         Self {
             range_latches: Mutex::new(BTreeMap::new()),
+            retired: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drop Arcs retired by released guards. Safe only when no
+    /// `RangeLatchGuard` for those Arcs is mid-Drop (call from `acquire` or
+    /// `Drop for RangeLatch`).
+    fn reclaim_retired(&self) {
+        let mut retired = self.retired.lock().unwrap();
+        retired.clear();
     }
 
     /// Acquires a range latch for the specified `[start_key, end_key)`.
@@ -74,6 +98,9 @@ impl RangeLatch {
     /// Deadlocks cannot occur in the current scenario, as each caller thread
     /// holds at most one lock at a time.
     pub fn acquire(self: &Arc<Self>, start_key: Vec<u8>, end_key: Vec<u8>) -> RangeLatchGuard<'_> {
+        // Free mutexes from previously released guards (outside any Guard Drop).
+        self.reclaim_retired();
+
         loop {
             let mut range_latches = self.range_latches.lock().unwrap();
 
@@ -101,10 +128,9 @@ impl RangeLatch {
                 // the type.
                 // `_mutex_guard` points to the `Mutex<()>`
                 // We need to make sure it will be dropped before the
-                // `Arc<Mutex<()>>` and the `RangeLatch` while `drop`.
-                // Then we can make sure the mutex guard doesn't point to
-                // released memory.
-                // We use `ManuallyDrop` to promise it.
+                // `Arc<Mutex<()>>` is freed. Free is deferred via `retired`
+                // (see `Drop for RangeLatchGuard` and `reclaim_retired`).
+                // We use `ManuallyDrop` so unlock runs before map remove.
 
                 #[allow(clippy::missing_transmute_annotations)]
                 let mutex_guard = unsafe { std::mem::transmute(mutex_guard) };
@@ -125,6 +151,13 @@ impl RangeLatch {
     }
 }
 
+impl Drop for RangeLatch {
+    fn drop(&mut self) {
+        // No live guards: safe to free any retired mutexes.
+        self.reclaim_retired();
+    }
+}
+
 /// A guard that holds the range latch.
 #[derive(Debug)]
 pub struct RangeLatchGuard<'a> {
@@ -132,8 +165,8 @@ pub struct RangeLatchGuard<'a> {
     /// Hold the mutex guard to prevent concurrent access to the same range.
     ///
     /// Use `ManuallyDrop` to promise:
-    /// `_mutex_guard` will be dropped before the `Arc<Mutex<()>>` and the
-    /// `RangeLatch` while `drop`.
+    /// `_mutex_guard` will be dropped before the `Arc<Mutex<()>>` is retired
+    /// (and later freed outside this Drop).
     _mutex_guard: ManuallyDrop<std::sync::MutexGuard<'a, ()>>,
     /// Holds a reference to RangeLatch to release the latch when the guard is
     /// dropped.
@@ -144,14 +177,16 @@ impl Drop for RangeLatchGuard<'_> {
     fn drop(&mut self) {
         // Safety: we call `ManuallyDrop::drop` to drop the mutex guard
         // once and only once.
-        // So `_mutex_guard` will be released earlier than the
-        // `Arc<Mutex<()>>`. We drop `_mutex_guard` by hand, so dropping order
-        // depends on declaration order no longer matters.
         unsafe { ManuallyDrop::drop(&mut self._mutex_guard) };
         let mut range_latches = self.handle.range_latches.lock().unwrap();
-        // `range_latches.remove(&self.start_key);` will cause
-        // `Arc<Mutex()>>` dropped.
-        range_latches.remove(&self.start_key);
+        // Remove from the active map so new acquires can take the range, but
+        // do **not** free the Arc here: free under Drop-protect of a value
+        // that held MutexGuard into that Mutex is UB under Stacked/Tree
+        // Borrows. Retire for later reclaim_retired().
+        if let Some((arc, _)) = range_latches.remove(&self.start_key) {
+            drop(range_latches);
+            self.handle.retired.lock().unwrap().push(arc);
+        }
     }
 }
 
@@ -160,8 +195,8 @@ mod tests {
     use std::{
         collections::HashSet,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         },
         thread,
         time::Duration,
@@ -292,27 +327,40 @@ mod tests {
         concurrent_random_ranges_test(100, 5);
     }
 
-    /// Miri regression: free last `Arc<Mutex<()>>` inside `Drop` of
-    /// `RangeLatchGuard` is undefined under Stacked Borrows / Tree Borrows
-    /// (allocation still strongly protected by the value being dropped).
+    /// After many acquire/release cycles, retired list is reclaimed on acquire
+    /// and empty after final Drop of the latch.
+    #[test]
+    fn test_retired_reclaimed_on_acquire_and_drop() {
+        let latch = Arc::new(RangeLatch::new());
+        for i in 0..50u8 {
+            let g = latch.acquire(vec![i], vec![i.saturating_add(1)]);
+            drop(g);
+            // Next acquire drains retired from previous release.
+            assert!(
+                latch.retired.lock().unwrap().len() <= 1,
+                "retired should drain at start of acquire"
+            );
+        }
+        // One last release leaves up to one retired Arc until Drop.
+        let g = latch.acquire(vec![0], vec![1]);
+        drop(g);
+        drop(latch);
+    }
+
+    /// Miri regression for RangeLatch Guard Drop free / deferred freelist.
     ///
-    /// # Unsoundness (current production / upstream master)
+    /// # Unsoundness (pre-fix)
     ///
-    /// `Drop for RangeLatchGuard` does:
-    /// 1. `ManuallyDrop::drop` on the `MutexGuard` (unlock)
-    /// 2. `range_latches.remove(...)` → drop last `Arc` → free the `Mutex`
-    ///
-    /// Step 2 runs inside `drop(guard)`. Miri reports:
+    /// Freeing the last `Arc<Mutex<()>>` inside `Drop` of `RangeLatchGuard`
+    /// is undefined under Stacked Borrows / Tree Borrows (allocation still
+    /// strongly protected by the value being dropped). Miri reports
     /// `Undefined Behavior: ... strongly protected` at `Arc::drop_slow`.
     ///
     /// # How this test proves it
     ///
-    /// Under Miri with unfixed code this test **fails** with the error above.
-    /// Native `cargo test` passes — the bug is invisible without an aliasing
-    /// model.
-    ///
-    /// With deferred retire + reclaim outside Guard Drop (fork fix branch),
-    /// Miri accepts this test.
+    /// Under Miri with free-in-Drop this test **fails**. With deferred retire
+    /// + reclaim outside Guard Drop (this PR), Miri accepts it. Native
+    /// `cargo test` passes either way.
     ///
     /// Run:
     /// ```text
