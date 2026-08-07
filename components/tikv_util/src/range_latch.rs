@@ -43,12 +43,17 @@ use std::{
 ///
 /// `RangeLatchGuard` holds a `MutexGuard` that points into an `Arc<Mutex<()>>`
 /// stored in the map. Freeing that `Arc` **inside** `Drop` of the guard is
-/// undefined under Stacked Borrows and Tree Borrows (the dropped value
-/// *protects* the Mutex allocation for the duration of Drop).
+/// undefined under Stacked Borrows and Tree Borrows: the guard value passed to
+/// `drop` keeps the Mutex allocation *strongly protected* until the drop frame
+/// returns, and no code — this thread or any other — may deallocate it before
+/// then.
 ///
-/// We therefore **retire** the `Arc` to `retired` on release and only drop it
-/// later from `acquire` / `Drop for RangeLatch` — never while a
-/// `RangeLatchGuard` is being destroyed.
+/// We therefore **retire** the `Arc` to a thread-local list on release and
+/// only drop it later, from the same thread's next `acquire` or at thread
+/// exit. Both happen strictly after that thread's guard-drop frame has
+/// returned. A shared (cross-thread) retire list would not be enough: another
+/// thread draining it can still deallocate while the retiring thread is
+/// inside `drop`, which Miri flags under concurrent schedules.
 #[derive(Debug, Default)]
 pub struct RangeLatch {
     /// A BTreeMap storing active range latches.
@@ -58,24 +63,30 @@ pub struct RangeLatch {
     ///   - `(Vec<u8>, Vec<u8>)`: The actual range definition (start_key,
     ///     end_key).
     range_latches: Mutex<BTreeMap<Vec<u8>, (Arc<Mutex<()>>, (Vec<u8>, Vec<u8>))>>,
-    /// Mutex Arcs removed from the map but not yet freed (see module note).
-    retired: Mutex<Vec<Arc<Mutex<()>>>>,
+}
+
+thread_local! {
+    /// Mutex Arcs retired by guards released on **this** thread, not yet
+    /// freed (see module note). Drained at this thread's next `acquire`
+    /// or at thread exit — never while a guard-drop frame still protects
+    /// the allocation.
+    static RETIRED: std::cell::RefCell<Vec<Arc<Mutex<()>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl RangeLatch {
     pub fn new() -> Self {
         Self {
             range_latches: Mutex::new(BTreeMap::new()),
-            retired: Mutex::new(Vec::new()),
         }
     }
 
-    /// Drop Arcs retired by released guards. Safe only when no
-    /// `RangeLatchGuard` for those Arcs is mid-Drop (call from `acquire` or
-    /// `Drop for RangeLatch`).
+    /// Drop Arcs retired by guards previously released **on this thread**.
+    /// Sound because of same-thread sequencing: the guard-drop frames that
+    /// retired them have already returned. Retirees of other threads are
+    /// never touched here.
     fn reclaim_retired(&self) {
-        let mut retired = self.retired.lock().unwrap();
-        retired.clear();
+        let _ = RETIRED.try_with(|r| r.borrow_mut().clear());
     }
 
     /// Acquires a range latch for the specified `[start_key, end_key)`.
@@ -98,7 +109,8 @@ impl RangeLatch {
     /// Deadlocks cannot occur in the current scenario, as each caller thread
     /// holds at most one lock at a time.
     pub fn acquire(self: &Arc<Self>, start_key: Vec<u8>, end_key: Vec<u8>) -> RangeLatchGuard<'_> {
-        // Free mutexes from previously released guards (outside any Guard Drop).
+        // Free mutexes retired by guards this thread released earlier; their
+        // drop frames have returned, so deallocation is safe here.
         self.reclaim_retired();
 
         loop {
@@ -128,7 +140,7 @@ impl RangeLatch {
                 // the type.
                 // `_mutex_guard` points to the `Mutex<()>`
                 // We need to make sure it will be dropped before the
-                // `Arc<Mutex<()>>` is freed. Free is deferred via `retired`
+                // `Arc<Mutex<()>>` is freed. Free is deferred via `RETIRED`
                 // (see `Drop for RangeLatchGuard` and `reclaim_retired`).
                 // We use `ManuallyDrop` so unlock runs before map remove.
 
@@ -148,13 +160,6 @@ impl RangeLatch {
                 let _guard = mutex.lock().unwrap();
             }
         }
-    }
-}
-
-impl Drop for RangeLatch {
-    fn drop(&mut self) {
-        // No live guards: safe to free any retired mutexes.
-        self.reclaim_retired();
     }
 }
 
@@ -180,12 +185,21 @@ impl Drop for RangeLatchGuard<'_> {
         unsafe { ManuallyDrop::drop(&mut self._mutex_guard) };
         let mut range_latches = self.handle.range_latches.lock().unwrap();
         // Remove from the active map so new acquires can take the range, but
-        // do **not** free the Arc here: free under Drop-protect of a value
-        // that held MutexGuard into that Mutex is UB under Stacked/Tree
-        // Borrows. Retire for later reclaim_retired().
+        // do **not** free the Arc here: this drop frame keeps the Mutex
+        // allocation strongly protected (see module note). Park it on this
+        // thread's retire list instead; it is freed at this thread's next
+        // `acquire` or at thread exit.
         if let Some((arc, _)) = range_latches.remove(&self.start_key) {
             drop(range_latches);
-            self.handle.retired.lock().unwrap().push(arc);
+            match RETIRED.try_with(|r| r.borrow_mut().push(arc.clone())) {
+                // The list holds the surviving reference; dropping `arc`
+                // here only decrements the count and cannot deallocate.
+                Ok(()) => drop(arc),
+                // TLS already destroyed (guard dropped during thread
+                // teardown): leak the tiny Mutex rather than free it inside
+                // this protected frame.
+                Err(_) => std::mem::forget(arc),
+            }
         }
     }
 }
@@ -195,8 +209,8 @@ mod tests {
     use std::{
         collections::HashSet,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         thread,
         time::Duration,
@@ -327,22 +341,27 @@ mod tests {
         concurrent_random_ranges_test(100, 5);
     }
 
-    /// After many acquire/release cycles, retired list is reclaimed on acquire
-    /// and empty after final Drop of the latch.
+    /// Each release parks exactly one Arc on this thread's retire list; the
+    /// next acquire on this thread drains it, so it never grows.
     #[test]
-    fn test_retired_reclaimed_on_acquire_and_drop() {
+    fn test_retired_reclaimed_on_next_acquire() {
+        RETIRED.with(|r| r.borrow_mut().clear());
         let latch = Arc::new(RangeLatch::new());
         for i in 0..50u8 {
             let g = latch.acquire(vec![i], vec![i.saturating_add(1)]);
             drop(g);
-            // Next acquire drains retired from previous release.
-            assert!(
-                latch.retired.lock().unwrap().len() <= 1,
-                "retired should drain at start of acquire"
+            assert_eq!(
+                RETIRED.with(|r| r.borrow().len()),
+                1,
+                "exactly the Arc parked by the release above"
             );
         }
-        // One last release leaves up to one retired Arc until Drop.
         let g = latch.acquire(vec![0], vec![1]);
+        assert_eq!(
+            RETIRED.with(|r| r.borrow().len()),
+            0,
+            "acquire drains this thread's retire list"
+        );
         drop(g);
         drop(latch);
     }
@@ -377,5 +396,33 @@ mod tests {
         let g2 = latch.acquire(vec![10], vec![20]);
         drop(g2);
         drop(latch);
+    }
+
+    /// Cross-thread deferred-free soundness: one thread's `acquire` runs its
+    /// reclaim while the other thread is releasing guards.
+    ///
+    /// With a **shared** retire list drained by any acquirer, thread B can
+    /// deallocate a Mutex while thread A is still inside `drop(g)` for the
+    /// guard that retired it — the allocation is still strongly protected by
+    /// A's drop frame, and Miri flags it under preempting schedules
+    /// (e.g. `-Zmiri-preemption-rate=0.3 -Zmiri-many-seeds=0..24`). With
+    /// per-thread retire lists only the retiring thread frees its own Arcs,
+    /// strictly after its drop frame returned. Ranges are disjoint so the
+    /// threads never block each other.
+    #[test]
+    fn miri_soundness_concurrent_guard_drop_vs_acquire() {
+        let latch = Arc::new(RangeLatch::new());
+        let latch2 = latch.clone();
+        let handle = thread::spawn(move || {
+            for i in 0..20u8 {
+                let g = latch2.acquire(vec![0, i], vec![0, i + 1]);
+                drop(g);
+            }
+        });
+        for i in 0..20u8 {
+            let g = latch.acquire(vec![1, i], vec![1, i + 1]);
+            drop(g);
+        }
+        handle.join().unwrap();
     }
 }
