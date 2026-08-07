@@ -359,4 +359,30 @@ mod test {
         assert_ne!(old_ptr, Arc::as_ptr(guard3.handle()));
         assert!(Arc::ptr_eq(guard3.handle(), &lock_table.get(&key).unwrap()));
     }
+
+    /// Production path: `LockTable` holds only `Weak`. After `lock_key` returns,
+    /// the sole strong `Arc` is in the guard. Dropping it must not UB under Miri
+    /// (free of last Arc under Guard Drop-protect). Free is deferred to the next
+    /// `lock()` on this thread (TLS retire), so the map entry disappears then.
+    ///
+    /// ```text
+    /// cargo +nightly miri test -p concurrency_manager --lib \
+    ///   lock_table::test::miri_soundness_lock_key_last_arc
+    /// ```
+    #[tokio::test]
+    async fn miri_soundness_lock_key_last_arc() {
+        let table = LockTable::default();
+        let key = Key::from_raw(b"prod");
+        for _ in 0..8 {
+            let g = table.lock_key(&key).await;
+            // No concurrent upgrade of the Weak — sole strong Arc is in `g`.
+            drop(g);
+            // Arc is retired (not freed yet); Weak still upgrades until reclaim.
+            assert!(table.get(&key).is_some());
+        }
+        // Next lock reclaims retired Arcs → KeyHandle::drop removes `prod`.
+        let g = table.lock_key(&Key::from_raw(b"reclaim")).await;
+        assert!(table.get(&key).is_none());
+        drop(g);
+    }
 }

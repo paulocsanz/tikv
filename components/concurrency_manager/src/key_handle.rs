@@ -195,8 +195,11 @@ mod tests {
 
     /// Sole-owner Arc in the guard: must not UB under Miri (Drop-protect free).
     ///
-    /// Safe API only: `Arc::new(...).lock().await` + drop. Pre-fix field-order
-    /// free of the last Arc inside Guard Drop fails Miri SB/TB.
+    /// Safe API only: `Arc::new(...).lock().await` + drop. Pre-fix free of the
+    /// last Arc inside Guard Drop fails Miri SB/TB. Same class as RangeLatch R1.
+    ///
+    /// Production uses `LockTable::lock_key` (Weak in map); see
+    /// `lock_table::test::miri_soundness_lock_key_last_arc`.
     ///
     /// ```text
     /// cargo +nightly miri test -p concurrency_manager --lib \
