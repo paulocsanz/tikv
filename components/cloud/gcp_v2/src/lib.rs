@@ -457,6 +457,29 @@ impl GcsStorage {
     }
 }
 
+/// Widen `PutResource<'_>` for `StreamingSource` storage that requires `'static`.
+///
+/// # Class C — dependency contract
+///
+/// This is **not** Class A (safe→UB of our types). Soundness depends on
+/// `google-cloud-storage` consuming the payload only inside the future we
+/// await (no detached background task holding the reader after Ready).
+///
+/// # Safety
+///
+/// 1. The returned `PutResource<'static>` must only be used until
+///    `write_object(...).send_buffered().await` completes.
+/// 2. That await must fully drive `StreamingSource::next` on the payload
+///    before returning (true for google-cloud-storage 1.x buffered upload as
+///    of the version pinned in this workspace — **re-verify on crate bumps**).
+/// 3. Do not store the result in a static / spawn without joining.
+///
+/// Prefer owning buffers (`Cursor<Vec<u8>>`) when the payload is already
+/// owned so no transmute is required.
+unsafe fn put_resource_into_static(reader: PutResource<'_>) -> PutResource<'static> {
+    std::mem::transmute::<PutResource<'_>, PutResource<'static>>(reader)
+}
+
 async fn put_with_client<S>(
     client: &google_cloud_storage::client::Storage<S>,
     bucket: String,
@@ -469,12 +492,10 @@ async fn put_with_client<S>(
 where
     S: StorageStub + 'static,
 {
-    // SAFETY: `put()` awaits `write_object(...).send_buffered()` to
-    // completion before returning, so the widened lifetime never outlives
-    // the original `reader`. In google-cloud-storage 1.0.0, the buffered
-    // upload path consumes the payload inside that future and does not
-    // detach it into a background task.
-    let reader = unsafe { std::mem::transmute::<PutResource<'_>, PutResource<'static>>(reader) };
+    // Class C: lifetime widen for the GCS streaming source. See
+    // `put_resource_into_static` safety docs — re-check on
+    // `google-cloud-storage` upgrades.
+    let reader = unsafe { put_resource_into_static(reader) };
     let payload = PutResourceSource::new(reader, content_length);
     let begin = Instant::now_coarse();
     let mut builder = client
@@ -701,6 +722,37 @@ mod tests {
         {
             future::ready(Ok(Object::new()))
         }
+    }
+
+    /// Class C: owned payload is already `'static` — no transmute needed.
+    /// Prefer this shape when the buffer is fully owned (tests / small objects).
+    #[test]
+    fn put_resource_owned_is_static_without_widen() {
+        use futures::io::Cursor;
+        let owned: PutResource<'static> =
+            PutResource(Box::new(Cursor::new(b"owned-payload".to_vec())));
+        // Type is already 'static; StreamingSource storage does not need transmute.
+        let _src = PutResourceSource::new(owned, 13);
+    }
+
+    /// Class C contract test: widen while the source borrow remains live through
+    /// a completed await of a Ready future (models send_buffered completion).
+    #[tokio::test]
+    async fn miri_soundness_put_resource_widen_await_complete() {
+        use futures::io::Cursor;
+        let data = b"stream-payload";
+        let reader = PutResource(Box::new(Cursor::new(data.as_slice())));
+        // SAFETY: we fully await a ready path that does not retain the reader
+        // past this function (same contract as put_with_client + send_buffered).
+        let static_reader = unsafe { put_resource_into_static(reader) };
+        let mut src = PutResourceSource::new(static_reader, data.len() as u64);
+        let mut total = 0usize;
+        while let Some(chunk) = src.next().await {
+            total += chunk.unwrap().len();
+        }
+        assert_eq!(total, data.len());
+        // `data` still live — contract held.
+        assert_eq!(data, b"stream-payload");
     }
 
     #[test]
