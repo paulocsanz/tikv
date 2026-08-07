@@ -3206,7 +3206,7 @@ mod tests {
         assert_eq!(Decimal::from_f64(123.456).unwrap(), decoded);
     }
 
-    /// Class A: invalid `bool` niche in chunk bytes must not reach `assume_init`.
+    /// Invalid `bool` niche in chunk bytes must not reach `assume_init`.
     /// Miri on the unfixed path: `constructing invalid value at .negative:
     /// encountered 0xff, but expected a boolean`.
     #[test]
