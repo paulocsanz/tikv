@@ -118,14 +118,14 @@ impl<'a> BinaryModifier<'a> {
                 self.to_be_modified_ptr = parent_node.as_ptr();
                 let elem_count = parent_node.get_elem_count();
                 let mut entries = Vec::with_capacity(elem_count + 1);
-                match parent_node.object_search_key(insert_key.as_bytes()) {
+                match parent_node.object_search_key(insert_key.as_bytes())? {
                     Some(insert_idx) => {
                         for i in 0..elem_count {
                             if insert_idx == i {
                                 entries.push((insert_key.as_bytes(), new.as_ref()));
                             }
                             entries.push((
-                                parent_node.object_get_key(i),
+                                parent_node.object_get_key(i)?,
                                 parent_node.object_get_val(i)?,
                             ));
                         }
@@ -133,7 +133,7 @@ impl<'a> BinaryModifier<'a> {
                     None => {
                         for i in 0..elem_count {
                             entries.push((
-                                parent_node.object_get_key(i),
+                                parent_node.object_get_key(i)?,
                                 parent_node.object_get_val(i)?,
                             ));
                         }
@@ -192,7 +192,7 @@ impl<'a> BinaryModifier<'a> {
                     let elem_count = parent_node.get_elem_count();
                     let mut entries = Vec::with_capacity(elem_count - 1);
                     for i in 0..elem_count {
-                        let key = parent_node.object_get_key(i);
+                        let key = parent_node.object_get_key(i)?;
                         if key != remove_key.as_bytes() {
                             entries.push((key, parent_node.object_get_val(i)?));
                         }

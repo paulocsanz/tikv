@@ -158,7 +158,7 @@ pub fn extract_json<'a>(j: JsonRef<'a>, path_legs: &[PathLeg]) -> Result<Vec<Jso
                         }
                     }
                     KeySelection::Key(key) => {
-                        if let Some(idx) = j.object_search_key(key.as_bytes()) {
+                        if let Some(idx) = j.object_search_key(key.as_bytes())? {
                             let val = j.object_get_val(idx)?;
                             append_if_ref_unique(&mut ret, &extract_json(val, sub_path_legs)?)
                         }

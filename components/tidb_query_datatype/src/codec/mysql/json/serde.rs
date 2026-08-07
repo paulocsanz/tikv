@@ -125,7 +125,7 @@ impl Serialize for JsonRef<'_> {
                 let elem_count = self.get_elem_count();
                 let mut map = serializer.serialize_map(Some(elem_count))?;
                 for i in 0..elem_count {
-                    let key = self.object_get_key(i);
+                    let key = self.object_get_key(i).map_err(SerError::custom)?;
                     let val = self.object_get_val(i).map_err(SerError::custom)?;
                     map.serialize_entry(str::from_utf8(key).unwrap(), &val)?;
                 }

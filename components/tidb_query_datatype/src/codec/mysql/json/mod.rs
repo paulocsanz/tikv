@@ -84,7 +84,9 @@ use std::{
 };
 
 use codec::number::{F64_SIZE, I64_SIZE, NumberCodec};
-use constants::{JSON_LITERAL_FALSE, JSON_LITERAL_NIL, JSON_LITERAL_TRUE};
+use constants::{
+    ELEMENT_COUNT_LEN, JSON_LITERAL_FALSE, JSON_LITERAL_NIL, JSON_LITERAL_TRUE,
+};
 use tikv_util::is_even;
 
 pub use self::{
@@ -191,8 +193,14 @@ impl<'a> JsonRef<'a> {
     // Gets the count of Object or Array
     //
     // See `GetElemCount()` in TiDB `json/binary.go`
+    //
+    // Truncated headers return 0 (no panic). Overstated counts are still
+    // possible; per-entry accessors return `CorruptedData` on OOB.
     pub(crate) fn get_elem_count(&self) -> usize {
         assert!((self.type_code == JsonType::Object) | (self.type_code == JsonType::Array));
+        if self.value().len() < ELEMENT_COUNT_LEN {
+            return 0;
+        }
         NumberCodec::decode_u32_le(self.value()) as usize
     }
 
