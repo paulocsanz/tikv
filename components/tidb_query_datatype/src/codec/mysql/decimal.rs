@@ -2291,17 +2291,16 @@ pub trait DecimalDecoder: NumberDecoder {
     /// `read_decimal_from_chunk` decode Decimal encoded by
     /// `write_decimal_to_chunk`.
     ///
-    /// # Validity
-    ///
-    /// Chunk bytes may be untrusted (storage / peer). The on-wire layout is a
-    /// raw `#[repr(C)] Decimal` (40 bytes). `negative` is a Rust `bool`, which
-    /// must be `0` or `1` — any other bit pattern is undefined behavior if
-    /// materialised via `assume_init`. Validate that niche before constructing
-    /// the value (Miri: `encountered 0xff, but expected a boolean`).
+    /// The on-wire layout is a raw `#[repr(C)] Decimal` (40 bytes:
+    /// `int_cnt`, `frac_cnt`, `result_frac_cnt`, `negative: bool`,
+    /// `word_buf: [u32; 9]`). Offset 3 is a Rust `bool`, which must be `0` or
+    /// `1` — any other bit pattern is undefined behavior if materialised via
+    /// `MaybeUninit::assume_init`. Chunk bytes can come from untrusted input
+    /// (e.g. `Column::get_decimal`), so the niche is checked before
+    /// `assume_init`. For a `u8`, `buf[3] > 1` rejects every invalid pattern.
     fn read_decimal_from_chunk(&mut self) -> Result<Decimal> {
         let buf = self.read_bytes(DECIMAL_STRUCT_SIZE)?;
-        // Layout: int_cnt, frac_cnt, result_frac_cnt, negative, word_buf[9].
-        // Offset 3 is `negative: bool` — reject invalid niches.
+        // Offset 3 is `negative: bool` — only 0/1 are valid niches.
         if buf[3] > 1 {
             return Err(box_err!(
                 "invalid decimal negative flag in chunk: {}",
@@ -3206,9 +3205,37 @@ mod tests {
         assert_eq!(Decimal::from_f64(123.456).unwrap(), decoded);
     }
 
-    /// Invalid `bool` niche in chunk bytes must not reach `assume_init`.
-    /// Miri on the unfixed path: `constructing invalid value at .negative:
-    /// encountered 0xff, but expected a boolean`.
+    /// Miri soundness regression for invalid `bool` niche in chunk decode.
+    ///
+    /// # Unsoundness (pre-fix)
+    ///
+    /// `read_decimal_from_chunk` copied 40 untrusted bytes into
+    /// `MaybeUninit::<Decimal>` and called `assume_init` with no check that
+    /// offset 3 (`negative: bool`) was `0` or `1`. Safe callers such as
+    /// `Column::get_decimal` can feed arbitrary chunk bytes (library
+    /// unsoundness).
+    ///
+    /// # How this test proves it
+    ///
+    /// Builds a 40-byte buffer with `buf[3] = 0xff` and calls
+    /// `read_decimal_from_chunk`.
+    ///
+    /// Under Miri with the pre-fix code this fails with:
+    /// ```text
+    /// error: Undefined Behavior: constructing invalid value at .negative:
+    ///        encountered 0xff, but expected a boolean
+    ///   --> ... assume_init()
+    /// ```
+    ///
+    /// With the fix, the call returns
+    /// `Err(... invalid decimal negative flag in chunk: 255 ...)` and Miri
+    /// accepts the test. It is also a plain unit test for regular CI.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo +nightly miri test -p tidb_query_datatype --lib \
+    ///   miri_soundness_decimal_chunk_invalid_bool -- --exact
+    /// ```
     #[test]
     fn miri_soundness_decimal_chunk_invalid_bool() {
         let mut bad = vec![0u8; DECIMAL_STRUCT_SIZE];
@@ -3225,6 +3252,17 @@ mod tests {
         );
     }
 
+    /// Miri / unit: valid `bool` niches (`0` and `1`) still decode.
+    ///
+    /// Complements `miri_soundness_decimal_chunk_invalid_bool` so the fix
+    /// does not reject legal encodings. Also covered by `test_chunk_codec`
+    /// (round-trip via `write_decimal_to_chunk`).
+    ///
+    /// Run:
+    /// ```text
+    /// cargo +nightly miri test -p tidb_query_datatype --lib \
+    ///   miri_soundness_decimal_chunk_valid_bools -- --exact
+    /// ```
     #[test]
     fn miri_soundness_decimal_chunk_valid_bools() {
         for neg in [0u8, 1u8] {
