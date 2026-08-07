@@ -291,4 +291,47 @@ mod tests {
     fn test_concurrent_random_ranges_many_threads() {
         concurrent_random_ranges_test(100, 5);
     }
+
+    /// Miri regression: free last `Arc<Mutex<()>>` inside `Drop` of
+    /// `RangeLatchGuard` is undefined under Stacked Borrows / Tree Borrows
+    /// (allocation still strongly protected by the value being dropped).
+    ///
+    /// # Unsoundness (current production / upstream master)
+    ///
+    /// `Drop for RangeLatchGuard` does:
+    /// 1. `ManuallyDrop::drop` on the `MutexGuard` (unlock)
+    /// 2. `range_latches.remove(...)` → drop last `Arc` → free the `Mutex`
+    ///
+    /// Step 2 runs inside `drop(guard)`. Miri reports:
+    /// `Undefined Behavior: ... strongly protected` at `Arc::drop_slow`.
+    ///
+    /// # How this test proves it
+    ///
+    /// Under Miri with unfixed code this test **fails** with the error above
+    /// (reproduces on tikv/tikv master and on this tree before the deferred
+    /// freelist fix). Native `cargo test` passes — the bug is invisible without
+    /// an aliasing model.
+    ///
+    /// With deferred retire + reclaim outside Guard Drop (fork fix branch),
+    /// Miri accepts this test.
+    ///
+    /// Run:
+    /// ```text
+    /// cargo +nightly miri test -p tikv_util --lib \
+    ///   range_latch::tests::miri_soundness_range_latch_guard_drop
+    /// ```
+    ///
+    /// Lighter A/B (verbatim file, no full tikv_util): monorepo
+    /// `determinismo` script `tikv-dst/scripts/miri-upstream-vs-fork-range-latch.sh`.
+    #[test]
+    fn miri_soundness_range_latch_guard_drop() {
+        let latch = Arc::new(RangeLatch::new());
+        {
+            let g = latch.acquire(vec![0], vec![10]);
+            drop(g);
+        }
+        let g2 = latch.acquire(vec![10], vec![20]);
+        drop(g2);
+        drop(latch);
+    }
 }
