@@ -319,9 +319,6 @@ mod tests {
     /// cargo +nightly miri test -p tikv_util --lib \
     ///   range_latch::tests::miri_soundness_range_latch_guard_drop
     /// ```
-    ///
-    /// Lighter A/B (verbatim file, no full tikv_util): monorepo
-    /// `determinismo` script `tikv-dst/scripts/miri-upstream-vs-fork-range-latch.sh`.
     #[test]
     fn miri_soundness_range_latch_guard_drop() {
         let latch = Arc::new(RangeLatch::new());
