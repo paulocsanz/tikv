@@ -2290,8 +2290,27 @@ pub trait DecimalDecoder: NumberDecoder {
 
     /// `read_decimal_from_chunk` decode Decimal encoded by
     /// `write_decimal_to_chunk`.
+    ///
+    /// # Validity
+    ///
+    /// Chunk bytes may be untrusted (storage / peer). The on-wire layout is a
+    /// raw `#[repr(C)] Decimal` (40 bytes). `negative` is a Rust `bool`, which
+    /// must be `0` or `1` — any other bit pattern is undefined behavior if
+    /// materialised via `assume_init`. Validate that niche before constructing
+    /// the value (Miri: `encountered 0xff, but expected a boolean`).
     fn read_decimal_from_chunk(&mut self) -> Result<Decimal> {
         let buf = self.read_bytes(DECIMAL_STRUCT_SIZE)?;
+        // Layout: int_cnt, frac_cnt, result_frac_cnt, negative, word_buf[9].
+        // Offset 3 is `negative: bool` — reject invalid niches.
+        if buf[3] > 1 {
+            return Err(box_err!(
+                "invalid decimal negative flag in chunk: {}",
+                buf[3]
+            ));
+        }
+        // SAFETY: after the bool niche check, every field of Decimal has a
+        // valid bit pattern for its type (u8/bool/[u32; 9]); size is
+        // const-asserted equal to DECIMAL_STRUCT_SIZE.
         let d = unsafe {
             let mut d = mem::MaybeUninit::<Decimal>::uninit();
             let p = d.as_mut_ptr() as *mut u8;
@@ -3185,6 +3204,36 @@ mod tests {
         ];
         let decoded = src.as_slice().read_decimal_from_chunk().unwrap();
         assert_eq!(Decimal::from_f64(123.456).unwrap(), decoded);
+    }
+
+    /// Class A: invalid `bool` niche in chunk bytes must not reach `assume_init`.
+    /// Miri on the unfixed path: `constructing invalid value at .negative:
+    /// encountered 0xff, but expected a boolean`.
+    #[test]
+    fn miri_soundness_decimal_chunk_invalid_bool() {
+        let mut bad = vec![0u8; DECIMAL_STRUCT_SIZE];
+        bad[0] = 1; // int_cnt
+        bad[3] = 0xff; // invalid bool for `negative`
+        let err = bad
+            .as_slice()
+            .read_decimal_from_chunk()
+            .expect_err("invalid negative flag must error, not UB");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("invalid decimal negative flag"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn miri_soundness_decimal_chunk_valid_bools() {
+        for neg in [0u8, 1u8] {
+            let mut buf = vec![0u8; DECIMAL_STRUCT_SIZE];
+            buf[0] = 1;
+            buf[3] = neg;
+            let d = buf.as_slice().read_decimal_from_chunk().unwrap();
+            assert_eq!(d.is_negative(), neg == 1);
+        }
     }
 
     #[test]
