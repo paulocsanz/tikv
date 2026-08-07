@@ -190,12 +190,43 @@ pub trait ChunkRef<'a, T: EvaluableRef<'a>>: Copy + Clone + std::fmt::Debug + Se
     fn phantom_data(self) -> Option<T>;
 }
 
+/// Lifetime-erasing conversion used by coprocessor aggregation update paths.
+///
+/// # Soundness classification (Class B — unsafe contract)
+///
+/// This is **not** a safe public API. Callers must use `unsafe` (or the
+/// `tidb_query_aggr` macros that expand to `unsafe { ... unsafe_into() }`).
+/// Pure safe code cannot invoke `unsafe_into` without an `unsafe` block.
+///
+/// That differs from Class A bugs (e.g. RangeLatch / KeyHandle last-Arc) where
+/// a **safe** method can cause UB. Here, UB only arises if the **lifetime
+/// contract** below is broken inside an `unsafe` region.
+///
+/// # Safety
+///
+/// Implementations use `std::mem::transmute` to widen lifetimes (typically to
+/// `'static`). The caller must ensure:
+///
+/// 1. The referent / buffer behind `self` remains valid for the entire duration
+///    of every use of the returned value.
+/// 2. The returned value is **not** stored past the enclosing aggregation
+///    `update_*` call (the only intended use in TiKV is the
+///    `tidb_query_aggr` macros that pass values into state updates while the
+///    source column / stack data is still live).
+///
+/// Violating (1) or (2) is undefined behavior (use-after-free).
+///
+/// # Miri
+///
+/// Contract-held use is Miri-clean; use-after-free of the source is not.
+/// See monorepo gate `lifetime-static-transmute` / finding
+/// `safe-ub-vs-unsafe-contract.md`.
 pub trait UnsafeRefInto<T> {
     /// # Safety
     ///
-    /// This function uses `std::mem::transmute`.
-    /// The only place that copr uses this function is in
-    /// `tidb_query_aggr`, together with a set of `update` macros.
+    /// See trait-level safety documentation. Uses `mem::transmute` to erase
+    /// lifetimes. Only intended for `tidb_query_aggr` update macros while
+    /// source data remains live for the duration of the update.
     unsafe fn unsafe_into(self) -> T;
 }
 
@@ -442,6 +473,8 @@ impl<A: UnsafeRefInto<B>, B> UnsafeRefInto<Option<B>> for Option<A> {
 }
 
 impl<T: Evaluable + EvaluableRet> UnsafeRefInto<&'static T> for &T {
+    /// # Safety
+    /// `*self` must outlive every use of the returned `&'static T`.
     unsafe fn unsafe_into(self) -> &'static T {
         std::mem::transmute(self)
     }
@@ -503,30 +536,40 @@ impl<'a> EvaluableRef<'a> for BytesRef<'a> {
 }
 
 impl UnsafeRefInto<BytesRef<'static>> for BytesRef<'_> {
+    /// # Safety
+    /// Underlying bytes must outlive every use of the returned `BytesRef`.
     unsafe fn unsafe_into(self) -> BytesRef<'static> {
         std::mem::transmute(self)
     }
 }
 
 impl UnsafeRefInto<JsonRef<'static>> for JsonRef<'_> {
+    /// # Safety
+    /// Underlying JSON buffer must outlive every use of the returned `JsonRef`.
     unsafe fn unsafe_into(self) -> JsonRef<'static> {
         std::mem::transmute(self)
     }
 }
 
 impl UnsafeRefInto<EnumRef<'static>> for EnumRef<'_> {
+    /// # Safety
+    /// Underlying enum storage must outlive every use of the returned `EnumRef`.
     unsafe fn unsafe_into(self) -> EnumRef<'static> {
         std::mem::transmute(self)
     }
 }
 
 impl UnsafeRefInto<SetRef<'static>> for SetRef<'_> {
+    /// # Safety
+    /// Underlying set storage must outlive every use of the returned `SetRef`.
     unsafe fn unsafe_into(self) -> SetRef<'static> {
         std::mem::transmute(self)
     }
 }
 
 impl UnsafeRefInto<VectorFloat32Ref<'static>> for VectorFloat32Ref<'_> {
+    /// # Safety
+    /// Underlying vector storage must outlive every use of the returned ref.
     unsafe fn unsafe_into(self) -> VectorFloat32Ref<'static> {
         std::mem::transmute(self)
     }
@@ -817,5 +860,33 @@ mod tests {
                 Err(_) => assert!(expected.is_none(), "{} to bool should fail", f,),
             }
         }
+    }
+
+    /// Class B contract: `unsafe_into` while the source is live is well-defined.
+    ///
+    /// Run under Miri:
+    /// ```text
+    /// cargo +nightly miri test -p tidb_query_datatype --lib \
+    ///   codec::data_type::tests::miri_soundness_unsafe_ref_into_while_live
+    /// ```
+    #[test]
+    fn miri_soundness_unsafe_ref_into_while_live() {
+        let v: Int = 42;
+        // SAFETY: `v` lives for the entire use of `r`.
+        let r: &'static Int = unsafe { (&v).unsafe_into() };
+        assert_eq!(*r, 42);
+        assert_eq!(v, 42);
+    }
+
+    /// Class B: fat-pointer widen while buffer lives.
+    #[test]
+    fn miri_soundness_bytes_ref_into_while_live() {
+        let owned = b"hello".to_vec();
+        let br = owned.as_slice();
+        // SAFETY: `owned` outlives every use of `s`.
+        let s: BytesRef<'static> = unsafe { br.unsafe_into() };
+        assert_eq!(s, b"hello");
+        // Keep `owned` live through the assertions (do not drop early).
+        assert_eq!(owned.as_slice(), b"hello");
     }
 }

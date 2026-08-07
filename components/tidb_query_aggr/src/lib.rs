@@ -110,6 +110,13 @@ pub trait ConcreteAggrFunctionState: std::fmt::Debug + Send + 'static {
     fn push_result(&self, ctx: &mut EvalContext, target: &mut [VectorValue]) -> Result<()>;
 }
 
+/// Updates aggregation state with a concrete value.
+///
+/// # Safety (Class B — unsafe contract)
+///
+/// Expands to `unsafe { ... $value.unsafe_into() ... }`. The value's referent
+/// must remain valid for the duration of the `update_*` call. See
+/// [`tidb_query_datatype::codec::data_type::UnsafeRefInto`].
 #[macro_export]
 macro_rules! update_concrete {
     ($state:expr, $ctx:expr, $value:expr) => {
@@ -117,6 +124,8 @@ macro_rules! update_concrete {
     };
 }
 
+/// See [`update_concrete`]: Class B — column / chunk data must remain live for
+/// the duration of the update.
 #[macro_export]
 macro_rules! update_vector {
     ($state:expr, $ctx:expr, $physical_values:expr, $logical_rows:expr) => {
@@ -131,6 +140,7 @@ macro_rules! update_vector {
     };
 }
 
+/// See [`update_concrete`]: Class B lifetime contract on `$value`.
 #[macro_export]
 #[allow(clippy::macro_metavars_in_unsafe)]
 macro_rules! update_repeat {
@@ -139,6 +149,7 @@ macro_rules! update_repeat {
     };
 }
 
+/// See [`update_concrete`]: Class B lifetime contract on `$value`.
 #[macro_export]
 macro_rules! update {
     ($state:expr, $ctx:expr, $value:expr) => {
