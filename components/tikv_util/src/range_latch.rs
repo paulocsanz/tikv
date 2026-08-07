@@ -307,10 +307,9 @@ mod tests {
     ///
     /// # How this test proves it
     ///
-    /// Under Miri with unfixed code this test **fails** with the error above
-    /// (reproduces on tikv/tikv master and on this tree before the deferred
-    /// freelist fix). Native `cargo test` passes — the bug is invisible without
-    /// an aliasing model.
+    /// Under Miri with unfixed code this test **fails** with the error above.
+    /// Native `cargo test` passes — the bug is invisible without an aliasing
+    /// model.
     ///
     /// With deferred retire + reclaim outside Guard Drop (fork fix branch),
     /// Miri accepts this test.
