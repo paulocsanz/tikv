@@ -1,12 +1,29 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{cell::UnsafeCell, mem, sync::Arc};
+use std::{
+    cell::{RefCell, UnsafeCell},
+    mem::{self, ManuallyDrop},
+    sync::Arc,
+};
 
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use txn_types::{Key, Lock};
 
 use super::lock_table::LockTable;
+
+thread_local! {
+    /// Arcs retired from `KeyHandleGuard` on this thread, not yet freed.
+    ///
+    /// Freeing the last `Arc<KeyHandle>` **inside** `Drop` of the guard is
+    /// undefined under Stacked/Tree Borrows (the guard value protects the
+    /// Mutex allocation for the whole drop frame). Safe API
+    /// `Arc::new(...).lock().await` + `drop` must not cause UB — so we retire
+    /// the Arc and free it on a later `lock()` on this thread (or leak at TLS
+    /// teardown), same idea as `tikv_util::range_latch`.
+    static RETIRED_HANDLES: RefCell<Vec<Arc<KeyHandle>>> =
+        const { RefCell::new(Vec::new()) };
+}
 
 /// An entry in the in-memory table providing functions related to a specific
 /// key.
@@ -27,17 +44,24 @@ impl KeyHandle {
         }
     }
 
+    fn reclaim_retired() {
+        let _ = RETIRED_HANDLES.try_with(|r| r.borrow_mut().clear());
+    }
+
     pub async fn lock(self: Arc<Self>) -> KeyHandleGuard {
-        // Safety: `_mutex_guard` is declared before `handle_ref` in `KeyHandleGuard`.
-        // So the mutex guard will be released earlier than the `Arc<KeyHandle>`.
-        // Then we can make sure the mutex guard doesn't point to released memory.
+        // Free Arcs retired by earlier guard drops on this thread (outside any
+        // guard Drop-protect frame).
+        Self::reclaim_retired();
+
+        // Safety: `_mutex_guard` is dropped (unlocked) before the Arc is freed
+        // (Arc is retired, not freed, inside Guard Drop; free is deferred).
         let mutex_guard = unsafe {
             #[allow(clippy::missing_transmute_annotations)]
             mem::transmute(self.mutex.lock().await)
         };
         KeyHandleGuard {
-            _mutex_guard: mutex_guard,
-            handle: self,
+            _mutex_guard: ManuallyDrop::new(mutex_guard),
+            handle: ManuallyDrop::new(self),
         }
     }
 
@@ -69,12 +93,10 @@ unsafe impl Sync for KeyHandle {}
 
 /// A `KeyHandle` with its mutex locked.
 pub struct KeyHandleGuard {
-    // It must be declared before `handle` so it will be dropped before
-    // `handle`.
-    _mutex_guard: AsyncMutexGuard<'static, ()>,
-    // It is unsafe to mutate `handle` to point at another `KeyHandle`.
-    // Otherwise `_mutex_guard` can be invalidated.
-    handle: Arc<KeyHandle>,
+    // Dropped explicitly in `Drop` before the Arc is retired.
+    _mutex_guard: ManuallyDrop<AsyncMutexGuard<'static, ()>>,
+    // Dropped via retire list — never free last Arc inside this struct's Drop.
+    handle: ManuallyDrop<Arc<KeyHandle>>,
 }
 
 impl KeyHandleGuard {
@@ -95,8 +117,23 @@ impl Drop for KeyHandleGuard {
     fn drop(&mut self) {
         // We only keep the lock in memory until the write to the underlying
         // store finishes.
-        // The guard can be released after finishes writing.
         *self.handle.lock_store.lock() = None;
+        // Unlock while Arc still keeps the Mutex alive.
+        unsafe { ManuallyDrop::drop(&mut self._mutex_guard) };
+        // Retire Arc: free outside this Drop-protect frame (next lock() or TLS end).
+        let arc = unsafe { ManuallyDrop::take(&mut self.handle) };
+        let mut hold = Some(arc);
+        let parked = RETIRED_HANDLES.try_with(|r| {
+            if let Some(a) = hold.take() {
+                r.borrow_mut().push(a);
+            }
+        });
+        if parked.is_err() {
+            // TLS gone (thread teardown): leak rather than free under protect.
+            if let Some(a) = hold.take() {
+                mem::forget(a);
+            }
+        }
     }
 }
 
@@ -154,5 +191,27 @@ mod tests {
         assert!(table.get(&k).is_some());
         drop(lock_ref2);
         assert!(table.get(&k).is_none());
+    }
+
+    /// Sole-owner Arc in the guard: must not UB under Miri (Drop-protect free).
+    ///
+    /// Safe API only: `Arc::new(...).lock().await` + drop. Pre-fix field-order
+    /// free of the last Arc inside Guard Drop fails Miri SB/TB.
+    ///
+    /// ```text
+    /// cargo +nightly miri test -p concurrency_manager --lib \
+    ///   key_handle::tests::miri_soundness_key_handle_last_arc
+    /// ```
+    #[tokio::test]
+    async fn miri_soundness_key_handle_last_arc() {
+        for _ in 0..8 {
+            let g = Arc::new(KeyHandle::new(Key::from_raw(b"solo"))).lock().await;
+            drop(g);
+        }
+        // Reclaim on a subsequent lock on this thread.
+        let keep = Arc::new(KeyHandle::new(Key::from_raw(b"keep")));
+        let g = keep.clone().lock().await;
+        drop(g);
+        drop(keep);
     }
 }
