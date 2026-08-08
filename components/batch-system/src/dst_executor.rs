@@ -190,6 +190,53 @@ pub fn live_count() -> usize {
     STATE.lock().unwrap().pollers.len()
 }
 
+/// One cooperative harness step under pure-Rust DST:
+/// 1. `step_all_once` — every registered poller once (registration order)
+/// 2. `dst_tick` — advance logical Instant by 1ms + fire SteadyTimer callbacks
+///
+/// Call from the test thread with `set_manual_drive(true)` so the background
+/// driver does not race. Returns how many pollers were stepped.
+pub fn drive_once() -> usize {
+    let stepped = step_all_once();
+    tikv_util::dst_init::dst_tick();
+    stepped
+}
+
+/// Drive up to `max_rounds` of `drive_once`. Stops early when a full round
+/// steps zero pollers **and** a follow-up round after another tick is also idle
+/// (catches timer-generated work that appears one tick later).
+pub fn drive_n(max_rounds: usize) -> usize {
+    let mut total = 0usize;
+    for _ in 0..max_rounds {
+        let n = drive_once();
+        total += n;
+        if n == 0 {
+            // One more logical tick + step to catch late timer work.
+            let n2 = step_all_once();
+            total += n2;
+            if n2 == 0 {
+                break;
+            }
+            tikv_util::dst_init::dst_tick();
+        }
+    }
+    total
+}
+
+/// Pause the background driver and (optionally) re-init the pure-Rust DST
+/// plane so the test thread owns schedule + clock + RNG.
+///
+/// Prefer this at the start of every step-driven scenario.
+pub fn begin_manual_scenario(seed: u64) {
+    set_manual_drive(true);
+    tikv_util::dst_init::dst_init(seed);
+}
+
+/// Resume background driver after a manual scenario (does not reseed).
+pub fn end_manual_scenario() {
+    set_manual_drive(false);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

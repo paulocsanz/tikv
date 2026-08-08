@@ -28,6 +28,6 @@ pub use self::{
 
 #[cfg(feature = "dst")]
 pub use self::dst_executor::{
-    Pollable, is_manual_drive, live_count, register as dst_register_poller, set_manual_drive,
-    step_all_once,
+    Pollable, begin_manual_scenario, drive_n, drive_once, end_manual_scenario, is_manual_drive,
+    live_count, register as dst_register_poller, set_manual_drive, step_all_once,
 };
