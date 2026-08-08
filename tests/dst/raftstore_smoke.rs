@@ -174,9 +174,7 @@ fn bootstrap_3node(seed: u64) -> test_raftstore::Cluster<test_raftstore::NodeClu
 }
 
 /// After hybrid bootstrap, freeze clock/pollers and hard-reseed entropy so the
-/// pure-hold put phase starts from seed-derived PRNG state. Pure-manual
-/// election (no hybrid) was tried and **hangs** in `cluster.run` / election
-/// without wall-coupled progress — see findings/dst-strict-isolation.md.
+/// pure-hold put phase starts from seed-derived PRNG state.
 fn enter_pure_hold_phase(seed: u64) {
     batch_system::set_manual_drive(true);
     time::dst_set_manual_only(true);
@@ -189,6 +187,10 @@ fn enter_pure_hold_phase(seed: u64) {
     tikv_util::dst_rng::dst_set_rng_seed(seed ^ 0xA11C_E_F00D);
     tikv_util::dst_init::dst_reseed_before_phase();
 }
+
+// Note: pure-manual fixed-step bootstrap still hangs inside cluster infrastructure
+// for some configs; SteadyClock-under-logical (tikv_util/timer) is the main
+// 100% lever for pure-hold. Hybrid bootstrap + enter_pure_hold_phase remains default.
 
 /// 3-node + DstNetworkQueue(batch_size=1): every send path sorts then releases.
 /// Hybrid clock + auto poller driver. Proves ordered virtual net + dst seed
@@ -790,6 +792,29 @@ fn test_dst_hard_reseed_pure_hold_drop_kv() {
             ops1.len(),
             ops2.len()
         );
+    }
+}
+
+/// After SteadyClock maps to logical time under `dst`, pure-hold dual-runs with
+/// drops must match KV+app+ops for the residual seed (100% freeze on this path).
+/// Hybrid bootstrap still runs; pure-hold + logical SteadyTimer is the freeze.
+#[test]
+fn test_dst_100_logical_timer_drop_full_freeze() {
+    // Run several dual-runs; all must full-match (not flaky residual).
+    let seeds = [1u64, 0x5d01, 7u64];
+    for &seed in &seeds {
+        let (s1, _, app1, ops1) = run_step_driven_scenario(seed, 2, 15, 0);
+        let (s2, _, app2, ops2) = run_step_driven_scenario(seed, 2, 15, 0);
+        eprintln!(
+            "DST100 seed={seed:#x} ops_len {} vs {} app_eq={}",
+            ops1.len(),
+            ops2.len(),
+            app1 == app2
+        );
+        assert_eq!(s1, s2, "seed={seed:#x} KV");
+        assert!(!s1.contains("=none"), "seed={seed:#x} puts");
+        assert_eq!(app1, app2, "seed={seed:#x} app full freeze");
+        assert_eq!(ops1, ops2, "seed={seed:#x} ops full freeze");
     }
 }
 
