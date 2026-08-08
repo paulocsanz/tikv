@@ -659,6 +659,31 @@ fn test_dst_step_driven_with_delay() {
     }
 }
 
+/// Combined fault plane: seed-stable **drop + delay** together.
+/// Hard: KV + leader. Soft: app residual (documented).
+#[test]
+fn test_dst_step_driven_drop_and_delay() {
+    let seed: u64 = 0xc0fa;
+    let drop_pct = 10u32;
+    let max_delay = 2u32;
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, drop_pct, max_delay);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, drop_pct, max_delay);
+    eprintln!("DST_COMBO stable1: {s1}");
+    eprintln!("DST_COMBO stable2: {s2}");
+    eprintln!("DST_COMBO app1: {app1}");
+    eprintln!("DST_COMBO app2: {app2}");
+    eprintln!("DST_COMBO ops_len1={} ops_len2={}", ops1.len(), ops2.len());
+    assert_eq!(s1, s2, "combo drop+delay KV must match");
+    assert!(!s1.contains("=none"), "puts must land under combo faults: {s1}");
+    assert!(f1.contains("leader=1") && f2.contains("leader=1"));
+    if app1 == app2 {
+        assert_eq!(ops1, ops2);
+        eprintln!("DST_COMBO_NOTE: full freeze under drop+delay seed={seed:#x}");
+    } else {
+        eprintln!("DST_COMBO_NOTE: app residual under drop+delay (KV match)");
+    }
+}
+
 /// Pure-hold + manual drive 3-node: KV + MsgApp path summary bit-match.
 /// Wall-capped put_stepped so a regression cannot hang CI forever.
 #[test]
