@@ -95,17 +95,29 @@ pub fn is_app_path_log_entry(entry: &str) -> bool {
     )
 }
 
+/// One buffered message with optional remaining delay steps.
+struct Buffered {
+    msg: RaftMessage,
+    /// Steps until eligible for `take_sorted` (0 = ready).
+    delay: u32,
+}
+
 /// Virtual network: buffer outbound Raft messages, sort by deterministic key,
 /// release in controlled batches. Optional delivery log for fingerprints.
+///
+/// Delay plane: each inbound message is assigned a seed-stable delay in
+/// `0..=max_delay` **steps** (each `take_sorted` call decrements delays).
 #[derive(Clone)]
 pub struct DstNetworkQueue {
-    buffer: Arc<Mutex<Vec<RaftMessage>>>,
+    buffer: Arc<Mutex<Vec<Buffered>>>,
     /// Auto-release every `batch_size` `before()` calls (0 = hold until step).
     batch_size: usize,
     call_count: Arc<AtomicUsize>,
     /// Log of released messages: "from>to:region:msgtype:term:index"
     log: Arc<Mutex<Vec<String>>>,
     drop_rate_pct: u32,
+    /// Max seed-stable delay steps assigned on ingress (0 = no delay).
+    max_delay: u32,
     rng: Arc<Mutex<SeededRng>>,
     pending_release: Arc<Mutex<Vec<RaftMessage>>>,
     passthrough: Arc<AtomicBool>,
@@ -120,6 +132,7 @@ impl DstNetworkQueue {
             call_count: Arc::new(AtomicUsize::new(0)),
             log: Arc::new(Mutex::new(Vec::new())),
             drop_rate_pct: 0,
+            max_delay: 0,
             rng: Arc::new(Mutex::new(SeededRng::new(seed.wrapping_add(NET_SEED_TAG)))),
             pending_release: Arc::new(Mutex::new(Vec::new())),
             passthrough: Arc::new(AtomicBool::new(false)),
@@ -129,6 +142,12 @@ impl DstNetworkQueue {
 
     pub fn with_drop_rate(mut self, pct: u32) -> Self {
         self.drop_rate_pct = pct.min(100);
+        self
+    }
+
+    /// Seed-stable per-message delay in `0..=max` steps before release.
+    pub fn with_max_delay(mut self, max: u32) -> Self {
+        self.max_delay = max;
         self
     }
 
@@ -144,16 +163,50 @@ impl DstNetworkQueue {
         self.log.lock().unwrap().clear();
     }
 
-    /// Take up to `n` buffered messages in sort order.
+    /// Take up to `n` **ready** buffered messages in sort order.
+    ///
+    /// Each call first decrements remaining delays by 1; only messages with
+    /// `delay == 0` are eligible. Remaining delayed messages stay buffered.
     pub fn take_sorted(&self, n: usize) -> Vec<RaftMessage> {
         let mut buffer = self.buffer.lock().unwrap();
-        buffer.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
-        let take = n.min(buffer.len());
-        buffer.drain(..take).collect()
+        for b in buffer.iter_mut() {
+            if b.delay > 0 {
+                b.delay -= 1;
+            }
+        }
+        // Partition ready vs delayed without reordering delayed relative order.
+        let mut ready: Vec<RaftMessage> = Vec::new();
+        let mut delayed: Vec<Buffered> = Vec::new();
+        for b in buffer.drain(..) {
+            if b.delay == 0 {
+                ready.push(b.msg);
+            } else {
+                delayed.push(b);
+            }
+        }
+        ready.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
+        let take = n.min(ready.len());
+        let out: Vec<_> = ready.drain(..take).collect();
+        // Put unreleased ready msgs back with delay 0 (still eligible next time).
+        for m in ready {
+            delayed.push(Buffered { msg: m, delay: 0 });
+        }
+        *buffer = delayed;
+        out
     }
 
     pub fn pending(&self) -> usize {
         self.buffer.lock().unwrap().len()
+    }
+
+    /// Messages still waiting on delay > 0.
+    pub fn delayed_pending(&self) -> usize {
+        self.buffer
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.delay > 0)
+            .count()
     }
 
     pub fn delivery_log(&self) -> Vec<String> {
@@ -255,7 +308,15 @@ impl Filter for DstNetworkQueue {
 
         {
             let mut buffer = self.buffer.lock().unwrap();
-            buffer.append(msgs);
+            let mut rng = self.rng.lock().unwrap();
+            for m in msgs.drain(..) {
+                let delay = if self.max_delay > 0 {
+                    rng.gen_range(self.max_delay + 1)
+                } else {
+                    0
+                };
+                buffer.push(Buffered { msg: m, delay });
+            }
         }
 
         {
@@ -268,11 +329,9 @@ impl Filter for DstNetworkQueue {
         let count = self.call_count.fetch_add(1, Ordering::Relaxed);
 
         if self.batch_size > 0 {
-            let mut buffer = self.buffer.lock().unwrap();
-            if (count + 1) % self.batch_size == 0 || buffer.len() > 64 {
-                buffer.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
-                let released: Vec<_> = buffer.drain(..).collect();
-                drop(buffer);
+            // Auto-release path: tick delays once, then flush ready msgs.
+            if (count + 1) % self.batch_size == 0 || self.pending() > 64 {
+                let released = self.take_sorted(usize::MAX);
                 msgs.extend(self.record_and_filter(released));
             }
         }
@@ -336,6 +395,27 @@ mod tests {
         assert_eq!(keys_a[0].5, 1);
         assert_eq!(keys_a[1].0, 1);
         assert_eq!(keys_a[1].5, 2);
+    }
+
+    #[test]
+    fn max_delay_is_seed_stable() {
+        fn release_trace(seed: u64) -> Vec<u64> {
+            let net = DstNetworkQueue::new(seed, 0).with_max_delay(3);
+            let mut batch: Vec<_> = (0..6).map(|i| make_msg(1, 2, 1, 1, i)).collect();
+            let _ = net.before(&mut batch);
+            let mut indices = Vec::new();
+            // Enough steps to drain all delayed msgs.
+            for _ in 0..8 {
+                for m in net.take_sorted(usize::MAX) {
+                    indices.push(m.get_message().get_index());
+                }
+            }
+            indices
+        }
+        assert_eq!(release_trace(77), release_trace(77));
+        assert_eq!(release_trace(77).len(), 6);
+        // Different seeds can differ (not required, but likely).
+        let _ = release_trace(78);
     }
 
     #[test]
