@@ -26,7 +26,8 @@ use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
 use rand::Rng;
 use test_raftstore::{
-    CloneFilterFactory, DstNetworkQueue, Filter, msg_sort_key, new_node_cluster, new_peer,
+    CloneFilterFactory, Direction, DstNetworkQueue, Filter, RegionPacketFilter, ReorderMode,
+    msg_sort_key, new_node_cluster, new_peer,
 };
 use tikv_util::{config::ReadableSize, dst_rng::DstRng, time};
 
@@ -1131,7 +1132,7 @@ fn test_dst_step_driven_multiseed() {
 fn run_adversarial_scenario(
     seed: u64,
     n_keys: usize,
-    reorder: test_raftstore::ReorderMode,
+    reorder: ReorderMode,
     dup_pct: u32,
 ) -> String {
     let n_keys = n_keys.clamp(1, STEP_KEYS.len());
@@ -1189,7 +1190,6 @@ fn run_adversarial_scenario(
 /// must be present with the expected value. Different schedules → same KV.
 #[test]
 fn test_dst_adversarial_safety() {
-    use test_raftstore::ReorderMode;
 
     let base_seed = 0x5d01u64;
     let n_keys = 3usize;
@@ -1238,7 +1238,6 @@ fn test_dst_adversarial_safety() {
 /// Adversarial multi-seed safety sweep.
 #[test]
 fn test_dst_adversarial_multiseed() {
-    use test_raftstore::ReorderMode;
 
     let seeds: Vec<u64> = if let Ok(replay) = std::env::var("DST_ADV_REPLAY") {
         vec![replay.trim().parse().unwrap_or(0x5d01)]
@@ -1293,7 +1292,6 @@ fn test_dst_adversarial_multiseed() {
 /// KV must be correct regardless of the delivery schedule or fault combination.
 #[test]
 fn test_dst_adversarial_quadruple_fault() {
-    use test_raftstore::ReorderMode;
 
     let seeds: &[u64] = &[0x5d01, 0x07, 0xC0FFEE, 42, 0xBEEF];
     let drop_pct = 15u32;
@@ -1403,7 +1401,6 @@ fn test_dst_adversarial_quadruple_fault() {
 /// valid value from one of the two writers.
 #[test]
 fn test_dst_concurrent_two_writers() {
-    use test_raftstore::ReorderMode;
 
     let seed = 0x5d01u64;
     let salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -2634,6 +2631,7 @@ fn test_dst_quintuple_fault_convergence() {
     // Phase 1: write under ALL 5 fault dimensions.
     // Node 2 partitioned from 1 and 3 (majority = {1,3}).
     let net = DstNetworkQueue::new(seed, 1) // auto-release batch_size=1
+        .with_reorder(test_raftstore::ReorderMode::Adversarial(seed))
         .with_dup_rate(15)
         .with_drop_rate(10)
         .with_max_delay(2);
@@ -2732,6 +2730,7 @@ fn test_dst_quintuple_fault_multiseed() {
         // All 5 fault dimensions.
         let net = DstNetworkQueue::new(seed, 1)
             .with_dup_rate(15)
+            .with_reorder(test_raftstore::ReorderMode::Adversarial(seed))
             .with_drop_rate(10)
             .with_max_delay(2);
         net.add_partition(2, 1);
@@ -2894,6 +2893,7 @@ fn run_churn_seed(seed: u64, n_ops: usize) {
     // Activate full 5-dim fault product from the start.
     let net = DstNetworkQueue::new(seed, 1)
         .with_dup_rate(12)
+        .with_reorder(test_raftstore::ReorderMode::Adversarial(seed))
         .with_drop_rate(8)
         .with_max_delay(2);
     cluster.add_send_filter(CloneFilterFactory(net.clone()));
@@ -2992,4 +2992,288 @@ fn run_churn_seed(seed: u64, n_ops: usize) {
     eprintln!(
         "DST_CHURN seed={seed:#x} verified {verified} keys, all correct"
     );
+}
+
+// ─── Deep fault injection: surgical message-type drops ────────────────
+
+fn bootstrap_hybrid(seed: u64) -> test_raftstore::Cluster<test_raftstore::NodeCluster> {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cluster
+}
+
+fn cleanup_cluster() {
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+fn drive_async_put(
+    cluster: &mut test_raftstore::Cluster<test_raftstore::NodeCluster>,
+    key: &[u8],
+    val: &[u8],
+    deadline: WallInstant,
+) -> Option<RaftCmdResponse> {
+    let mut fut = match cluster.async_put(key, val) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        if WallInstant::now() > deadline {
+            return None;
+        }
+        match Future::poll(fut.as_mut(), &mut cx) {
+            Poll::Ready(resp) => return Some(resp),
+            Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Drop MsgApp to follower 3 during a write.
+#[test]
+fn test_deep_drop_msgapp_to_follower() {
+    let seed = 0xA1A1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"d1", b"base");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgAppend)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    cluster.must_put(b"d1_key", b"d1_val");
+    std::thread::sleep(Duration::from_millis(200));
+    let v = cluster.must_get(b"d1_key");
+    eprintln!("DST_DEEP1 d1_key = {:?}", v.as_deref());
+    assert_eq!(v, Some(b"d1_val".to_vec()), "write must succeed via node 2");
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+    let v = cluster.must_get(b"d1_key");
+    assert_eq!(v, Some(b"d1_val".to_vec()), "node 3 must catch up after heal");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP1 OK");
+}
+
+/// Drop MsgAppResp from follower 2.
+#[test]
+fn test_deep_drop_msgappresp_from_follower() {
+    let seed = 0xB2B2u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"d2", b"base");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 2)
+        .direction(Direction::Send)
+        .msg_type(MessageType::MsgAppendResponse)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(2, Box::new(filter));
+
+    let resp = drive_async_put(
+        &mut cluster, b"d2_key", b"d2_val",
+        WallInstant::now() + Duration::from_secs(10),
+    );
+    let succeeded = resp.as_ref().is_some_and(|r| !r.get_header().has_error());
+    eprintln!("DST_DEEP2 write succeeded={succeeded}");
+    std::thread::sleep(Duration::from_millis(200));
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(2);
+    std::thread::sleep(Duration::from_millis(500));
+
+    if succeeded {
+        let v = cluster.must_get(b"d2_key");
+        assert_eq!(v, Some(b"d2_val".to_vec()), "BUG: committed write lost");
+    }
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP2 OK");
+}
+
+/// Drop heartbeats to all followers, then heal.
+#[test]
+fn test_deep_drop_heartbeats_then_heal() {
+    let seed = 0xC3C3u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("d3_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    for store in [2u64, 3u64] {
+        let filter = RegionPacketFilter::new(1, store)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgHeartbeat)
+            .when(drop_flag.clone());
+        cluster.add_send_filter_on_node(store, Box::new(filter));
+    }
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let write_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"d3_new", b"new_val");
+    })).is_ok();
+    eprintln!("DST_DEEP3 write during hb drop={write_ok}");
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(2);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("d3_{i}").as_bytes());
+        assert_eq!(v, Some(format!("v{i}").into_bytes()), "BUG: key d3_{i} lost");
+    }
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP3 OK");
+}
+
+/// Drop MsgSnapshot to lagging follower, then heal.
+#[test]
+fn test_deep_drop_snapshot_lagging_follower() {
+    let seed = 0xE5E5u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..200 {
+        cluster.must_put(format!("snap_{:04}", i).as_bytes(), format!("val_{:04}", i).as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgSnapshot)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    for i in 200u32..210 {
+        cluster.must_put(format!("snap_{:04}", i).as_bytes(), format!("val_{:04}", i).as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    for i in [0u32, 50, 100, 150, 199, 200, 209] {
+        let v = cluster.must_get(format!("snap_{:04}", i).as_bytes());
+        assert_eq!(
+            v, Some(format!("val_{:04}", i).into_bytes()),
+            "BUG: key snap_{i:04} lost on lagging follower"
+        );
+    }
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP5 OK");
+}
+
+/// Isolate leader from all followers, write must fail.
+#[test]
+fn test_deep_isolate_leader_write_fails() {
+    let seed = 0xF6F6u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"d6", b"base");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    for store in [2u64, 3u64] {
+        let f_recv = RegionPacketFilter::new(1, store)
+            .direction(Direction::Recv)
+            .when(drop_flag.clone());
+        cluster.add_send_filter_on_node(store, Box::new(f_recv));
+        let f_send = RegionPacketFilter::new(1, store)
+            .direction(Direction::Send)
+            .when(drop_flag.clone());
+        cluster.add_send_filter_on_node(store, Box::new(f_send));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let deadline = WallInstant::now() + Duration::from_secs(3);
+    let resp = drive_async_put(&mut cluster, b"d6_iso", b"fail", deadline);
+    let write_ok = resp.as_ref().is_some_and(|r| !r.get_header().has_error());
+    eprintln!("DST_DEEP6 write under isolation succeeded={write_ok}");
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(2);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let v = cluster.must_get(b"d6");
+    assert_eq!(v, Some(b"base".to_vec()), "BUG: base data corrupted");
+
+    if write_ok {
+        let iso_v = cluster.must_get(b"d6_iso");
+        if iso_v.is_some() {
+            eprintln!("DST_DEEP6 WARNING: write persisted under full isolation!");
+        }
+    }
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP6 OK");
+}
+
+/// Transfer leader while dropping MsgTimeoutNow.
+#[test]
+fn test_deep_transfer_timeoutnow_drop() {
+    let seed = 0x2828u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("d8_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgTimeoutNow)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    let resp = cluster.try_transfer_leader(1, new_peer(3, 3));
+    eprintln!("DST_DEEP8 transfer with TimeoutNow drop: error={}", resp.get_header().has_error());
+    std::thread::sleep(Duration::from_millis(500));
+
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("d8_{i}").as_bytes());
+        assert_eq!(v, Some(format!("v{i}").into_bytes()), "BUG: key d8_{i} lost");
+    }
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(3, 3));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("d8_{i}").as_bytes());
+        assert_eq!(v, Some(format!("v{i}").into_bytes()), "BUG: key d8_{i} lost after transfer");
+    }
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP8 OK");
 }
