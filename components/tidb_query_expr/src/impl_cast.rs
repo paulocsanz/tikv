@@ -1408,9 +1408,13 @@ fn cast_string_as_json(
                 let val: Json = s.parse()?;
                 Ok(Some(val))
             } else {
-                // FIXME: port `JSONBinary` from TiDB to adapt if the bytes is not a valid utf8
-                // string
-                let val = unsafe { String::from_utf8_unchecked(val.to_owned()) };
+                // Soundness: `val` may contain invalid UTF-8 (e.g. from an
+                // attacker-controlled expression constant or corrupt storage).
+                // `String::from_utf8_unchecked` was UB on invalid input; use
+                // `from_utf8_lossy` to replace invalid sequences with U+FFFD
+                // instead of creating an invalid `String`. This matches TiDB's
+                // behavior of treating the bytes as a string without erroring.
+                let val = String::from_utf8_lossy(val).into_owned();
                 Ok(Some(Json::from_string(val)?))
             }
         }
@@ -7068,6 +7072,34 @@ mod tests {
                 input, parse_to_json, expect, result_str
             );
             check_result(Some(&expect), &result, log.as_str());
+        }
+
+        // Soundness regression: invalid UTF-8 in the non-PARSE_TO_JSON path
+        // must not cause UB (was `String::from_utf8_unchecked` before fix).
+        // Invalid byte sequences are replaced with U+FFFD by `from_utf8_lossy`.
+        {
+            let arg_type = FieldType::default(); // not binary-string-like
+            let invalid_utf8: &[u8] = &[0xff, 0xfe, 0xfd, 0x00, 0x80];
+            let args = [RpnStackNode::Scalar {
+                value: &ScalarValue::Bytes(Some(invalid_utf8.to_vec())),
+                field_type: &arg_type,
+            }];
+            let rft = FieldType::default(); // no PARSE_TO_JSON flag
+            let extra = make_extra(&rft);
+            let result = cast_string_as_json(&args, &extra, Some(invalid_utf8));
+            // Should succeed (no UB, no panic) — invalid bytes become U+FFFD.
+            assert!(
+                result.is_ok(),
+                "cast_string_as_json with invalid UTF-8 must not error: {:?}",
+                result
+            );
+            let json = result.unwrap().unwrap();
+            // The resulting JSON string contains replacement chars, not raw bytes.
+            assert!(
+                json.to_string().contains('\u{fffd}'),
+                "expected U+FFFD replacement in: {}",
+                json
+            );
         }
     }
 
