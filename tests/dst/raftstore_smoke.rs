@@ -7,9 +7,12 @@
 // 2. 1-node: same seed → same KV fingerprint (hybrid clock).
 // 3. 3-node: DstNetworkQueue batch_size=1 + hybrid clock → same KV fingerprint.
 // 4. 3-node pure-hold + manual drive → KV + MsgApp ops sequence bit-match.
+// 5. Multi-seed stress (default corpus; expand with DST_FUZZ_SEEDS / REPLAY).
 //
 // Run:
 //   cargo test -p tests --features "dst,testexport" --test dst_raftstore -- --test-threads=1
+//   DST_FUZZ_SEEDS=0..16 cargo test -p tests --features "dst,testexport" --test dst_raftstore \
+//     test_dst_step_driven_multiseed -- --test-threads=1 --nocapture
 
 #![cfg(feature = "dst")]
 
@@ -293,8 +296,13 @@ fn put_stepped(
     false
 }
 
+/// Key space for step-driven puts (prefix + index).
+const STEP_KEYS: [&[u8]; 5] = [b"sd_a", b"sd_b", b"sd_c", b"sd_d", b"sd_e"];
+
 /// Returns (stable_kv, full_trace, app_summary, ops_sequence).
-fn run_step_driven_scenario(seed: u64) -> (String, String, String, String) {
+/// `n_keys` in 1..=STEP_KEYS.len() — used by minimize-on-fail.
+fn run_step_driven_scenario(seed: u64, n_keys: usize) -> (String, String, String, String) {
+    let n_keys = n_keys.clamp(1, STEP_KEYS.len());
     let mut cluster = bootstrap_3node(seed);
 
     // Phase-align clock + freeze hybrid + pause background poller driver.
@@ -314,13 +322,13 @@ fn run_step_driven_scenario(seed: u64) -> (String, String, String, String) {
     net.clear_log();
 
     let wall_deadline = WallInstant::now() + Duration::from_secs(45);
-    let keys: &[&[u8]] = &[b"sd_a", b"sd_b", b"sd_c"];
+    let keys = &STEP_KEYS[..n_keys];
     for (i, k) in keys.iter().enumerate() {
         let val = format!("sv{seed}_{i}");
         let ok = put_stepped(&mut cluster, &net, k, val.as_bytes(), wall_deadline);
         assert!(
             ok,
-            "stepped put failed for key {} (pending={} live_pollers={})",
+            "stepped put failed seed={seed:#x} key={} (pending={} live_pollers={}) REPLAY=DST_FUZZ_REPLAY={seed}",
             String::from_utf8_lossy(k),
             net.pending(),
             batch_system::live_count()
@@ -344,6 +352,154 @@ fn run_step_driven_scenario(seed: u64) -> (String, String, String, String) {
     batch_system::set_manual_drive(false);
     time::dst_set_manual_only(false);
     (stable, full, app, ops)
+}
+
+#[derive(Debug)]
+struct StepMismatch {
+    seed: u64,
+    n_keys: usize,
+    kind: &'static str,
+    left: String,
+    right: String,
+}
+
+impl StepMismatch {
+    fn replay_hint(&self) -> String {
+        format!(
+            "REPLAY=DST_FUZZ_REPLAY={} DST_FUZZ_KEYS={}",
+            self.seed, self.n_keys
+        )
+    }
+}
+
+/// Run step-driven twice for `seed` with `n_keys`; Ok if bit-stable.
+fn check_step_driven_replay(seed: u64, n_keys: usize) -> Result<(), StepMismatch> {
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n_keys);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n_keys);
+    if s1 != s2 {
+        return Err(StepMismatch {
+            seed,
+            n_keys,
+            kind: "stable_kv",
+            left: s1,
+            right: s2,
+        });
+    }
+    if s1.contains("=none") {
+        return Err(StepMismatch {
+            seed,
+            n_keys,
+            kind: "missing_put",
+            left: s1,
+            right: String::new(),
+        });
+    }
+    if !(f1.contains("leader=1") && f2.contains("leader=1")) {
+        return Err(StepMismatch {
+            seed,
+            n_keys,
+            kind: "leader",
+            left: f1,
+            right: f2,
+        });
+    }
+    if app1 != app2 {
+        return Err(StepMismatch {
+            seed,
+            n_keys,
+            kind: "app_summary",
+            left: app1,
+            right: app2,
+        });
+    }
+    if ops1 != ops2 {
+        return Err(StepMismatch {
+            seed,
+            n_keys,
+            kind: "ops_sequence",
+            left: ops1,
+            right: ops2,
+        });
+    }
+    Ok(())
+}
+
+/// Greedy minimize: shrink `n_keys` while the mismatch kind still fires.
+fn minimize_step_driven_fail(seed: u64, start_keys: usize) -> StepMismatch {
+    let mut last = check_step_driven_replay(seed, start_keys)
+        .expect_err("minimize called without a failure");
+    for n in (1..start_keys).rev() {
+        match check_step_driven_replay(seed, n) {
+            Ok(()) => break,
+            Err(m) => {
+                eprintln!(
+                    "DST_MINIMIZE seed={seed:#x} n_keys={n} still fails kind={}",
+                    m.kind
+                );
+                last = m;
+            }
+        }
+    }
+    last
+}
+
+/// Parse `DST_FUZZ_SEEDS`:
+/// - unset → default corpus (always-on multi-seed)
+/// - `N` → single seed
+/// - `a,b,c` → list
+/// - `lo..hi` → half-open range [lo, hi)
+/// - empty / `0` with only REPLAY → see `DST_FUZZ_REPLAY`
+fn parse_fuzz_seeds() -> Vec<u64> {
+    if let Ok(replay) = std::env::var("DST_FUZZ_REPLAY") {
+        if let Ok(s) = replay.trim().parse::<u64>() {
+            return vec![s];
+        }
+        // allow hex
+        if let Some(hex) = replay.trim().strip_prefix("0x") {
+            if let Ok(s) = u64::from_str_radix(hex, 16) {
+                return vec![s];
+            }
+        }
+    }
+    let raw = match std::env::var("DST_FUZZ_SEEDS") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            // Always-on corpus: diverse seeds including the original regression seed.
+            return vec![0x5d01, 0x51, 0x03d3, 7, 42, 0xdead, 0xC0FFEE];
+        }
+    };
+    if let Some((lo, hi)) = raw.split_once("..") {
+        let lo: u64 = lo.trim().parse().unwrap_or(0);
+        let hi: u64 = hi.trim().parse().unwrap_or(lo);
+        return (lo..hi).collect();
+    }
+    if raw.contains(',') {
+        return raw
+            .split(',')
+            .filter_map(|p| {
+                let p = p.trim();
+                p.parse().ok().or_else(|| {
+                    p.strip_prefix("0x")
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                })
+            })
+            .collect();
+    }
+    if let Ok(n) = raw.parse::<u64>() {
+        // Single seed, or if small integer without 0x treat as count 0..n
+        // Convention: plain integer N means range 0..N when N <= 4096 and no REPLAY.
+        if n <= 4096 && !raw.starts_with("0x") && std::env::var_os("DST_FUZZ_COUNT").is_some() {
+            return (0..n).collect();
+        }
+        return vec![n];
+    }
+    if let Some(hex) = raw.strip_prefix("0x") {
+        if let Ok(s) = u64::from_str_radix(hex, 16) {
+            return vec![s];
+        }
+    }
+    // Fallback: default corpus
+    vec![0x5d01]
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -412,8 +568,8 @@ fn test_dst_ordered_net_3node_fingerprint() {
 #[test]
 fn test_dst_step_driven_put_fingerprint() {
     let seed: u64 = 0x5d01;
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed);
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3);
     eprintln!("DST_STEP stable1: {s1}");
     eprintln!("DST_STEP stable2: {s2}");
     eprintln!("DST_STEP app1: {app1}");
@@ -424,7 +580,6 @@ fn test_dst_step_driven_put_fingerprint() {
     assert_eq!(s1, s2, "step-driven stable fingerprint must match");
     assert!(!s1.contains("=none"), "puts missing: {s1}");
     assert!(f1.contains("leader=1") && f2.contains("leader=1"));
-    // Stronger: client replication path counts under pure-hold + manual drive.
     assert_eq!(
         app1, app2,
         "MsgApp/AppResp summary must match under pure step-driven schedule"
@@ -433,4 +588,61 @@ fn test_dst_step_driven_put_fingerprint() {
         ops1, ops2,
         "MsgApp/AppResp ops sequence must match under pure step-driven schedule"
     );
+}
+
+/// Multi-seed step-driven stress.
+///
+/// Default corpus (7 seeds) always runs. Expand via:
+/// - `DST_FUZZ_SEEDS=0..32` half-open range
+/// - `DST_FUZZ_SEEDS=1,2,0x5d01` list
+/// - `DST_FUZZ_REPLAY=<seed>` single-seed bisect
+/// - `DST_FUZZ_COUNT=1 DST_FUZZ_SEEDS=16` → seeds 0..16
+///
+/// On mismatch: greedy minimize `n_keys` 3→1 and print `REPLAY=DST_FUZZ_REPLAY=...`.
+#[test]
+fn test_dst_step_driven_multiseed() {
+    let seeds = parse_fuzz_seeds();
+    assert!(!seeds.is_empty(), "empty seed list");
+    let n_keys: usize = std::env::var("DST_FUZZ_KEYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+        .clamp(1, STEP_KEYS.len());
+
+    eprintln!(
+        "DST_FUZZ n_seeds={} n_keys={} first={:#x} last={:#x}",
+        seeds.len(),
+        n_keys,
+        seeds[0],
+        seeds[seeds.len() - 1]
+    );
+
+    let mut passed = 0usize;
+    for &seed in &seeds {
+        match check_step_driven_replay(seed, n_keys) {
+            Ok(()) => {
+                passed += 1;
+                eprintln!("DST_FUZZ seed={seed:#x} OK");
+            }
+            Err(m) => {
+                eprintln!(
+                    "DST_FUZZ FAIL seed={seed:#x} kind={} n_keys={}",
+                    m.kind, m.n_keys
+                );
+                eprintln!("  left : {}", &m.left[..m.left.len().min(240)]);
+                eprintln!("  right: {}", &m.right[..m.right.len().min(240)]);
+                let mini = minimize_step_driven_fail(seed, n_keys);
+                panic!(
+                    "step-driven nondeterminism seed={seed:#x} kind={} minimized_n_keys={} {}\n  left={}\n  right={}",
+                    mini.kind,
+                    mini.n_keys,
+                    mini.replay_hint(),
+                    mini.left,
+                    mini.right
+                );
+            }
+        }
+    }
+    eprintln!("DST_FUZZ all_passed={passed}/{}", seeds.len());
+    assert_eq!(passed, seeds.len());
 }
