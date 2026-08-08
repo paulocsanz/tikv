@@ -173,6 +173,23 @@ fn bootstrap_3node(seed: u64) -> test_raftstore::Cluster<test_raftstore::NodeClu
     cluster
 }
 
+/// After hybrid bootstrap, freeze clock/pollers and hard-reseed entropy so the
+/// pure-hold put phase starts from seed-derived PRNG state. Pure-manual
+/// election (no hybrid) was tried and **hangs** in `cluster.run` / election
+/// without wall-coupled progress — see findings/dst-strict-isolation.md.
+fn enter_pure_hold_phase(seed: u64) {
+    batch_system::set_manual_drive(true);
+    time::dst_set_manual_only(true);
+    let now = time::dst_now_nanos();
+    let align: i64 = 1_000_000_000;
+    let seed_off = (seed as i64).rem_euclid(align);
+    let aligned = ((now / align) + 2) * align + seed_off;
+    time::dst_set_logical_nanos(aligned);
+    tikv_util::dst_init::dst_reseed_before_phase();
+    tikv_util::dst_rng::dst_set_rng_seed(seed ^ 0xA11C_E_F00D);
+    tikv_util::dst_init::dst_reseed_before_phase();
+}
+
 /// 3-node + DstNetworkQueue(batch_size=1): every send path sorts then releases.
 /// Hybrid clock + auto poller driver. Proves ordered virtual net + dst seed
 /// yield a stable KV fingerprint without pure-hold (which needs manual drive).
@@ -311,17 +328,7 @@ fn run_step_driven_scenario(
 ) -> (String, String, String, String) {
     let n_keys = n_keys.clamp(1, STEP_KEYS.len());
     let mut cluster = bootstrap_3node(seed);
-
-    // Phase-align clock + freeze hybrid + pause background poller driver.
-    {
-        let now = time::dst_now_nanos();
-        let align: i64 = 1_000_000_000;
-        let aligned = ((now / align) + 2) * align;
-        time::dst_set_logical_nanos(aligned);
-    }
-    batch_system::set_manual_drive(true);
-    time::dst_set_manual_only(true);
-    tikv_util::dst_init::dst_reseed_before_phase();
+    enter_pure_hold_phase(seed);
 
     // Pure hold — only network_step delivers. Optional seed-stable drops/delays.
     let net = DstNetworkQueue::new(seed, 0)
@@ -765,6 +772,25 @@ fn test_dst_drop_kv_stable_isolates_app_residual() {
     }
     eprintln!("DST_ISO app_divergent_seeds_this_run={app_div}/{}", seeds.len());
     // No hard assert on app_div — residual is flaky. KV asserts above are the gate.
+}
+
+/// After hard reseed pure-hold entry, dual-run under drops still requires KV match.
+#[test]
+fn test_dst_hard_reseed_pure_hold_drop_kv() {
+    let seed = 1u64;
+    let (s1, _, app1, ops1) = run_step_driven_scenario(seed, 2, 15, 0);
+    let (s2, _, app2, ops2) = run_step_driven_scenario(seed, 2, 15, 0);
+    assert_eq!(s1, s2, "hard-reseed pure-hold: KV must match");
+    assert!(!s1.contains("=none"));
+    if app1 == app2 && ops1 == ops2 {
+        eprintln!("DST_RESEED_NOTE: full freeze after hard reseed seed={seed:#x}");
+    } else {
+        eprintln!(
+            "DST_RESEED_NOTE: app residual remains after hard reseed (ops {} vs {})",
+            ops1.len(),
+            ops2.len()
+        );
+    }
 }
 
 /// Focused STRICT residual probe for seed=0x1 keys=2 drop=15.
