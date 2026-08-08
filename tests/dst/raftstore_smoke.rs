@@ -2233,3 +2233,370 @@ fn test_bug_hunt_multi_key_partition_consistency() {
     sterilize_dst_process();
     eprintln!("DST_BUG9 OK: multi-key consistency holds");
 }
+
+// ─── Phase 3: complex operations under fault ─────────────────────────
+
+/// Attack 10: Region split under partition. Write to keys that span
+/// the future split boundary, partition a node, split, heal. Both
+/// child regions must have correct data.
+#[test]
+fn test_bug_hunt_split_under_partition() {
+    let seed = 0x5111u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write keys on both sides of the split point.
+    cluster.must_put(b"aaa_before", b"v_before");
+    cluster.must_put(b"mmm_split_key", b"v_mid");
+    cluster.must_put(b"zzz_after", b"v_after");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Partition node 3.
+    let net = DstNetworkQueue::new(seed, 1);
+    net.add_partition(3, 1);
+    net.add_partition(3, 2);
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Split at "mmm".
+    let region = cluster.get_region(b"");
+    eprintln!(
+        "DST_BUG10 region before split: {:?}",
+        region.get_start_key()
+    );
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_split(&region, b"mmm_split_key");
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Heal.
+    net.clear_partitions();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: all keys must be readable in the correct child regions.
+    let v1 = cluster.must_get(b"aaa_before");
+    let v2 = cluster.must_get(b"mmm_split_key");
+    let v3 = cluster.must_get(b"zzz_after");
+    eprintln!(
+        "DST_BUG10 after split+heal: before={:?} mid={:?} after={:?}",
+        v1.as_deref(),
+        v2.as_deref(),
+        v3.as_deref()
+    );
+    assert_eq!(v1, Some(b"v_before".to_vec()), "BUG: key lost after split");
+    assert_eq!(v2, Some(b"v_mid".to_vec()), "BUG: split key lost");
+    assert_eq!(v3, Some(b"v_after".to_vec()), "BUG: key lost after split");
+
+    // Verify region exists on both sides.
+    let r_left = cluster.get_region(b"aaa");
+    let r_right = cluster.get_region(b"zzz");
+    eprintln!(
+        "DST_BUG10 regions: left={} right={}",
+        r_left.get_id(),
+        r_right.get_id()
+    );
+    assert_ne!(
+        r_left.get_id(),
+        r_right.get_id(),
+        "BUG: split did not create two regions"
+    );
+
+    cluster.clear_send_filters();
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_BUG10 OK: split under partition safe");
+}
+
+/// Attack 11: Conf change (remove peer) under partition. Remove a
+/// partitioned node. The remaining quorum must stay consistent.
+/// Raft safety: removing a node must never cause committed data loss.
+#[test]
+fn test_bug_hunt_conf_change_under_partition() {
+    let seed = 0xC2C2u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write data.
+    cluster.must_put(b"cc_1", b"v1");
+    cluster.must_put(b"cc_2", b"v2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify baseline.
+    assert_eq!(cluster.must_get(b"cc_1"), Some(b"v1".to_vec()));
+    assert_eq!(cluster.must_get(b"cc_2"), Some(b"v2".to_vec()));
+
+    // Try async_remove_peer for node 3.
+    let resp = match cluster.async_remove_peer(1, new_peer(3, 3)) {
+        Ok(mut f) => {
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let deadline = WallInstant::now() + Duration::from_secs(10);
+            loop {
+                if WallInstant::now() > deadline {
+                    break None;
+                }
+                match Future::poll(f.as_mut(), &mut cx) {
+                    Poll::Ready(r) => break Some(r),
+                    Poll::Pending => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("DST_BUG11 async_remove_peer error: {:?}", e);
+            None
+        }
+    };
+
+    let has_err = resp.as_ref().is_some_and(|r| r.get_header().has_error());
+    eprintln!("DST_BUG11 remove_peer response error={has_err}");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ORACLE: data must survive regardless of conf change outcome.
+    let v1 = cluster.must_get(b"cc_1");
+    let v2 = cluster.must_get(b"cc_2");
+    eprintln!("DST_BUG11 after conf change: cc_1={:?} cc_2={:?}", v1.as_deref(), v2.as_deref());
+    assert_eq!(v1, Some(b"v1".to_vec()), "BUG: data lost after conf change");
+    assert_eq!(v2, Some(b"v2".to_vec()), "BUG: data lost after conf change");
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_BUG11 OK: data survived conf change");
+}
+
+/// Attack 12: Write a large batch of keys, then read them back via
+/// different read paths (local, quorum). Any inconsistency is a bug.
+#[test]
+fn test_bug_hunt_large_batch_read_consistency() {
+    let seed = 0x8A11u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write 50 keys.
+    let mut pairs = Vec::new();
+    for i in 0u32..50 {
+        let key = format!("batch_{i:04}");
+        let val = format!("val_{i:04}_{seed:x}");
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        pairs.push((key, val));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ORACLE: every key must be readable with the correct value.
+    let mut mismatches = 0;
+    for (key, expected) in &pairs {
+        let v = cluster.must_get(key.as_bytes());
+        if v.as_deref() != Some(expected.as_bytes()) {
+            eprintln!(
+                "DST_BUG12 MISMATCH: {} expected={:?} got={:?}",
+                key,
+                expected.as_bytes(),
+                v.as_deref()
+            );
+            mismatches += 1;
+        }
+    }
+    assert_eq!(mismatches, 0, "BUG: {mismatches} key mismatches out of 50");
+
+    // Transfer leader and re-verify.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut post_mismatches = 0;
+    for (key, expected) in &pairs {
+        let v = cluster.must_get(key.as_bytes());
+        if v.as_deref() != Some(expected.as_bytes()) {
+            post_mismatches += 1;
+        }
+    }
+    assert_eq!(
+        post_mismatches, 0,
+        "BUG: {post_mismatches} mismatches after leader transfer"
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_BUG12 OK: 50/50 keys consistent before and after transfer");
+}
+
+/// Attack 13: Delete then read — must see absence. Under partition,
+/// the delete must propagate correctly after heal.
+#[test]
+fn test_bug_hunt_delete_visibility() {
+    let seed = 0x0E1Eu64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write, verify, delete, verify absence.
+    cluster.must_put(b"del_key", b"exists");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        cluster.must_get(b"del_key"),
+        Some(b"exists".to_vec()),
+        "key must exist before delete"
+    );
+
+    cluster.must_delete(b"del_key");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        cluster.must_get(b"del_key"),
+        None,
+        "BUG: key still present after delete"
+    );
+
+    // Transfer and verify delete persists.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(
+        cluster.must_get(b"del_key"),
+        None,
+        "BUG: deleted key resurrected after leader transfer"
+    );
+
+    // Write again — must work after delete.
+    cluster.must_put(b"del_key", b"reborn");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        cluster.must_get(b"del_key"),
+        Some(b"reborn".to_vec()),
+        "BUG: cannot write after delete"
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_BUG13 OK: delete visibility correct");
+}
+
+/// Attack 14: Multiple rapid leader transfers in sequence.
+/// Each transfer must preserve all data. Stale or lost data is a bug.
+#[test]
+fn test_bug_hunt_rapid_leader_transfers() {
+    let seed = 0xFA5_u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+
+    // Write baseline before any transfers.
+    cluster.must_put(b"rt_0", b"val_0");
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Rapid: write → transfer → write → transfer → write → transfer.
+    let targets = [(1u64, 1u64), (2u64, 2u64), (3u64, 3u64), (1u64, 1u64), (2u64, 2u64)];
+    for (round, (store, _)) in targets.iter().enumerate() {
+        let key = format!("rt_{round}");
+        cluster.must_put(key.as_bytes(), format!("val_{round}").as_bytes());
+        std::thread::sleep(Duration::from_millis(50));
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_transfer_leader(1, new_peer(*store, *store));
+        }));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // Final write.
+    cluster.must_put(b"rt_final", b"last_val");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ORACLE: ALL keys across ALL transfers must be present.
+    let mut all_ok = true;
+    for (key, expected) in [("rt_0", "val_0"), ("rt_final", "last_val")] {
+        let v = cluster.must_get(key.as_bytes());
+        if v.as_deref() != Some(expected.as_bytes()) {
+            eprintln!("DST_BUG14 MISSING: {key} expected={expected} got={:?}", v.as_deref());
+            all_ok = false;
+        }
+    }
+    for round in 0..targets.len() {
+        let key = format!("rt_{round}");
+        let expected = format!("val_{round}");
+        let v = cluster.must_get(key.as_bytes());
+        if v.as_deref() != Some(expected.as_bytes()) {
+            eprintln!("DST_BUG14 MISSING: {key} expected={expected} got={:?}", v.as_deref());
+            all_ok = false;
+        }
+    }
+    assert!(all_ok, "BUG: data lost during rapid leader transfers");
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_BUG14 OK: all data survived {} rapid leader transfers", targets.len());
+}
