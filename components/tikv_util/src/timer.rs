@@ -95,6 +95,9 @@ struct SystemClock;
 
 impl Now for SystemClock {
     fn now(&self) -> std::time::Instant {
+        // Keep wall Instant for GLOBAL_TIMER_HANDLE — callers pass deadlines
+        // from `std::time::Instant::now()`. SteadyTimer/SteadyClock use logical
+        // under `feature = "dst"` instead.
         std::time::Instant::now()
     }
 }
@@ -116,6 +119,8 @@ struct TimeZero {
     /// A base time point.
     ///
     /// The source of time point should grow steady.
+    /// Under `feature = "dst"`, SteadyClock uses logical nanos on `zero` instead.
+    #[cfg_attr(feature = "dst", allow(dead_code))]
     steady_time_point: Timespec,
 }
 
@@ -150,9 +155,20 @@ impl Default for SteadyClock {
 impl Now for SteadyClock {
     #[inline]
     fn now(&self) -> std::time::Instant {
-        let n = monotonic_raw_now();
-        let dur = Instant::elapsed_duration(n, self.zero.steady_time_point);
-        self.zero.zero + dur
+        #[cfg(feature = "dst")]
+        {
+            // SteadyTimer delays must track logical time under DST so election
+            // ticks / leases fire only when the test advances LOGICAL_NANOS.
+            let nanos = crate::time::dst_now_nanos();
+            let nanos = if nanos < 0 { 0u64 } else { nanos as u64 };
+            self.zero.zero + Duration::from_nanos(nanos)
+        }
+        #[cfg(not(feature = "dst"))]
+        {
+            let n = monotonic_raw_now();
+            let dur = Instant::elapsed_duration(n, self.zero.steady_time_point);
+            self.zero.zero + dur
+        }
     }
 }
 
