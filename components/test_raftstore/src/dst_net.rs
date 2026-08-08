@@ -106,7 +106,11 @@ struct Buffered {
 /// release in controlled batches. Optional delivery log for fingerprints.
 ///
 /// Delay plane: each inbound message is assigned a seed-stable delay in
-/// `0..=max_delay` **steps** (each `take_sorted` call decrements delays).
+/// `0..=max_delay` **drive steps**. Call [`tick_delays`] once per outer
+/// schedule step; [`take_sorted`] never decrements — only releases ready
+/// (`delay == 0`) messages. Coupling delay to every `take_sorted` made the
+/// delay clock depend on how many flush rounds had ready msgs (nondeterministic
+/// under dual-run residual).
 #[derive(Clone)]
 pub struct DstNetworkQueue {
     buffer: Arc<Mutex<Vec<Buffered>>>,
@@ -163,17 +167,26 @@ impl DstNetworkQueue {
         self.log.lock().unwrap().clear();
     }
 
-    /// Take up to `n` **ready** buffered messages in sort order.
-    ///
-    /// Each call first decrements remaining delays by 1; only messages with
-    /// `delay == 0` are eligible. Remaining delayed messages stay buffered.
-    pub fn take_sorted(&self, n: usize) -> Vec<RaftMessage> {
+    /// Advance the delay clock by one step. Call **once** per outer schedule
+    /// iteration (e.g. each `put_stepped` poll round), not on every flush.
+    pub fn tick_delays(&self) {
+        if self.max_delay == 0 {
+            return;
+        }
         let mut buffer = self.buffer.lock().unwrap();
         for b in buffer.iter_mut() {
             if b.delay > 0 {
                 b.delay -= 1;
             }
         }
+    }
+
+    /// Take up to `n` **ready** buffered messages in sort order.
+    ///
+    /// Only messages with `delay == 0` are eligible. Does **not** tick delays
+    /// — use [`tick_delays`] on the schedule boundary.
+    pub fn take_sorted(&self, n: usize) -> Vec<RaftMessage> {
+        let mut buffer = self.buffer.lock().unwrap();
         // Partition ready vs delayed without reordering delayed relative order.
         let mut ready: Vec<RaftMessage> = Vec::new();
         let mut delayed: Vec<Buffered> = Vec::new();
@@ -329,8 +342,9 @@ impl Filter for DstNetworkQueue {
         let count = self.call_count.fetch_add(1, Ordering::Relaxed);
 
         if self.batch_size > 0 {
-            // Auto-release path: tick delays once, then flush ready msgs.
+            // Auto-release path: one delay tick per before() release, then flush.
             if (count + 1) % self.batch_size == 0 || self.pending() > 64 {
+                self.tick_delays();
                 let released = self.take_sorted(usize::MAX);
                 msgs.extend(self.record_and_filter(released));
             }
@@ -404,8 +418,9 @@ mod tests {
             let mut batch: Vec<_> = (0..6).map(|i| make_msg(1, 2, 1, 1, i)).collect();
             let _ = net.before(&mut batch);
             let mut indices = Vec::new();
-            // Enough steps to drain all delayed msgs.
+            // tick once per step, then take ready — same as put_stepped schedule.
             for _ in 0..8 {
+                net.tick_delays();
                 for m in net.take_sorted(usize::MAX) {
                     indices.push(m.get_message().get_index());
                 }
@@ -416,6 +431,30 @@ mod tests {
         assert_eq!(release_trace(77).len(), 6);
         // Different seeds can differ (not required, but likely).
         let _ = release_trace(78);
+    }
+
+    #[test]
+    fn take_sorted_does_not_tick_delays() {
+        let net = DstNetworkQueue::new(1, 0).with_max_delay(2);
+        // Force delay=2 by injecting until we see delayed_pending (rng may assign 0).
+        // Direct: push via before many msgs; at least some delayed with max=2.
+        let mut batch: Vec<_> = (0..20).map(|i| make_msg(1, 2, 1, 1, i)).collect();
+        let _ = net.before(&mut batch);
+        let delayed_before = net.delayed_pending();
+        // Many take_sorted without tick must not free delayed msgs.
+        for _ in 0..10 {
+            let _ = net.take_sorted(usize::MAX);
+        }
+        assert_eq!(
+            net.delayed_pending(),
+            delayed_before,
+            "take_sorted must not advance delay clock"
+        );
+        net.tick_delays();
+        assert!(
+            net.delayed_pending() <= delayed_before,
+            "tick_delays should reduce or keep delayed count"
+        );
     }
 
     #[test]
