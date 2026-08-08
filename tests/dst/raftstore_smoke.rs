@@ -4177,7 +4177,7 @@ fn test_deep_remove_readd_follower() {
     let region_id = cluster.get_region_id(b"rr_00");
 
     // Remove follower node 3.
-    cluster.async_remove_peer(region_id, new_peer(3, 3)).unwrap();
+    let _fut = cluster.async_remove_peer(region_id, new_peer(3, 3)).unwrap();
     std::thread::sleep(Duration::from_millis(500));
 
     // Write while node 3 is absent.
@@ -4187,7 +4187,7 @@ fn test_deep_remove_readd_follower() {
     std::thread::sleep(Duration::from_millis(200));
 
     // Re-add node 3.
-    cluster.async_add_peer(region_id, new_peer(3, 3)).unwrap();
+    let _fut = cluster.async_add_peer(region_id, new_peer(3, 3)).unwrap();
     std::thread::sleep(Duration::from_millis(1000));
 
     // ALL data (before and after absence) must be present.
