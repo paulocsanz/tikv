@@ -95,6 +95,34 @@ pub fn is_app_path_log_entry(entry: &str) -> bool {
     )
 }
 
+/// Adversarial reorder mode — perturbs the canonical sort key with a
+/// seed-derived salt so that different seeds explore different delivery orders.
+#[derive(Clone, Copy, Debug)]
+pub enum ReorderMode {
+    /// Always sort by canonical key (default, backward-compatible).
+    Canonical,
+    /// Sort by a seed-salted hash of the canonical key.
+    Adversarial(u64),
+    /// Deliver in reverse canonical order.
+    Reverse,
+}
+
+impl Default for ReorderMode {
+    fn default() -> Self {
+        ReorderMode::Canonical
+    }
+}
+
+/// Deterministic hash for adversarial reorder salt.
+fn salt_hash(salt: u64, key: &(u64, u64, u64, i32, u64, u64)) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ salt;
+    for &word in &[key.0, key.1, key.2, key.3 as u64, key.4, key.5] {
+        h ^= word;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// One buffered message with optional remaining delay steps.
 struct Buffered {
     msg: RaftMessage,
@@ -122,6 +150,10 @@ pub struct DstNetworkQueue {
     drop_rate_pct: u32,
     /// Max seed-stable delay steps assigned on ingress (0 = no delay).
     max_delay: u32,
+    /// Probability (0..=100) of duplicating each released message.
+    dup_rate_pct: u32,
+    /// Reorder mode for delivery schedule.
+    reorder: ReorderMode,
     rng: Arc<Mutex<SeededRng>>,
     pending_release: Arc<Mutex<Vec<RaftMessage>>>,
     passthrough: Arc<AtomicBool>,
@@ -137,6 +169,8 @@ impl DstNetworkQueue {
             log: Arc::new(Mutex::new(Vec::new())),
             drop_rate_pct: 0,
             max_delay: 0,
+            dup_rate_pct: 0,
+            reorder: ReorderMode::default(),
             rng: Arc::new(Mutex::new(SeededRng::new(seed.wrapping_add(NET_SEED_TAG)))),
             pending_release: Arc::new(Mutex::new(Vec::new())),
             passthrough: Arc::new(AtomicBool::new(false)),
@@ -152,6 +186,18 @@ impl DstNetworkQueue {
     /// Seed-stable per-message delay in `0..=max` steps before release.
     pub fn with_max_delay(mut self, max: u32) -> Self {
         self.max_delay = max;
+        self
+    }
+
+    /// Seed-stable probability of duplicating each released message.
+    pub fn with_dup_rate(mut self, pct: u32) -> Self {
+        self.dup_rate_pct = pct.min(100);
+        self
+    }
+
+    /// Set the adversarial reorder mode for delivery schedule.
+    pub fn with_reorder(mut self, mode: ReorderMode) -> Self {
+        self.reorder = mode;
         self
     }
 
@@ -197,13 +243,42 @@ impl DstNetworkQueue {
                 delayed.push(b);
             }
         }
-        ready.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
+        match self.reorder {
+            ReorderMode::Canonical => {
+                ready.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
+            }
+            ReorderMode::Reverse => {
+                ready.sort_by(|a, b| msg_sort_key(a).cmp(&msg_sort_key(b)));
+                ready.reverse();
+            }
+            ReorderMode::Adversarial(salt) => {
+                ready.sort_by(|a, b| {
+                    let ka = salt_hash(salt, &msg_sort_key(a));
+                    let kb = salt_hash(salt, &msg_sort_key(b));
+                    ka.cmp(&kb)
+                });
+            }
+        }
         let take = n.min(ready.len());
         let out: Vec<_> = ready.drain(..take).collect();
         // Put unreleased ready msgs back with delay 0 (still eligible next time).
         for m in ready {
             delayed.push(Buffered { msg: m, delay: 0 });
         }
+        // Apply duplication: seed-stable dup of released messages.
+        let out = if self.dup_rate_pct > 0 {
+            let mut rng = self.rng.lock().unwrap();
+            let mut expanded = Vec::with_capacity(out.len() * 2);
+            for m in out {
+                expanded.push(m.clone());
+                if rng.gen_range(100) < self.dup_rate_pct {
+                    expanded.push(m);
+                }
+            }
+            expanded
+        } else {
+            out
+        };
         *buffer = delayed;
         out
     }
@@ -473,5 +548,47 @@ mod tests {
         assert_eq!(log1, log2);
         assert_eq!(n1, n2);
         assert!(n1 < 20, "expected some drops at 40%, got {}", n1);
+    }
+
+    #[test]
+    fn adversarial_reorder_is_seed_stable() {
+        fn trace(salt: u64) -> Vec<u64> {
+            let net = DstNetworkQueue::new(42, 0)
+                .with_reorder(ReorderMode::Adversarial(salt));
+            let mut batch: Vec<_> = (0..10)
+                .map(|i| make_msg(1, 2, 1, 1, i))
+                .collect();
+            let _ = net.before(&mut batch);
+            net.take_sorted(usize::MAX)
+                .iter()
+                .map(|m| m.get_message().get_index())
+                .collect()
+        }
+        assert_eq!(trace(0xDEAD), trace(0xDEAD));
+        assert_ne!(trace(0xDEAD), trace(0xBEEF));
+    }
+
+    #[test]
+    fn reverse_reorder_flips_canonical() {
+        let net = DstNetworkQueue::new(42, 0).with_reorder(ReorderMode::Reverse);
+        let mut batch: Vec<_> = (0..5).map(|i| make_msg(1, 2, 1, 1, i)).collect();
+        let _ = net.before(&mut batch);
+        let out = net.take_sorted(usize::MAX);
+        let indices: Vec<_> = out.iter().map(|m| m.get_message().get_index()).collect();
+        assert_eq!(indices, vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn dup_rate_inflates_output() {
+        let net = DstNetworkQueue::new(7, 0).with_dup_rate(100);
+        let mut batch: Vec<_> = (0..5).map(|i| make_msg(1, 2, 1, 1, i)).collect();
+        let _ = net.before(&mut batch);
+        let out = net.take_sorted(usize::MAX);
+        assert_eq!(out.len(), 10);
+        let indices: std::collections::HashSet<_> = out
+            .iter()
+            .map(|m| m.get_message().get_index())
+            .collect();
+        assert_eq!(indices.len(), 5);
     }
 }
