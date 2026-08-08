@@ -12,6 +12,7 @@ default = [
   "test-engine-raft-raft-engine",
   "engine_rocks",
 ]
+dst = ["batch-system/dst", "tikv_util/dst"]
 failpoints = ["fail/failpoints"]
 testexport = []
 test-engine-kv-rocksdb = ["engine_test/test-engine-kv-rocksdb"]

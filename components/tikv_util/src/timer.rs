@@ -242,6 +242,65 @@ impl<T: Now> RatchetClock<T> {
 }
 
 /// Start a timer thread with specific thread name and clock source.
+// ── DST cooperative timer sync ──────────────────────────────────────
+//
+// Under `cfg(dst)`, the timer thread polls the tokio timer wheel every
+// 100µs.  During the step-driven phase, `dst_tick_ms` advances logical
+// time and then calls `dst_process_timers()` to request a **synchronous**
+// timer turn: the test thread blocks until the timer thread has processed
+// all expired delays.  This eliminates the nondeterminism where timer
+// fires landed at unpredictable points relative to poller steps.
+
+#[cfg(feature = "dst")]
+mod dst_timer_sync {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Request counter — incremented by `dst_process_timers()`.
+    static REQUESTED: AtomicU64 = AtomicU64::new(0);
+    /// Completion counter — incremented by the timer thread after each turn
+    /// when a request is pending.
+    static COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+    /// Called from the test thread: request a timer turn and block until the
+    /// timer thread has completed it.  Timeout after 200ms to avoid deadlock
+    /// if the timer thread isn't running yet.
+    pub fn request_and_wait() {
+        let req = REQUESTED.fetch_add(1, Ordering::SeqCst) + 1;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if COMPLETED.load(Ordering::SeqCst) >= req {
+                return;
+            }
+            if Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(5));
+        }
+    }
+
+    /// Called by the timer thread after each `turn()`: if the test thread has
+    /// requested a synchronous turn, acknowledge it.
+    pub fn ack_if_requested() {
+        let req = REQUESTED.load(Ordering::SeqCst);
+        let done = COMPLETED.load(Ordering::SeqCst);
+        if req > done {
+            COMPLETED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Synchronously process expired timers under DST.
+///
+/// Call after advancing logical time (`dst_advance`) so that all timers
+/// whose deadlines have passed fire **before** the next `step_all_once()`.
+/// This makes timer-driven Raft behaviour (election ticks, lease refresh)
+/// deterministic relative to poller steps.
+#[cfg(feature = "dst")]
+pub fn dst_process_timers() {
+    dst_timer_sync::request_and_wait();
+}
+
 fn start_timer_thread<T: Now>(name: &str, clock: T) -> Handle {
     let (tx, rx) = mpsc::channel();
     let props = crate::thread_group::current_properties();
@@ -254,6 +313,17 @@ fn start_timer_thread<T: Now>(name: &str, clock: T) -> Handle {
 
             let mut timer = tokio_timer::Timer::new_with_now(ParkThread::new(), clock);
             tx.send(timer.handle()).unwrap();
+            // Under DST, SteadyClock tracks logical time. ParkThread only wakes
+            // on wall clock, so a long park would miss large dst_advance jumps.
+            // Poll at most every 100µs so virtual advances fire delays promptly.
+            // After each turn, ack any pending synchronous request from the test
+            // thread (see `dst_process_timers`).
+            #[cfg(feature = "dst")]
+            loop {
+                timer.turn(Some(Duration::from_micros(100))).unwrap();
+                dst_timer_sync::ack_if_requested();
+            }
+            #[cfg(not(feature = "dst"))]
             loop {
                 timer.turn(None).unwrap();
             }
@@ -324,6 +394,59 @@ mod tests {
             end,
             elapsed
         );
+    }
+
+    /// Peça 2: SteadyTimer fires when logical time advances, not wall clock.
+    /// Requires feature `dst` so SteadyClock tracks LOGICAL_NANOS and the
+    /// timer thread polls every 1ms.
+    #[cfg(feature = "dst")]
+    #[test]
+    fn test_dst_virtual_timer_fires_on_logical_advance() {
+        use std::sync::atomic::Ordering;
+        use std::thread;
+
+        use crate::time::{dst_advance, dst_set_manual_only, dst_set_step};
+
+        // Pure step-driven: no hybrid wall-clock driver.
+        dst_set_manual_only(true);
+        dst_set_step(1_000_000);
+
+        let t = SteadyTimer::default();
+        // Touch clock so SteadyClock is initialized against current logical now.
+        let _ = t.clock.now();
+
+        let delay = t.delay(Duration::from_millis(80));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        thread::spawn(move || {
+            let _ = block_on(delay.compat());
+            done2.store(true, Ordering::SeqCst);
+        });
+
+        // Wall time alone must NOT fire the delay (manual mode freezes logical time).
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "delay must not fire without logical time advance"
+        );
+
+        // Advance past the deadline; timer thread polls ≤1ms later.
+        dst_advance(100_000_000); // +100ms logical
+        let mut fired = false;
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                fired = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            fired,
+            "delay must fire within ~200ms wall after logical advance"
+        );
+
+        // Restore hybrid mode so sibling timer tests still work.
+        dst_set_manual_only(false);
     }
 
     #[test]

@@ -8,6 +8,9 @@ mod metrics;
 mod router;
 mod scheduler;
 
+#[cfg(feature = "dst")]
+mod dst_executor;
+
 #[cfg(feature = "test-runner")]
 pub mod test_runner;
 
@@ -21,4 +24,10 @@ pub use self::{
     mailbox::{BasicMailbox, Mailbox},
     metrics::FsmType,
     router::Router,
+};
+
+#[cfg(feature = "dst")]
+pub use self::dst_executor::{
+    Pollable, is_manual_drive, live_count, register as dst_register_poller, set_manual_drive,
+    step_all_once,
 };
