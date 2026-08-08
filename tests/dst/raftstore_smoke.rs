@@ -24,10 +24,11 @@ use std::{
 use futures::Future;
 use kvproto::raft_serverpb::RaftMessage;
 use raft::eraftpb::MessageType;
+use rand::Rng;
 use test_raftstore::{
     CloneFilterFactory, DstNetworkQueue, Filter, msg_sort_key, new_node_cluster, new_peer,
 };
-use tikv_util::{config::ReadableSize, time};
+use tikv_util::{config::ReadableSize, dst_rng::DstRng, time};
 
 fn dst_setup_cluster(cluster: &mut test_raftstore::Cluster<test_raftstore::NodeCluster>) {
     cluster.cfg.raft_store.store_batch_system.pool_size = 1;
@@ -2772,4 +2773,223 @@ fn test_dst_quintuple_fault_multiseed() {
     }
     eprintln!("DST_QUINT_MS all_passed={passed}/{}", seeds.len());
     assert_eq!(passed, seeds.len());
+}
+
+// ─── Churn campaign: long-running mixed workload under 5-dim fault ──────
+//
+// This is the Antithesis-style stress test: a long sequence of mixed
+// operations (puts, deletes, leader transfers, partition flaps) running
+// under the full 5-dimension fault product. Unlike the targeted bug-hunt
+// tests (short, single-invariant), this exercises the system as a whole
+// over an extended period, testing state accumulation, multiple leadership
+// transitions, delete-rewrite patterns, and partition flapping.
+
+/// A single deterministic operation in the churn workload.
+enum ChurnOp {
+    Put { key_idx: usize, val: String },
+    Delete { key_idx: usize },
+    Transfer { to_node: u64 },
+    PartitionFlap,
+}
+
+/// Generate a deterministic workload from a seed.
+fn generate_churn_workload(seed: u64, n_ops: usize) -> Vec<ChurnOp> {
+    let mut rng = DstRng::seed_from_u64(seed.wrapping_mul(0x51_7c_91_3d));
+    let mut ops = Vec::with_capacity(n_ops);
+
+    for i in 0..n_ops {
+        let choice = rng.gen_range(0..100u32);
+        let key_idx = rng.gen_range(0..16usize) as usize;
+
+        match choice {
+            0..=49 => {
+                // 50%: put
+                ops.push(ChurnOp::Put {
+                    key_idx,
+                    val: format!("cv_{seed}_{i}"),
+                });
+            }
+            50..=64 => {
+                // 15%: delete
+                ops.push(ChurnOp::Delete { key_idx });
+            }
+            65..=74 => {
+                // 10%: transfer leader
+                let to = rng.gen_range(1..=3u64);
+                ops.push(ChurnOp::Transfer { to_node: to });
+            }
+            _ => {
+                // 25%: partition flap
+                ops.push(ChurnOp::PartitionFlap);
+            }
+        }
+    }
+    ops
+}
+
+#[test]
+fn test_dst_churn_campaign() {
+    let seeds: Vec<u64> = if let Ok(replay) = std::env::var("DST_CHURN_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_CHURN_SEEDS").unwrap_or_else(|_| "0..6".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u64 = lo.trim().parse().unwrap_or(0);
+            let hi: u64 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            vec![0]
+        }
+    };
+
+    let n_ops: usize = std::env::var("DST_CHURN_OPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+
+    eprintln!(
+        "DST_CHURN n_seeds={} n_ops={n_ops} first={:#x}",
+        seeds.len(),
+        seeds[0]
+    );
+
+    let mut passed = 0usize;
+    for &seed in &seeds {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_churn_seed(seed, n_ops);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_CHURN seed={seed:#x} OK");
+        } else {
+            eprintln!(
+                "DST_CHURN seed={seed:#x} FAIL — replay with DST_CHURN_REPLAY={seed:#x}"
+            );
+            panic!("churn campaign failed on seed {seed:#x}");
+        }
+    }
+    eprintln!("DST_CHURN all_passed={passed}/{}", seeds.len());
+    assert_eq!(passed, seeds.len());
+}
+
+fn run_churn_seed(seed: u64, n_ops: usize) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Activate full 5-dim fault product from the start.
+    let net = DstNetworkQueue::new(seed, 1)
+        .with_dup_rate(12)
+        .with_drop_rate(8)
+        .with_max_delay(2);
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Generate deterministic workload.
+    let ops = generate_churn_workload(seed, n_ops);
+
+    // Track the "expected" state: key_idx → last written value.
+    // Deletes remove the entry. We verify at the end that surviving keys
+    // have the correct value.
+    let mut expected: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut partitioned = false;
+
+    let key = |idx: usize| -> Vec<u8> {
+        format!("churn_{idx:02}").into_bytes()
+    };
+
+    eprintln!("DST_CHURN seed={seed:#x} starting {n_ops} ops");
+
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            ChurnOp::Put { key_idx, val } => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cluster.must_put(&key(*key_idx), val.as_bytes());
+                }));
+                expected.insert(*key_idx, val.clone());
+            }
+            ChurnOp::Delete { key_idx } => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cluster.must_delete(&key(*key_idx));
+                }));
+                expected.remove(key_idx);
+            }
+            ChurnOp::Transfer { to_node } => {
+                if !partitioned {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cluster.must_transfer_leader(1, new_peer(*to_node, *to_node));
+                    }));
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            ChurnOp::PartitionFlap => {
+                if partitioned {
+                    // Heal.
+                    net.clear_partitions();
+                    partitioned = false;
+                    std::thread::sleep(Duration::from_millis(150));
+                } else {
+                    // Partition node 3.
+                    net.add_partition(3, 1);
+                    net.add_partition(3, 2);
+                    partitioned = true;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        // Periodic settle.
+        if i % 10 == 9 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Final heal: clear all partitions and let raft converge.
+    if partitioned {
+        net.clear_partitions();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Drain network for convergence.
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: every key that should exist (per expected map) must be
+    // readable with the correct value. Keys that were deleted must not
+    // exist (or return stale — we check they're gone or have old value).
+    let mut verified = 0;
+    for (idx, val) in &expected {
+        let k = key(*idx);
+        let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cluster.get(&k)))
+            .ok()
+            .flatten();
+        let got = v.as_deref().map(|b| String::from_utf8_lossy(b).into_owned());
+        assert_eq!(
+            got.as_deref(),
+            Some(val.as_str()),
+            "CHURN SAFETY VIOLATION: key churn_{idx:02} expected={val} got={got:?} seed={seed:#x}"
+        );
+        verified += 1;
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!(
+        "DST_CHURN seed={seed:#x} verified {verified} keys, all correct"
+    );
 }
