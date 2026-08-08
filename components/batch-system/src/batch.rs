@@ -10,11 +10,15 @@
 use std::{
     borrow::Cow,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    },
     thread::{self, JoinHandle, ThreadId, current},
     time::Duration,
 };
 
+use crossbeam::channel::TryRecvError;
 use fail::fail_point;
 use file_system::{IoType, set_io_type};
 use resource_control::{
@@ -358,29 +362,100 @@ enum ReschedulePolicy {
     Schedule,
 }
 
+/// Result of attempting to fetch an FSM for the current batch.
+///
+/// - `GotWork` — batch has something to process
+/// - `Idle` — channel empty for now (dst: sleep and retry)
+/// - `Stop` — shutdown signal (`Empty`) or channel disconnected
+enum FetchResult {
+    GotWork,
+    Idle,
+    Stop,
+}
+
 impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
-    fn fetch_fsm(&mut self, batch: &mut Batch<N, C>) -> bool {
+    fn fetch_fsm(&mut self, batch: &mut Batch<N, C>) -> FetchResult {
         if batch.control.is_some() {
-            return true;
+            return FetchResult::GotWork;
         }
 
-        if let Ok(fsm) = self.fsm_receiver.try_recv() {
-            return batch.push(fsm);
+        match self.fsm_receiver.try_recv() {
+            Ok(fsm) => {
+                // batch.push returns false for FsmTypes::Empty (shutdown signal).
+                if batch.push(fsm) {
+                    return FetchResult::GotWork;
+                } else {
+                    return FetchResult::Stop;
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                return FetchResult::Stop;
+            }
+            Err(TryRecvError::Empty) => {}
         }
 
         if batch.is_empty() {
             self.handler.pause();
-            if let Ok(fsm) = self.fsm_receiver.recv() {
-                return batch.push(fsm);
+            #[cfg(not(feature = "dst"))]
+            {
+                // Production path: block until work or disconnect.
+                match self.fsm_receiver.recv() {
+                    Ok(fsm) => {
+                        if batch.push(fsm) {
+                            return FetchResult::GotWork;
+                        } else {
+                            return FetchResult::Stop;
+                        }
+                    }
+                    Err(_) => return FetchResult::Stop,
+                }
+            }
+            // Under dst: never block. Report Idle so the cooperative outer loop
+            // can sleep deterministically and retry.
+            #[cfg(feature = "dst")]
+            {
+                return FetchResult::Idle;
             }
         }
-        !batch.is_empty()
+        if batch.is_empty() {
+            FetchResult::Idle
+        } else {
+            FetchResult::GotWork
+        }
     }
 
     /// Polls for readiness and forwards them to handler. Removes stale peers if
     /// necessary.
+    ///
+    /// Under `feature = "dst"`, pollers are normally driven by
+    /// [`crate::dst_executor`] (single-threaded). This method remains for
+    /// non-dst production use and for any direct callers.
     pub fn poll(&mut self) {
         fail_point!("poll");
+        #[cfg(feature = "dst")]
+        {
+            // Fallback if someone calls poll() directly under dst: same
+            // non-blocking loop as the global driver would use for one poller.
+            loop {
+                if !self.poll_round() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            return;
+        }
+        // Non-dst: block inside fetch_fsm until stop (Empty / disconnect).
+        #[cfg(not(feature = "dst"))]
+        {
+            let _ = self.poll_round();
+        }
+    }
+
+    /// Process one or more batches until idle (dst) or until stop (always).
+    ///
+    /// Returns `false` when the poller should exit permanently (shutdown).
+    /// Returns `true` when the channel is temporarily empty (dst only — keep polling).
+    pub fn poll_round(&mut self) -> bool {
         let mut batch = Batch::with_capacity(self.max_batch_size);
         let mut reschedule_fsms = Vec::with_capacity(self.max_batch_size);
         let mut to_skip_end = Vec::with_capacity(self.max_batch_size);
@@ -390,7 +465,16 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
         // every time calling `poll`, we do not need to configure a large value for
         // `self.max_batch_size`.
         let mut run = true;
-        while run && self.fetch_fsm(&mut batch) {
+        let mut permanently_stop = false;
+        while run {
+            match self.fetch_fsm(&mut batch) {
+                FetchResult::GotWork => {}
+                FetchResult::Idle => break,
+                FetchResult::Stop => {
+                    permanently_stop = true;
+                    break;
+                }
+            }
             // If there is a region that waits to be dealt, we must deal with it even if it
             // has overhead max size of batch. It's helpful to protect regions
             // from becoming hungry if some regions are hot points.
@@ -444,7 +528,11 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             let mut fsm_cnt = batch.normals.len();
             while batch.normals.len() < max_batch_size {
                 if let Ok(fsm) = self.fsm_receiver.try_recv() {
-                    run = batch.push(fsm);
+                    // push returns false for Empty (shutdown).
+                    if !batch.push(fsm) {
+                        run = false;
+                        permanently_stop = true;
+                    }
                 }
                 // When `fsm_cnt >= batch.normals.len()`:
                 // - No more FSMs in `fsm_receiver`.
@@ -485,25 +573,45 @@ impl<N: Fsm, C: Fsm, Handler: PollHandler<N, C>> Poller<N, C, Handler> {
             }
             reschedule_fsms.clear();
         }
-        if let Some(fsm) = batch.control.take() {
-            self.router.control_scheduler.schedule(fsm);
-            info!("poller will exit, release the left ControlFsm");
-        }
-        let left_fsm_cnt = batch.normals.len();
-        if left_fsm_cnt > 0 {
-            info!(
-                "poller will exit, schedule {} left NormalFsms",
-                left_fsm_cnt
-            );
-            for i in 0..left_fsm_cnt {
-                let to_schedule = match batch.normals[i].take() {
-                    Some(f) => f,
-                    None => continue,
-                };
-                self.router.normal_scheduler.schedule(to_schedule.fsm);
+        // Only drain leftover FSMs when permanently stopping. Under dst Idle
+        // the batch is empty (work is either still in-flight or rescheduled).
+        if permanently_stop {
+            if let Some(fsm) = batch.control.take() {
+                self.router.control_scheduler.schedule(fsm);
+                info!("poller will exit, release the left ControlFsm");
+            }
+            let left_fsm_cnt = batch.normals.len();
+            if left_fsm_cnt > 0 {
+                info!(
+                    "poller will exit, schedule {} left NormalFsms",
+                    left_fsm_cnt
+                );
+                for i in 0..left_fsm_cnt {
+                    let to_schedule = match batch.normals[i].take() {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    self.router.normal_scheduler.schedule(to_schedule.fsm);
+                }
             }
         }
         batch.clear();
+        !permanently_stop
+    }
+}
+
+/// Drive this poller from the global DST single-threaded executor.
+#[cfg(feature = "dst")]
+impl<N, C, Handler> crate::dst_executor::Pollable for Poller<N, C, Handler>
+where
+    N: Fsm + Send + 'static,
+    C: Fsm + Send + 'static,
+    Handler: PollHandler<N, C> + Send + 'static,
+{
+    fn step(&mut self) -> bool {
+        // Match production poll()'s failpoint for test injection.
+        fail_point!("poll");
+        self.poll_round()
     }
 }
 
@@ -531,6 +639,10 @@ pub struct BatchSystem<N: Fsm, C: Fsm> {
     reschedule_duration: Duration,
     low_priority_pool_size: usize,
     pool_state_builder: Option<PoolStateBuilder<N, C>>,
+    /// Under `dst`, done flags for pollers registered with the global executor.
+    /// Used by `shutdown` to `force_stop` so join cannot hang.
+    #[cfg(feature = "dst")]
+    dst_dones: Vec<Arc<AtomicBool>>,
 }
 
 impl<N, C> BatchSystem<N, C>
@@ -567,7 +679,7 @@ where
             Priority::Normal => self.receiver.clone(),
             Priority::Low => self.low_receiver.clone(),
         };
-        let mut poller = Poller {
+        let poller = Poller {
             router: self.router.clone(),
             fsm_receiver: receiver,
             handler,
@@ -579,16 +691,43 @@ where
                 None
             },
         };
-        let props = tikv_util::thread_group::current_properties();
-        let t = thread::Builder::new()
-            .name(name)
-            .spawn_wrapper(move || {
-                tikv_util::thread_group::set_properties(props);
-                set_io_type(IoType::ForegroundWrite);
-                poller.poll();
-            })
-            .unwrap();
-        self.workers.lock().unwrap().push(t);
+
+        #[cfg(feature = "dst")]
+        {
+            // Single-threaded DST executor: register poller; a global driver
+            // steps all pollers in registration order. A lightweight waiter
+            // thread keeps BatchSystem::shutdown()'s join() working.
+            let done = Arc::new(AtomicBool::new(false));
+            let done_wait = Arc::clone(&done);
+            crate::dst_executor::register(Box::new(poller), Arc::clone(&done));
+            self.dst_dones.push(done);
+            let t = thread::Builder::new()
+                .name(name)
+                .spawn_wrapper(move || {
+                    set_io_type(IoType::ForegroundWrite);
+                    while !done_wait.load(AtomicOrdering::SeqCst) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })
+                .unwrap();
+            self.workers.lock().unwrap().push(t);
+            return;
+        }
+
+        #[cfg(not(feature = "dst"))]
+        {
+            let mut poller = poller;
+            let props = tikv_util::thread_group::current_properties();
+            let t = thread::Builder::new()
+                .name(name)
+                .spawn_wrapper(move || {
+                    tikv_util::thread_group::set_properties(props);
+                    set_io_type(IoType::ForegroundWrite);
+                    poller.poll();
+                })
+                .unwrap();
+            self.workers.lock().unwrap().push(t);
+        }
     }
 
     /// Start the batch system.
@@ -622,6 +761,14 @@ where
         let name_prefix = self.name_prefix.take().unwrap();
         info!("shutdown batch system {}", name_prefix);
         self.router.broadcast_shutdown();
+        // Under dst: force-stop pollers so join cannot hang if the global
+        // driver is mid-step or delayed processing Empty.
+        #[cfg(feature = "dst")]
+        {
+            for done in self.dst_dones.drain(..) {
+                crate::dst_executor::force_stop(&done);
+            }
+        }
         let mut last_error = None;
         for h in self.workers.lock().unwrap().drain(..) {
             debug!("waiting for {}", h.thread().name().unwrap());
@@ -634,6 +781,20 @@ where
             safe_panic!("failed to join worker thread: {:?}", e);
         }
         info!("batch system {} is stopped.", name_prefix);
+    }
+}
+
+/// Under `dst`, always shut down on drop so pollers leave the global
+/// single-threaded executor. Without this, tests that forget `shutdown()`
+/// leave zombie pollers that can starve or confuse later cases in-process.
+#[cfg(feature = "dst")]
+impl<N, C> Drop for BatchSystem<N, C>
+where
+    N: Fsm + Send + 'static,
+    C: Fsm + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -728,6 +889,8 @@ pub fn create_system<N: Fsm, C: Fsm>(
         reschedule_duration: cfg.reschedule_duration.0,
         low_priority_pool_size: cfg.low_priority_pool_size,
         pool_state_builder: Some(pool_state_builder),
+        #[cfg(feature = "dst")]
+        dst_dones: Vec::new(),
     };
     (router, system)
 }

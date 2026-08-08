@@ -26,6 +26,17 @@ pub use self::{
     errors::{DiscardReason, Error, Result},
 };
 
+/// Force ThreadRng (rand 0.8, used by raftstore) to exhaust its 64 KiB
+/// ReseedingRng cache and reseed from OsRng → our deterministic getrandom.
+/// Call this before the deterministic phase so ThreadRng 0.8's internal
+/// ChaCha state is freshly derived from the current seed.
+#[cfg(feature = "dst")]
+pub fn dst_force_thread_rng_reseed() {
+    use rand::Rng;
+    let mut sink = vec![0u8; 65_536];
+    rand::thread_rng().fill(&mut sink[..]);
+}
+
 // `bytes::Bytes` is generated for `bytes` in protobuf.
 pub fn bytes_capacity(b: &bytes::Bytes) -> usize {
     // NOTE: For deserialized raft messages, `len` equals capacity.
