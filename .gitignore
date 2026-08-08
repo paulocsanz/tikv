@@ -44,3 +44,4 @@ core.*
 
 # Ignore all logs
 *.log
+.disk_latency_inspector.tmp

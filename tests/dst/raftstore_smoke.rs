@@ -2600,3 +2600,176 @@ fn test_bug_hunt_rapid_leader_transfers() {
     sterilize_dst_process();
     eprintln!("DST_BUG14 OK: all data survived {} rapid leader transfers", targets.len());
 }
+
+// ─── Quintuple fault: all 5 dimensions simultaneously ──────────────────
+//
+// reorder + duplication + drops + delays + partition — ALL active at once.
+// This is the maximum product of fault dimensions the DstNetworkQueue can
+// produce. The oracle: after partition heal + settle, every key must have
+// its correct value. Raft must converge despite all 5 fault types.
+
+#[test]
+fn test_dst_quintuple_fault_convergence() {
+    // Hybrid clock (partition needs auto-release, not pure-hold).
+    let seed = 0x5d01u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 1: write under ALL 5 fault dimensions.
+    // Node 2 partitioned from 1 and 3 (majority = {1,3}).
+    let net = DstNetworkQueue::new(seed, 1) // auto-release batch_size=1
+        .with_dup_rate(15)
+        .with_drop_rate(10)
+        .with_max_delay(2);
+    net.add_partition(2, 1);
+    net.add_partition(2, 3);
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+    net.set_recording(true);
+
+    eprintln!("DST_QUINT phase 1: partition + dup + drop + delay + auto-release");
+
+    let keys: [&[u8]; 3] = [b"qf_1", b"qf_2", b"qf_3"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("qfv_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Phase 2: heal partition, keep other faults active briefly.
+    eprintln!("DST_QUINT phase 2: healing partition (dup+drop+delay still active)");
+    net.clear_partitions();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Phase 3: clear all faults, settle.
+    eprintln!("DST_QUINT phase 3: clearing all faults, settling");
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: all keys must have correct values (Raft convergence under 5-dim faults).
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    eprintln!("DST_QUINT final kv after 5-dim faults={stable}");
+
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=qfv_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "SAFETY VIOLATION: key {} missing after 5-dim faults: {stable}",
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_QUINT OK: all keys converged under 5-dimension fault product");
+}
+
+/// Quintuple fault multi-seed campaign.
+/// Each seed gets partition + dup + drop + delay simultaneously.
+#[test]
+fn test_dst_quintuple_fault_multiseed() {
+    let seeds: Vec<u64> = if let Ok(replay) = std::env::var("DST_QUINT_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_QUINT_SEEDS").unwrap_or_else(|_| "0..8".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u64 = lo.trim().parse().unwrap_or(0);
+            let hi: u64 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            vec![0]
+        }
+    };
+
+    eprintln!(
+        "DST_QUINT_MS n_seeds={} first={:#x} last={:#x}",
+        seeds.len(),
+        seeds[0],
+        seeds[seeds.len() - 1]
+    );
+
+    let mut passed = 0usize;
+    for &seed in &seeds {
+        tikv_util::dst_init::dst_init(seed);
+        time::dst_set_manual_only(false);
+        time::dst_start_hybrid_driver(Duration::from_millis(1));
+        batch_system::set_manual_drive(false);
+
+        let mut cluster = new_node_cluster(seed, 3);
+        dst_setup_cluster(&mut cluster);
+        test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+        cluster.run();
+
+        assert!(wait_leader(&mut cluster, 100));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_transfer_leader(1, new_peer(1, 1));
+        }));
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // All 5 fault dimensions.
+        let net = DstNetworkQueue::new(seed, 1)
+            .with_dup_rate(15)
+            .with_drop_rate(10)
+            .with_max_delay(2);
+        net.add_partition(2, 1);
+        net.add_partition(2, 3);
+        cluster.add_send_filter(CloneFilterFactory(net.clone()));
+        net.clear_log();
+
+        let keys: [&[u8]; 2] = [b"qm_1", b"qm_2"];
+        for (i, k) in keys.iter().enumerate() {
+            let val = format!("qmv_{seed}_{i}");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cluster.must_put(*k, val.as_bytes());
+            }));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(500));
+        cluster.clear_send_filters();
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Safety oracle.
+        let stable = rich_fingerprint_stable(&mut cluster, &keys);
+        for (i, k) in keys.iter().enumerate() {
+            let expected = format!("{}=qmv_{seed}_{i}", String::from_utf8_lossy(k));
+            assert!(
+                stable.contains(&expected),
+                "SAFETY VIOLATION: key {} missing seed={seed:#x}: {stable}",
+                String::from_utf8_lossy(k)
+            );
+        }
+
+        cluster.shutdown();
+        batch_system::set_manual_drive(false);
+        time::dst_set_manual_only(false);
+        sterilize_dst_process();
+        passed += 1;
+        eprintln!("DST_QUINT_MS seed={seed:#x} OK");
+    }
+    eprintln!("DST_QUINT_MS all_passed={passed}/{}", seeds.len());
+    assert_eq!(passed, seeds.len());
+}
