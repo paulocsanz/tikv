@@ -301,7 +301,12 @@ const STEP_KEYS: [&[u8]; 5] = [b"sd_a", b"sd_b", b"sd_c", b"sd_d", b"sd_e"];
 
 /// Returns (stable_kv, full_trace, app_summary, ops_sequence).
 /// `n_keys` in 1..=STEP_KEYS.len() — used by minimize-on-fail.
-fn run_step_driven_scenario(seed: u64, n_keys: usize) -> (String, String, String, String) {
+/// `drop_pct` 0..=100 — seed-stable message drops at release time.
+fn run_step_driven_scenario(
+    seed: u64,
+    n_keys: usize,
+    drop_pct: u32,
+) -> (String, String, String, String) {
     let n_keys = n_keys.clamp(1, STEP_KEYS.len());
     let mut cluster = bootstrap_3node(seed);
 
@@ -316,8 +321,8 @@ fn run_step_driven_scenario(seed: u64, n_keys: usize) -> (String, String, String
     time::dst_set_manual_only(true);
     tikv_util::dst_init::dst_reseed_before_phase();
 
-    // Pure hold — only network_step delivers.
-    let net = DstNetworkQueue::new(seed, 0);
+    // Pure hold — only network_step delivers. Optional seed-stable drops.
+    let net = DstNetworkQueue::new(seed, 0).with_drop_rate(drop_pct);
     cluster.add_send_filter(CloneFilterFactory(net.clone()));
     net.clear_log();
 
@@ -374,8 +379,16 @@ impl StepMismatch {
 
 /// Run step-driven twice for `seed` with `n_keys`; Ok if bit-stable.
 fn check_step_driven_replay(seed: u64, n_keys: usize) -> Result<(), StepMismatch> {
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n_keys);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n_keys);
+    check_step_driven_replay_drop(seed, n_keys, 0)
+}
+
+fn check_step_driven_replay_drop(
+    seed: u64,
+    n_keys: usize,
+    drop_pct: u32,
+) -> Result<(), StepMismatch> {
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n_keys, drop_pct);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n_keys, drop_pct);
     if s1 != s2 {
         return Err(StepMismatch {
             seed,
@@ -563,13 +576,49 @@ fn test_dst_ordered_net_3node_fingerprint() {
     }
 }
 
+/// Ordered-net multi-seed (faster than step-driven pure-hold).
+#[test]
+fn test_dst_ordered_net_multiseed() {
+    let seeds: &[u64] = &[0x03d3, 0x51, 7, 42, 0xbeef];
+    for &seed in seeds {
+        let (s1, f1) = run_ordered_net_scenario(seed);
+        let (s2, f2) = run_ordered_net_scenario(seed);
+        assert_eq!(s1, s2, "ordered-net KV mismatch seed={seed:#x}");
+        assert!(!s1.contains("=none"), "missing puts seed={seed:#x}: {s1}");
+        if f1.contains("leader=1") {
+            assert!(f2.contains("leader=1"), "leader seed={seed:#x}");
+        }
+        eprintln!("DST_ORD_MS seed={seed:#x} OK");
+    }
+}
+
+/// Step-driven pure-hold **with seed-stable drops** (fault injection plane).
+/// Same seed → same KV + same app summary + same ops sequence including DROP:* log entries.
+#[test]
+fn test_dst_step_driven_with_drops() {
+    let seed: u64 = 0xd70b;
+    let drop_pct = 15u32;
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, drop_pct);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, drop_pct);
+    eprintln!("DST_DROP stable1: {s1}");
+    eprintln!("DST_DROP stable2: {s2}");
+    eprintln!("DST_DROP app1: {app1}");
+    eprintln!("DST_DROP app2: {app2}");
+    eprintln!("DST_DROP ops_len1={} ops_len2={}", ops1.len(), ops2.len());
+    assert_eq!(s1, s2, "drop-path KV must match");
+    assert!(!s1.contains("=none"), "puts must land despite drops: {s1}");
+    assert!(f1.contains("leader=1") && f2.contains("leader=1"));
+    assert_eq!(app1, app2, "app summary with drops must match");
+    assert_eq!(ops1, ops2, "ops sequence with drops must match");
+}
+
 /// Pure-hold + manual drive 3-node: KV + MsgApp path summary bit-match.
 /// Wall-capped put_stepped so a regression cannot hang CI forever.
 #[test]
 fn test_dst_step_driven_put_fingerprint() {
     let seed: u64 = 0x5d01;
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3);
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, 0);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, 0);
     eprintln!("DST_STEP stable1: {s1}");
     eprintln!("DST_STEP stable2: {s2}");
     eprintln!("DST_STEP app1: {app1}");
