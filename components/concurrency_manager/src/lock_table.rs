@@ -30,21 +30,26 @@ impl LockTable {
             let weak2 = weak.clone();
             let guard = handle.lock().await;
 
-            let entry = self.0.get_or_insert(key.clone(), weak);
-            if entry.value().ptr_eq(&weak2) {
-                // If the weak ptr returned by `get_or_insert` equals to the one we inserted,
-                // `guard` refers to the KeyHandle in the lock table. Now, we can bind the
-                // handle to the table.
+            // Scope the SkipMap `Entry` so it is never held across `.await`
+            // (Entry is !Send; tokio::spawn requires Send futures).
+            let existing: Option<Arc<KeyHandle>> = {
+                let entry = self.0.get_or_insert(key.clone(), weak);
+                if entry.value().ptr_eq(&weak2) {
+                    // If the weak ptr returned by `get_or_insert` equals to the one we
+                    // inserted, `guard` refers to the KeyHandle in the lock table.
 
-                // SAFETY: The `table` field in `KeyHandle` is only accessed through the
-                // `set_table` or the `drop` method. It's impossible to have a concurrent `drop`
-                // here and `set_table` is only called here. So there is no concurrent access to
-                // the `table` field in `KeyHandle`.
-                unsafe {
-                    guard.handle().set_table(self.clone());
+                    // SAFETY: The `table` field in `KeyHandle` is only accessed through the
+                    // `set_table` or the `drop` method. It's impossible to have a concurrent
+                    // `drop` here and `set_table` is only called here. So there is no
+                    // concurrent access to the `table` field in `KeyHandle`.
+                    unsafe {
+                        guard.handle().set_table(self.clone());
+                    }
+                    return guard;
                 }
-                return guard;
-            } else if let Some(handle) = entry.value().upgrade() {
+                entry.value().upgrade()
+            };
+            if let Some(handle) = existing {
                 return handle.lock().await;
             }
         }
@@ -353,5 +358,31 @@ mod test {
         let guard3 = lock_table.lock_key(&key).await;
         assert_ne!(old_ptr, Arc::as_ptr(guard3.handle()));
         assert!(Arc::ptr_eq(guard3.handle(), &lock_table.get(&key).unwrap()));
+    }
+
+    /// Production path: `LockTable` holds only `Weak`. After `lock_key` returns,
+    /// the sole strong `Arc` is in the guard. Dropping it must not UB under Miri
+    /// (free of last Arc under Guard Drop-protect). Free is deferred to the next
+    /// `lock()` on this thread (TLS retire), so the map entry disappears then.
+    ///
+    /// ```text
+    /// cargo +nightly miri test -p concurrency_manager --lib \
+    ///   lock_table::test::miri_soundness_lock_key_last_arc
+    /// ```
+    #[tokio::test]
+    async fn miri_soundness_lock_key_last_arc() {
+        let table = LockTable::default();
+        let key = Key::from_raw(b"prod");
+        for _ in 0..8 {
+            let g = table.lock_key(&key).await;
+            // No concurrent upgrade of the Weak — sole strong Arc is in `g`.
+            drop(g);
+            // Arc is retired (not freed yet); Weak still upgrades until reclaim.
+            assert!(table.get(&key).is_some());
+        }
+        // Next lock reclaims retired Arcs → KeyHandle::drop removes `prod`.
+        let g = table.lock_key(&Key::from_raw(b"reclaim")).await;
+        assert!(table.get(&key).is_none());
+        drop(g);
     }
 }
