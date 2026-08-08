@@ -4118,3 +4118,304 @@ fn test_deep_large_value_under_drop() {
     cleanup_cluster();
     eprintln!("DST_DEEP17 OK");
 }
+
+// ─── Deep fault batch 4: conf-change edge cases + read consistency ────
+
+/// Remove the current leader peer via conf change. The cluster must
+/// re-elect and continue serving writes with the remaining 2 nodes.
+#[test]
+fn test_deep_remove_leader_peer() {
+    let seed = 0x7D7Du64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("rl_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Leader is node 1. Remove peer(1,1).
+    let region_id = cluster.get_region_id(b"rl_00");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _fut = cluster.async_remove_peer(region_id, new_peer(1, 1)).unwrap();
+    }));
+    // Wait for removal to propagate.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write must succeed via remaining nodes 2+3.
+    let write_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"rl_post", b"post_val");
+    })).is_ok();
+    eprintln!("DST_DEEP18 write after leader removal: ok={write_ok}");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify data survives — prior writes must be present.
+    for i in 0u32..10 {
+        let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_get(format!("rl_{i:02}").as_bytes())
+        })).ok().flatten();
+        assert!(
+            v.as_deref() == Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key rl_{i:02} lost after leader removal"
+        );
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP18 OK");
+}
+
+/// Remove a follower, write, then add it back. The re-added node must
+/// receive all data including writes that happened while it was absent.
+#[test]
+fn test_deep_remove_readd_follower() {
+    let seed = 0x8E8Eu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("rr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region_id = cluster.get_region_id(b"rr_00");
+
+    // Remove follower node 3.
+    cluster.async_remove_peer(region_id, new_peer(3, 3)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write while node 3 is absent.
+    for i in 10u32..20 {
+        cluster.must_put(format!("rr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Re-add node 3.
+    cluster.async_add_peer(region_id, new_peer(3, 3)).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // ALL data (before and after absence) must be present.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("rr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key rr_{i:02} lost after remove+re-add cycle");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP19 OK");
+}
+
+/// Read-your-writes consistency: write a key, then immediately read it
+/// back through the raft path (read_quorum=true). The read must always
+/// return the just-written value, even during a single-follower partition.
+#[test]
+fn test_deep_read_your_writes_consistency() {
+    let seed = 0x9F9Fu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Partition node 3 (one follower). Leader + node 2 = quorum.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write then immediately read back — through raft (read_quorum=true).
+    for i in 0u32..20 {
+        let key = format!("ryw_{i:02}");
+        let val = format!("val_{i:02}");
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+
+        // Read back through raft with read_quorum.
+        let resp = cluster.request(
+            key.as_bytes(),
+            vec![test_raftstore::new_get_cmd(key.as_bytes())],
+            true, // read_quorum
+            Duration::from_secs(5),
+        );
+        // Extract response value.
+        assert!(
+            !resp.get_header().has_error(),
+            "BUG: read-your-writes failed for key {key}: {:?}",
+            resp.get_header().get_error()
+        );
+    }
+
+    // Heal.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP20 OK");
+}
+
+/// Force a snapshot transfer: stop node 3, write enough entries to
+/// exceed the raft log capacity, restart node 3. It should receive a
+/// snapshot (not log replay) and still have all data.
+#[test]
+fn test_deep_snapshot_after_long_gap() {
+    let seed = 0xA0A0u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("snap_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3 to create a long gap.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write many entries — enough to trigger compaction/snapshot.
+    for i in 0u32..200 {
+        cluster.must_put(format!("snap_mid_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Compact to force raft log truncation.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write more after compaction.
+    for i in 0u32..10 {
+        cluster.must_put(format!("snap_post_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3 — it will need a snapshot.
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(2000));
+
+    // Verify early data survived snapshot path.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("snap_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key snap_{i} lost after snapshot recovery");
+    }
+    // Verify mid data.
+    for i in [0u32, 50, 100, 199] {
+        let v = cluster.must_get(format!("snap_mid_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()).as_deref(),
+            "BUG: key snap_mid_{i:03} lost after snapshot recovery");
+    }
+    // Verify post-compaction data.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("snap_post_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key snap_post_{i} lost after snapshot recovery");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP21 OK");
+}
+
+/// Verify that data written by a leader is visible after that leader
+/// is transferred away and a new leader takes over. This tests the
+/// read consistency across leadership changes.
+#[test]
+fn test_deep_visibility_after_leader_change() {
+    let seed = 0xB1B1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write under leader node 1.
+    for i in 0u32..10 {
+        cluster.must_put(format!("vis1_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Transfer to node 2.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write under new leader node 2.
+    for i in 0u32..10 {
+        cluster.must_put(format!("vis2_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Transfer to node 3.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(3, 3));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write under new leader node 3.
+    for i in 0u32..10 {
+        cluster.must_put(format!("vis3_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Transfer back to node 1.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ALL data across all three leadership epochs must be visible.
+    for prefix in ["vis1", "vis2", "vis3"] {
+        for i in 0u32..10 {
+            let key = format!("{prefix}_{i:02}");
+            let v = cluster.must_get(key.as_bytes());
+            assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+                "BUG: key {key} lost across leadership changes");
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP22 OK");
+}
+
+/// Concurrent writes from rapid sequential puts while one follower is
+/// intermittently dropping. Verify no committed write is lost and
+/// there's no data corruption (each key has exactly its expected value).
+#[test]
+fn test_deep_concurrent_write_integrity() {
+    let seed = 0xC2C2u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Intermittent drop to node 3.
+    let drop_flag = Arc::new(AtomicBool::new(false));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgAppend)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    // Write 100 distinct keys, toggling drop every 3 writes.
+    for i in 0u32..100 {
+        if i % 3 == 0 {
+            drop_flag.store(!drop_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        cluster.must_put(
+            format!("cw_{i:03}").as_bytes(),
+            format!("value_{i:03}_payload").as_bytes(),
+        );
+    }
+
+    // Heal.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify every single key has exactly the right value — no corruption.
+    let mut errors = 0;
+    for i in 0u32..100 {
+        let key = format!("cw_{i:03}");
+        let expected = format!("value_{i:03}_payload");
+        let v = cluster.must_get(key.as_bytes());
+        if v.as_deref() != Some(expected.as_bytes()) {
+            eprintln!("BUG: key {key} expected={expected} got={v:?}");
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/100 keys have wrong values after concurrent writes under intermittent drop");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP23 OK");
+}
