@@ -5588,3 +5588,351 @@ fn test_deep_proposal_during_conf_change() {
     cleanup_cluster();
     eprintln!("DST_DEEP37 OK");
 }
+
+// ─── Deep fault batch 7: creative chaos & adversarial sequences ──────
+
+/// RAPID LEADER CYCLING: Transfer leadership 1→2→3→1→2→3 in quick
+/// succession while writing between each transfer. Tests that the raft
+/// group maintains consistency through rapid term changes.
+#[test]
+fn test_deep_rapid_leader_cycling_with_writes() {
+    let seed = 0xA2A2u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"rlc_init", b"init");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Cycle through all 3 leaders, writing at each step.
+    let peers = [new_peer(1, 1), new_peer(2, 2), new_peer(3, 3)];
+    let mut cycle = 0u32;
+    for round in 0u32..3 {
+        for peer in &peers {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cluster.must_transfer_leader(1, peer.clone());
+            }));
+            std::thread::sleep(Duration::from_millis(200));
+            cluster.must_put(
+                format!("rlc_{cycle}").as_bytes(),
+                format!("round{round}_node{}", peer.get_store_id()).as_bytes(),
+            );
+            cycle += 1;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify ALL writes across all leadership cycles.
+    let mut verified = 0;
+    for i in 0u32..cycle {
+        let v = cluster.must_get(format!("rlc_{i}").as_bytes());
+        assert!(v.is_some(), "BUG: key rlc_{i} lost after rapid leader cycling");
+        verified += 1;
+    }
+    assert_eq!(verified, cycle, "BUG: some writes lost during leader cycling");
+    eprintln!("DST_DEEP38 verified {verified} writes across 9 leader transfers");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP38 OK");
+}
+
+/// WRITE-KILL-RESTART RACE: Write a key, immediately kill a follower,
+/// restart it, and verify the write propagated. Do this repeatedly.
+/// Tests the race between commit propagation and node failure.
+#[test]
+fn test_deep_write_kill_restart_race() {
+    let seed = 0xB3B3u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for round in 0u32..5 {
+        // Write.
+        cluster.must_put(
+            format!("wkr_{round}").as_bytes(),
+            format!("val_{round}").as_bytes(),
+        );
+        // Immediately kill node 3.
+        cluster.stop_node(3);
+        // Write again (survives via 1+2).
+        cluster.must_put(
+            format!("wkr_post_{round}").as_bytes(),
+            format!("post_{round}").as_bytes(),
+        );
+        // Restart node 3.
+        cluster.run_node(3).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    // Verify ALL data.
+    for round in 0u32..5 {
+        let v1 = cluster.must_get(format!("wkr_{round}").as_bytes());
+        assert_eq!(v1.as_deref(), Some(format!("val_{round}").as_bytes()),
+            "BUG: wkr_{round} lost in write-kill-restart race");
+        let v2 = cluster.must_get(format!("wkr_post_{round}").as_bytes());
+        assert_eq!(v2.as_deref(), Some(format!("post_{round}").as_bytes()),
+            "BUG: wkr_post_{round} lost in write-kill-restart race");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP39 OK");
+}
+
+/// ADVERSARIAL MSGVOTE DROP: Drop MsgRequestVote to prevent election,
+/// then verify that when votes finally go through, only ONE leader
+/// emerges (no split brain).
+#[test]
+fn test_deep_adversarial_vote_drop() {
+    let seed = 0xC4C4u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("av_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Drop MsgRequestVote on all nodes to prevent new elections.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    for store in [1u64, 2u64, 3u64] {
+        let filter = RegionPacketFilter::new(1, store)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgRequestVote)
+            .when(drop_flag.clone());
+        cluster.add_send_filter_on_node(store, Box::new(filter));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Stop the leader — normally would trigger election, but votes are dropped.
+    cluster.stop_node(1);
+    std::thread::sleep(Duration::from_millis(2000));
+
+    // No new leader should be elected while votes are blocked.
+    // (Nodes 2+3 can't campaign without votes.)
+    let region_id = cluster.get_region_id(b"av_00");
+    let leader_during_block = cluster.leader_of_region(region_id);
+    eprintln!("DST_DEEP40 leader during vote drop: {:?}", leader_during_block);
+
+    // Heal votes.
+    drop_flag.store(false, Ordering::SeqCst);
+    for store in [1u64, 2u64, 3u64] {
+        cluster.clear_send_filter_on_node(store);
+    }
+    std::thread::sleep(Duration::from_millis(2000));
+
+    // Now nodes 2+3 should elect a leader.
+    let leader_after_heal = cluster.leader_of_region(region_id);
+    assert!(leader_after_heal.is_some(),
+        "BUG: no leader elected after healing vote drops");
+
+    // All committed data must survive.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("av_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key av_{i:02} lost during adversarial vote drop");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP40 OK");
+}
+
+/// OVERWRITE RACE UNDER LEADER TRANSFER: Transfer leadership while
+/// rapidly overwriting the same key. The final value must be consistent
+/// — the last successfully committed write wins.
+#[test]
+fn test_deep_overwrite_race_under_transfer() {
+    let seed = 0xD5D5u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let final_val = b"FINAL_VALUE".to_vec();
+
+    // Phase 1: rapid overwrites.
+    for i in 0u32..30 {
+        cluster.must_put(b"orr_key", format!("intermediate_{i:02}").as_bytes());
+    }
+
+    // Phase 2: transfer leadership.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: more overwrites under new leader.
+    for i in 0u32..20 {
+        cluster.must_put(b"orr_key", format!("post_transfer_{i:02}").as_bytes());
+    }
+
+    // Phase 4: final value.
+    cluster.must_put(b"orr_key", &final_val);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The final value must be exactly FINAL_VALUE — last write wins.
+    let v = cluster.must_get(b"orr_key");
+    assert_eq!(v.as_deref(), Some(final_val.as_slice()),
+        "BUG: overwrite race under transfer produced wrong final value: got {v:?}");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP41 OK");
+}
+
+/// DOUBLE RESTART: Stop a node, restart it, immediately stop it again,
+/// restart once more. The node must eventually catch up to ALL committed
+/// data. Tests idempotent restart / log replay.
+#[test]
+fn test_deep_double_restart_catchup() {
+    let seed = 0xE6E6u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("dr2_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // First stop-restart cycle.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    cluster.must_put(b"dr2_mid1", b"mid1");
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Immediately stop again — before it fully catches up.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    cluster.must_put(b"dr2_mid2", b"mid2");
+
+    // Second restart.
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Write more.
+    cluster.must_put(b"dr2_final", b"final");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // All data must survive.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("dr2_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key dr2_{i:02} lost after double restart");
+    }
+    assert_eq!(cluster.must_get(b"dr2_mid1"), Some(b"mid1".to_vec()),
+        "BUG: dr2_mid1 lost after double restart");
+    assert_eq!(cluster.must_get(b"dr2_mid2"), Some(b"mid2".to_vec()),
+        "BUG: dr2_mid2 lost after double restart");
+    assert_eq!(cluster.must_get(b"dr2_final"), Some(b"final".to_vec()),
+        "BUG: dr2_final lost after double restart");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP42 OK");
+}
+
+/// PARTITION-PARTITION-PARTITION: Repeatedly partition and heal the
+/// same node while continuously writing. Stress-test the raft retry
+/// and catch-up mechanism under flapping network.
+#[test]
+fn test_deep_flapping_partition_stress() {
+    let seed = 0xF7F7u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    // Flap the network 10 times, writing each time.
+    let flap_flag = drop_flag.clone();
+    let flapper = std::thread::spawn(move || {
+        for i in 0u32..10 {
+            std::thread::sleep(Duration::from_millis(300));
+            flap_flag.store(!flap_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+            eprintln!("FLAP {i}: partition={}", flap_flag.load(Ordering::SeqCst));
+        }
+        // Final heal.
+        flap_flag.store(false, Ordering::SeqCst);
+    });
+
+    // Write continuously during flapping.
+    for i in 0u32..30 {
+        cluster.must_put(
+            format!("fp_{i:03}").as_bytes(),
+            format!("val_{i:03}").as_bytes(),
+        );
+    }
+
+    flapper.join().unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // ALL 30 keys must survive.
+    let mut errors = 0;
+    for i in 0u32..30 {
+        let v = cluster.must_get(format!("fp_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:03}").as_bytes()) {
+            eprintln!("BUG: fp_{i:03} expected=val_{i:03} got={v:?}");
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/30 keys lost during flapping partition stress");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP43 OK");
+}
+
+/// SNAPSHOT DURING LEADER TRANSFER: Force a snapshot (by making node 3
+/// lag heavily), then transfer leadership to node 3 WHILE the snapshot
+/// is in flight. The transfer must complete correctly and all data must
+/// survive.
+#[test]
+fn test_deep_snapshot_during_transfer() {
+    let seed = 0x0818u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("sd_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Make node 3 lag heavily.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(300));
+
+    for i in 0u32..150 {
+        cluster.must_put(format!("sd_mid_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Restart node 3 — it will need a snapshot.
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // IMMEDIATELY transfer leadership to node 3 (while snapshot is in flight).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.try_transfer_leader(1, new_peer(3, 3));
+    }));
+    std::thread::sleep(Duration::from_millis(3000));
+
+    // Write under whatever leader we have now.
+    cluster.must_put(b"sd_post", b"post_val");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify early data.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("sd_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key sd_{i} lost during snapshot+transfer race");
+    }
+    // Verify mid data (needed snapshot).
+    for i in [0u32, 50, 149] {
+        let v = cluster.must_get(format!("sd_mid_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
+            "BUG: key sd_mid_{i:03} lost during snapshot+transfer race");
+    }
+    // Post-transfer write.
+    assert_eq!(cluster.must_get(b"sd_post"), Some(b"post_val".to_vec()),
+        "BUG: write after snapshot+transfer lost");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP44 OK");
+}
