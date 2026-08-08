@@ -55,7 +55,7 @@ impl Json {
             if target.get_type() == JsonType::Object {
                 let elem_count = target.get_elem_count();
                 for i in 0..elem_count {
-                    let key = target.object_get_key(i);
+                    let key = target.object_get_key(i)?;
                     let val = target.object_get_val(i)?;
                     let key = String::from_utf8(key.to_owned()).map_err(Error::from)?;
                     key_val_map.insert(key, val.to_owned());
@@ -65,7 +65,7 @@ impl Json {
             let mut tmp: Json;
             let elem_count = patch.get_elem_count();
             for i in 0..elem_count {
-                let key = patch.object_get_key(i);
+                let key = patch.object_get_key(i)?;
                 let val = patch.object_get_val(i)?;
                 let k = String::from_utf8(key.to_owned()).map_err(Error::from)?;
 
@@ -132,7 +132,7 @@ fn merge_binary_object(objects: &mut Vec<JsonRef<'_>>) -> Result<Json> {
     for j in objects.drain(..) {
         let elem_count = j.get_elem_count();
         for i in 0..elem_count {
-            let key = j.object_get_key(i);
+            let key = j.object_get_key(i)?;
             let val = j.object_get_val(i)?;
             let key = String::from_utf8(key.to_owned()).map_err(Error::from)?;
             if let Some(old) = kv_map.remove(&key) {

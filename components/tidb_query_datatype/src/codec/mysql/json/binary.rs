@@ -5,9 +5,40 @@ use std::convert::TryInto;
 use codec::number::NumberCodec;
 
 use super::{ERR_CONVERT_FAILED, JsonRef, JsonType, constants::*};
-use crate::codec::{Result, convert::ToStringValue, mysql::json::path_expr::ArrayIndex};
+use crate::codec::{Error, Result, convert::ToStringValue, mysql::json::path_expr::ArrayIndex};
 
 impl<'a> JsonRef<'a> {
+    /// Bounds-checked slice of the binary payload. Corrupt/truncated JSON must
+    /// return `Err` (coprocessor error), not panic — untrusted storage/network
+    /// bytes can poison offsets.
+    #[inline]
+    fn try_slice(&self, start: usize, end: usize) -> Result<&'a [u8]> {
+        self.value().get(start..end).ok_or_else(|| {
+            Error::CorruptedData(format!(
+                "JSON binary out of bounds: [{}, {}) of len {}",
+                start,
+                end,
+                self.value().len()
+            ))
+        })
+    }
+
+    #[inline]
+    fn try_decode_u32_le_at(&self, off: usize) -> Result<u32> {
+        let end = off.checked_add(U32_LEN).ok_or_else(|| {
+            Error::CorruptedData(format!("JSON binary u32 offset overflow at {}", off))
+        })?;
+        Ok(NumberCodec::decode_u32_le(self.try_slice(off, end)?))
+    }
+
+    #[inline]
+    fn try_decode_u16_le_at(&self, off: usize) -> Result<u16> {
+        let end = off.checked_add(U16_LEN).ok_or_else(|| {
+            Error::CorruptedData(format!("JSON binary u16 offset overflow at {}", off))
+        })?;
+        Ok(NumberCodec::decode_u16_le(self.try_slice(off, end)?))
+    }
+
     /// Gets the index from the ArrayIndex
     ///
     /// If the idx is greater than the count and is from right, it will return
@@ -32,18 +63,37 @@ impl<'a> JsonRef<'a> {
     ///
     /// See `arrayGetElem()` in TiDB `json/binary.go`
     pub fn array_get_elem(&self, idx: usize) -> Result<JsonRef<'a>> {
-        self.val_entry_get(HEADER_LEN + idx * VALUE_ENTRY_LEN)
+        let off = HEADER_LEN
+            .checked_add(idx.checked_mul(VALUE_ENTRY_LEN).ok_or_else(|| {
+                Error::CorruptedData("JSON array index overflow".into())
+            })?)
+            .ok_or_else(|| Error::CorruptedData("JSON array entry offset overflow".into()))?;
+        self.val_entry_get(off)
     }
 
     /// Return the `i`th key in current Object json
     ///
     /// See `objectGetKey()` in TiDB `types/json_binary.go`
-    pub fn object_get_key(&self, i: usize) -> &'a [u8] {
-        let key_off_start = HEADER_LEN + i * KEY_ENTRY_LEN;
-        let key_off = NumberCodec::decode_u32_le(&self.value()[key_off_start..]) as usize;
-        let key_len =
-            NumberCodec::decode_u16_le(&self.value()[key_off_start + KEY_OFFSET_LEN..]) as usize;
-        &self.value()[key_off..key_off + key_len]
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::CorruptedData` if key-entry offsets are out of bounds
+    /// (truncated or poison binary). Does not panic on untrusted input.
+    pub fn object_get_key(&self, i: usize) -> Result<&'a [u8]> {
+        let key_off_start = HEADER_LEN
+            .checked_add(i.checked_mul(KEY_ENTRY_LEN).ok_or_else(|| {
+                Error::CorruptedData("JSON object key index overflow".into())
+            })?)
+            .ok_or_else(|| Error::CorruptedData("JSON object key-entry offset overflow".into()))?;
+        let key_off = self.try_decode_u32_le_at(key_off_start)? as usize;
+        let key_len = self.try_decode_u16_le_at(key_off_start + KEY_OFFSET_LEN)? as usize;
+        let key_end = key_off.checked_add(key_len).ok_or_else(|| {
+            Error::CorruptedData(format!(
+                "JSON object key range overflow: off={} len={}",
+                key_off, key_len
+            ))
+        })?;
+        self.try_slice(key_off, key_end)
     }
 
     /// Returns the JsonRef of `i`th value in current Object json
@@ -51,75 +101,121 @@ impl<'a> JsonRef<'a> {
     /// See `objectGetVal()` in TiDB `types/json_binary.go`
     pub fn object_get_val(&self, i: usize) -> Result<JsonRef<'a>> {
         let ele_count = self.get_elem_count();
-        let val_entry_off = HEADER_LEN + ele_count * KEY_ENTRY_LEN + i * VALUE_ENTRY_LEN;
+        let keys_bytes = ele_count.checked_mul(KEY_ENTRY_LEN).ok_or_else(|| {
+            Error::CorruptedData("JSON object key-entries size overflow".into())
+        })?;
+        let val_entry_off = HEADER_LEN
+            .checked_add(keys_bytes)
+            .and_then(|b| b.checked_add(i.checked_mul(VALUE_ENTRY_LEN)?))
+            .ok_or_else(|| Error::CorruptedData("JSON object value-entry offset overflow".into()))?;
         self.val_entry_get(val_entry_off)
     }
 
     /// Searches the value index by the give `key` in Object.
     ///
     /// See `objectSearchKey()` in TiDB `json/binary_function.go`
-    pub fn object_search_key(&self, key: &[u8]) -> Option<usize> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates `object_get_key` corruption errors instead of panicking.
+    pub fn object_search_key(&self, key: &[u8]) -> Result<Option<usize>> {
         let len = self.get_elem_count();
         let mut j = len;
         let mut i = 0;
         while i < j {
             let mid = (i + j) >> 1;
-            if self.object_get_key(mid) < key {
+            if self.object_get_key(mid)? < key {
                 i = mid + 1;
             } else {
                 j = mid;
             }
         }
-        if i < len && self.object_get_key(i) == key {
-            return Some(i);
+        if i < len && self.object_get_key(i)? == key {
+            return Ok(Some(i));
         }
-        None
+        Ok(None)
     }
 
     /// Gets the value (JsonRef) by the given offset of the value entry
     ///
     /// See `arrayGetElem()` in TiDB `json/binary.go`
     pub fn val_entry_get(&self, val_entry_off: usize) -> Result<JsonRef<'a>> {
-        let val_type: JsonType = self.value()[val_entry_off].try_into()?;
-        let val_offset =
-            NumberCodec::decode_u32_le(&self.value()[val_entry_off + TYPE_LEN..]) as usize;
+        let type_bytes = self.try_slice(val_entry_off, val_entry_off.saturating_add(TYPE_LEN))?;
+        let val_type: JsonType = type_bytes[0].try_into()?;
+        let val_offset = self.try_decode_u32_le_at(val_entry_off + TYPE_LEN)? as usize;
         Ok(match val_type {
             JsonType::Literal => {
                 let offset = val_entry_off + TYPE_LEN;
-                #[allow(clippy::range_plus_one)]
-                JsonRef::new(val_type, &self.value()[offset..offset + LITERAL_LEN])
+                let end = offset.checked_add(LITERAL_LEN).ok_or_else(|| {
+                    Error::CorruptedData("JSON literal range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(offset, end)?)
             }
             JsonType::U64 | JsonType::I64 | JsonType::Double => {
-                JsonRef::new(val_type, &self.value()[val_offset..val_offset + NUMBER_LEN])
+                let end = val_offset.checked_add(NUMBER_LEN).ok_or_else(|| {
+                    Error::CorruptedData("JSON number range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
             }
             JsonType::String => {
-                let (str_len, len_len) =
-                    NumberCodec::try_decode_var_u64(&self.value()[val_offset..])?;
-                JsonRef::new(
-                    val_type,
-                    &self.value()[val_offset..val_offset + str_len as usize + len_len],
-                )
+                let tail = self.value().get(val_offset..).ok_or_else(|| {
+                    Error::CorruptedData(format!(
+                        "JSON string offset {} past len {}",
+                        val_offset,
+                        self.value().len()
+                    ))
+                })?;
+                let (str_len, len_len) = NumberCodec::try_decode_var_u64(tail)?;
+                let total = (str_len as usize).checked_add(len_len).ok_or_else(|| {
+                    Error::CorruptedData("JSON string length overflow".into())
+                })?;
+                let end = val_offset.checked_add(total).ok_or_else(|| {
+                    Error::CorruptedData("JSON string range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
             }
             JsonType::Opaque => {
-                let (opaque_bytes_len, len_len) =
-                    NumberCodec::try_decode_var_u64(&self.value()[val_offset + 1..])?;
-                JsonRef::new(
-                    val_type,
-                    &self.value()[val_offset..val_offset + opaque_bytes_len as usize + len_len + 1],
-                )
+                let body_off = val_offset.checked_add(1).ok_or_else(|| {
+                    Error::CorruptedData("JSON opaque offset overflow".into())
+                })?;
+                let tail = self.value().get(body_off..).ok_or_else(|| {
+                    Error::CorruptedData(format!(
+                        "JSON opaque offset {} past len {}",
+                        body_off,
+                        self.value().len()
+                    ))
+                })?;
+                let (opaque_bytes_len, len_len) = NumberCodec::try_decode_var_u64(tail)?;
+                let total = (opaque_bytes_len as usize)
+                    .checked_add(len_len)
+                    .and_then(|t| t.checked_add(1))
+                    .ok_or_else(|| Error::CorruptedData("JSON opaque length overflow".into()))?;
+                let end = val_offset.checked_add(total).ok_or_else(|| {
+                    Error::CorruptedData("JSON opaque range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
             }
             JsonType::Date | JsonType::Datetime | JsonType::Timestamp => {
-                JsonRef::new(val_type, &self.value()[val_offset..val_offset + TIME_LEN])
+                let end = val_offset.checked_add(TIME_LEN).ok_or_else(|| {
+                    Error::CorruptedData("JSON time range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
             }
-            JsonType::Time => JsonRef::new(
-                val_type,
-                &self.value()[val_offset..val_offset + DURATION_LEN],
-            ),
+            JsonType::Time => {
+                let end = val_offset.checked_add(DURATION_LEN).ok_or_else(|| {
+                    Error::CorruptedData("JSON duration range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
+            }
             _ => {
-                let data_size =
-                    NumberCodec::decode_u32_le(&self.value()[val_offset + ELEMENT_COUNT_LEN..])
-                        as usize;
-                JsonRef::new(val_type, &self.value()[val_offset..val_offset + data_size])
+                let size_off = val_offset.checked_add(ELEMENT_COUNT_LEN).ok_or_else(|| {
+                    Error::CorruptedData("JSON nested size offset overflow".into())
+                })?;
+                let data_size = self.try_decode_u32_le_at(size_off)? as usize;
+                let end = val_offset.checked_add(data_size).ok_or_else(|| {
+                    Error::CorruptedData("JSON nested range overflow".into())
+                })?;
+                JsonRef::new(val_type, self.try_slice(val_offset, end)?)
             }
         })
     }
@@ -264,11 +360,19 @@ mod tests {
             false
         );
         assert_eq!(
-            json_array_ref.array_get_elem(6).unwrap().object_get_key(0),
+            json_array_ref
+                .array_get_elem(6)
+                .unwrap()
+                .object_get_key(0)
+                .unwrap(),
             b"key1"
         );
         assert_eq!(
-            json_array_ref.array_get_elem(6).unwrap().object_get_key(1),
+            json_array_ref
+                .array_get_elem(6)
+                .unwrap()
+                .object_get_key(1)
+                .unwrap(),
             b"key2"
         );
         assert_eq!(
@@ -326,10 +430,10 @@ mod tests {
         .unwrap();
         let json_object_ref = json_object.as_ref();
 
-        assert_eq!(json_object_ref.object_get_key(0), b"0");
-        assert_eq!(json_object_ref.object_get_key(1), b"1");
-        assert_eq!(json_object_ref.object_get_key(2), b"2");
-        assert_eq!(json_object_ref.object_get_key(3), b"3");
+        assert_eq!(json_object_ref.object_get_key(0).unwrap(), b"0");
+        assert_eq!(json_object_ref.object_get_key(1).unwrap(), b"1");
+        assert_eq!(json_object_ref.object_get_key(2).unwrap(), b"2");
+        assert_eq!(json_object_ref.object_get_key(3).unwrap(), b"3");
 
         assert_eq!(json_object_ref.object_get_val(0).unwrap().get_u64(), 1);
         assert_eq!(
@@ -384,11 +488,19 @@ mod tests {
             false
         );
         assert_eq!(
-            json_object_ref.object_get_val(6).unwrap().object_get_key(0),
+            json_object_ref
+                .object_get_val(6)
+                .unwrap()
+                .object_get_key(0)
+                .unwrap(),
             b"key1"
         );
         assert_eq!(
-            json_object_ref.object_get_val(6).unwrap().object_get_key(1),
+            json_object_ref
+                .object_get_val(6)
+                .unwrap()
+                .object_get_key(1)
+                .unwrap(),
             b"key2"
         );
         assert_eq!(
@@ -410,5 +522,57 @@ mod tests {
                 .unwrap(),
             "abcdefg"
         );
+    }
+
+    /// Poison / truncated object binary must return `CorruptedData`, not panic.
+    ///
+    /// Untrusted storage can present wild key offsets; slice indexing used to
+    /// panic (coprocessor DoS). Bounds-checked accessors return an error.
+    #[test]
+    fn test_object_get_key_poison_offsets_err_not_panic() {
+        // type Object + 8-byte header (elem_count=1, size=...) + key entry with
+        // huge key_off so key slice is OOB.
+        let mut value = vec![0u8; HEADER_LEN + KEY_ENTRY_LEN];
+        let value_len = value.len() as u32;
+        // element count = 1
+        value[0..4].copy_from_slice(&1u32.to_le_bytes());
+        // size = value.len()
+        value[4..8].copy_from_slice(&value_len.to_le_bytes());
+        // key_off = 0xffff_fff0, key_len = 4
+        let key_entry = HEADER_LEN;
+        value[key_entry..key_entry + 4].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+        value[key_entry + 4..key_entry + 6].copy_from_slice(&4u16.to_le_bytes());
+
+        let j = JsonRef::new(JsonType::Object, &value);
+        let err = j.object_get_key(0).unwrap_err();
+        match err {
+            crate::codec::Error::CorruptedData(msg) => {
+                assert!(
+                    msg.contains("out of bounds") || msg.contains("overflow"),
+                    "unexpected msg: {}",
+                    msg
+                );
+            }
+            other => panic!("expected CorruptedData, got {:?}", other),
+        }
+
+        // Truncated key-entry table: elem_count claims 2 keys but buffer too short.
+        let mut short = vec![0u8; HEADER_LEN];
+        short[0..4].copy_from_slice(&2u32.to_le_bytes());
+        short[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let j2 = JsonRef::new(JsonType::Object, &short);
+        assert!(j2.object_get_key(0).is_err());
+        assert!(j2.object_search_key(b"x").is_err());
+    }
+
+    #[test]
+    fn test_array_get_elem_truncated_err_not_panic() {
+        // Array header claims 1 elem but no value entry bytes.
+        let mut value = vec![0u8; HEADER_LEN];
+        value[0..4].copy_from_slice(&1u32.to_le_bytes());
+        value[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let j = JsonRef::new(JsonType::Array, &value);
+        assert!(j.array_get_elem(0).is_err());
+        assert!(j.val_entry_get(HEADER_LEN).is_err());
     }
 }

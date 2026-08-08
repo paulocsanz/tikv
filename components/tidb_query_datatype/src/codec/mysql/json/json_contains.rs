@@ -14,9 +14,9 @@ impl JsonRef<'_> {
                 if target.type_code == JsonType::Object {
                     let elem_count = target.get_elem_count();
                     for i in 0..elem_count {
-                        let key = target.object_get_key(i);
+                        let key = target.object_get_key(i)?;
                         let val = target.object_get_val(i)?;
-                        let idx = self.object_search_key(key);
+                        let idx = self.object_search_key(key)?;
                         match idx {
                             None => {
                                 return Ok(false);

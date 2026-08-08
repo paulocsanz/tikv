@@ -40,7 +40,7 @@ fn json_keys(j: &JsonRef<'_>) -> Result<Option<Json>> {
         let elem_count = j.get_elem_count();
         let mut ret = Vec::with_capacity(elem_count);
         for i in 0..elem_count {
-            ret.push(Json::from_str_val(str::from_utf8(j.object_get_key(i))?)?);
+            ret.push(Json::from_str_val(str::from_utf8(j.object_get_key(i)?)?)?);
         }
         Some(Json::from_array(ret)?)
     } else {
