@@ -3851,3 +3851,270 @@ fn test_dst_fault_matrix_exhaustive() {
         );
     }
 }
+
+// ─── Deep fault batch 3: edge-case safety oracles ────────────────────
+
+/// Transfer leadership to a lagging follower (node 3), which is behind
+/// because it was stopped. After restart and transfer, it must correctly
+/// become leader and serve all prior committed data.
+#[test]
+fn test_deep_transfer_to_lagging_node() {
+    let seed = 0x1717u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..20 {
+        cluster.must_put(format!("tl_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3 to make it lag.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write more while node 3 is down.
+    for i in 20u32..40 {
+        cluster.must_put(format!("tl_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3 and transfer leadership to it.
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(3, 3));
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ALL data must be correct under the new leader (node 3).
+    for i in 0u32..40 {
+        let v = cluster.must_get(format!("tl_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key tl_{i:02} lost after transfer to lagging node 3");
+    }
+
+    // Write under new leader.
+    cluster.must_put(b"tl_new_leader", b"works");
+    assert_eq!(cluster.must_get(b"tl_new_leader"), Some(b"works".to_vec()),
+        "BUG: write under new leader node 3 failed");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP12 OK");
+}
+
+/// Rapidly overwrite the same key many times under partition, then heal
+/// and verify the final value is consistent. Tests last-write-wins under
+/// intermittent fault.
+#[test]
+fn test_deep_overwrite_stress() {
+    let seed = 0x2828u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Intermittent MsgAppend drop to node 3.
+    let drop_flag = Arc::new(AtomicBool::new(false));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgAppend)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    // Overwrite same key 100 times, toggling drop every 5 writes.
+    for i in 0u32..100 {
+        if i % 5 == 0 {
+            drop_flag.store(!drop_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        cluster.must_put(b"overwrite_me", format!("val_{i:03}").as_bytes());
+    }
+
+    // Heal.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Final value must be val_099.
+    let v = cluster.must_get(b"overwrite_me");
+    assert_eq!(v.as_deref(), Some(b"val_099".as_slice()),
+        "BUG: overwrite last-write-wins violated, expected val_099 got {v:?}");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP13 OK");
+}
+
+/// Double split: split a region, then split one of the children.
+/// All data must be accessible across all three resulting regions.
+#[test]
+fn test_deep_double_split() {
+    let seed = 0x3939u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..30 {
+        cluster.must_put(format!("ds_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"ds_000");
+    cluster.must_split(&region, b"ds_010");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Split the first child again.
+    let child = cluster.get_region(b"ds_005");
+    cluster.must_split(&child, b"ds_005");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write to all three resulting ranges.
+    cluster.must_put(b"ds_002", b"new_lo");
+    cluster.must_put(b"ds_007", b"new_mid");
+    cluster.must_put(b"ds_020", b"new_hi");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify original data.
+    for i in 0u32..30 {
+        let key = format!("ds_{i:03}");
+        let expected = format!("v{i:03}");
+        // Keys 2 and 7 and 20 were overwritten.
+        let expected = match i {
+            2 => "new_lo".to_string(),
+            7 => "new_mid".to_string(),
+            20 => "new_hi".to_string(),
+            _ => expected,
+        };
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_deref(), Some(expected.as_bytes()),
+            "BUG: key {key} lost after double split, expected {expected}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP14 OK");
+}
+
+/// Partition only node 2 (one follower). Write should succeed via
+/// leader + node 3 (majority). Heal and verify node 2 catches up.
+#[test]
+fn test_deep_single_follower_partition_write() {
+    let seed = 0x4A4Au64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"sp_base", b"base");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Partition only node 2 (bidirectional).
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let f_recv = RegionPacketFilter::new(1, 2)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(2, Box::new(f_recv));
+    let f_send = RegionPacketFilter::new(1, 2)
+        .direction(Direction::Send)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(2, Box::new(f_send));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write — must succeed via leader (1) + node 3 = quorum.
+    for i in 0u32..10 {
+        cluster.must_put(format!("sp_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal node 2.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(2);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // All data must be present.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("sp_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key sp_{i:02} lost after single-follower partition");
+    }
+    assert_eq!(cluster.must_get(b"sp_base"), Some(b"base".to_vec()),
+        "BUG: sp_base lost after partition");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP15 OK");
+}
+
+/// Write during leader transfer, then verify data consistency.
+/// This tests the proposal-vs-transfer race.
+#[test]
+fn test_deep_write_during_transfer() {
+    let seed = 0x5B5Bu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("wt_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Start transfer to node 2.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Write during/after transfer.
+    for i in 0u32..10 {
+        cluster.must_put(format!("wt_new_{i}").as_bytes(), format!("nv{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify all data.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("wt_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key wt_{i} lost during transfer+write race");
+    }
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("wt_new_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("nv{i}").as_bytes()).as_deref(),
+            "BUG: key wt_new_{i} lost during transfer+write race");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP16 OK");
+}
+
+/// Large value write under fault — tests that large entries (which may
+/// require multiple raft rounds) are replicated correctly under drops.
+#[test]
+fn test_deep_large_value_under_drop() {
+    let seed = 0x6C6Cu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Drop 50% of MsgAppend to node 3.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgAppend)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    // Write large values.
+    let big_val = "X".repeat(4096);
+    for i in 0u32..5 {
+        cluster.must_put(format!("big_{i}").as_bytes(), big_val.as_bytes());
+        drop_flag.store(
+            (i % 2) == 0,
+            Ordering::SeqCst,
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify large values.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("big_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(big_val.as_bytes()),
+            "BUG: large value big_{i} corrupted or lost");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP17 OK");
+}
