@@ -4,18 +4,19 @@
 //
 // Proves:
 // 1. DstNetworkQueue hold/sort/release is seed-stable (unit, no cluster).
-// 2. 1-node cluster under dst + logical clock can elect + put/get, and two
-//    runs with the same seed produce the same stable KV fingerprint.
-// 3. (heavier) step-driven 3-node path is available behind env DST_FULL=1.
+// 2. 1-node: same seed → same KV fingerprint (hybrid clock).
+// 3. 3-node: DstNetworkQueue batch_size=1 + hybrid clock → same KV fingerprint.
+// 4. 3-node pure-hold + manual drive → KV + MsgApp ops sequence bit-match.
 //
 // Run:
 //   cargo test -p tests --features "dst,testexport" --test dst_raftstore -- --test-threads=1
-//   DST_FULL=1 cargo test -p tests --features "dst,testexport" --test dst_raftstore \
-//     test_dst_step_driven_put_fingerprint -- --test-threads=1 --nocapture
 
 #![cfg(feature = "dst")]
 
-use std::task::{Context, Poll};
+use std::{
+    task::{Context, Poll},
+    time::{Duration, Instant as WallInstant},
+};
 
 use futures::Future;
 use kvproto::raft_serverpb::RaftMessage;
@@ -121,6 +122,87 @@ fn run_single_node_scenario(seed: u64) -> String {
     fp
 }
 
+/// Wait until region 1 has a leader (hybrid clock + wall sleep).
+fn wait_leader(
+    cluster: &mut test_raftstore::Cluster<test_raftstore::NodeCluster>,
+    max_iters: usize,
+) -> bool {
+    for _ in 0..max_iters {
+        if cluster.leader_of_region(1).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cluster.leader_of_region(1).is_some()
+}
+
+/// Bootstrap shared by 3-node scenarios: hybrid clock, pool_size=1, elect, force leader 1.
+fn bootstrap_3node(seed: u64) -> test_raftstore::Cluster<test_raftstore::NodeCluster> {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(
+        wait_leader(&mut cluster, 100),
+        "3-node cluster failed to elect a leader under dst"
+    );
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    // Settle transfer under hybrid + auto driver.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(50));
+        if cluster
+            .leader_of_region(1)
+            .map(|p| p.get_store_id() == 1)
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
+    cluster
+}
+
+/// 3-node + DstNetworkQueue(batch_size=1): every send path sorts then releases.
+/// Hybrid clock + auto poller driver. Proves ordered virtual net + dst seed
+/// yield a stable KV fingerprint without pure-hold (which needs manual drive).
+fn run_ordered_net_scenario(seed: u64) -> (String, String) {
+    let mut cluster = bootstrap_3node(seed);
+
+    let net = DstNetworkQueue::new(seed, 1);
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    let keys: &[&[u8]] = &[b"on_a", b"on_b", b"on_c"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("ov{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let stable = rich_fingerprint_stable(&mut cluster, keys);
+    let app = net.log_summary_app_only();
+    let leader = cluster
+        .leader_of_region(1)
+        .map(|l| l.get_store_id())
+        .unwrap_or(0);
+    let full = format!("leader={leader} {stable} app=[{app}]");
+
+    cluster.clear_send_filters();
+    cluster.shutdown();
+    (stable, full)
+}
+
 // ─── Step-driven helpers (opt-in via DST_FULL=1) ───────────────────────
 
 fn network_step(
@@ -165,6 +247,7 @@ fn put_stepped(
     net: &DstNetworkQueue,
     key: &[u8],
     val: &[u8],
+    wall_deadline: WallInstant,
 ) -> bool {
     let mut fut = match cluster.async_put(key, val) {
         Ok(f) => f,
@@ -173,9 +256,23 @@ fn put_stepped(
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     net.set_recording(true);
-    for _ in 0..4000 {
+    // Cap iterations + hard wall budget so a stuck pure-hold cannot hang CI.
+    for iter in 0..2000 {
+        if WallInstant::now() > wall_deadline {
+            eprintln!(
+                "put_stepped wall deadline hit for key={} after {iter} iters (pending={})",
+                String::from_utf8_lossy(key),
+                net.pending()
+            );
+            break;
+        }
         let _ = batch_system::step_all_once();
-        while network_step(cluster, net) > 0 {}
+        // Flush production aggressively each poller round.
+        for _ in 0..8 {
+            if network_step(cluster, net) == 0 {
+                break;
+            }
+        }
         match Future::poll(fut.as_mut(), &mut cx) {
             Poll::Ready(resp) => {
                 let ok = !resp.get_header().has_error();
@@ -184,7 +281,10 @@ fn put_stepped(
                 net.set_recording(true);
                 return ok;
             }
-            Poll::Pending => dst_tick_ms(5),
+            Poll::Pending => {
+                // Advance logical time enough for a Raft tick (~50ms lease cfg).
+                dst_tick_ms(10);
+            }
         }
     }
     net.set_recording(false);
@@ -193,53 +293,37 @@ fn put_stepped(
     false
 }
 
-fn run_step_driven_scenario(seed: u64) -> (String, String) {
-    tikv_util::dst_init::dst_init(seed);
-    // Hybrid clock during bootstrap so election / transfer make progress.
-    time::dst_set_manual_only(false);
-    time::dst_start_hybrid_driver(std::time::Duration::from_millis(1));
-    batch_system::set_manual_drive(false);
+/// Returns (stable_kv, full_trace, app_summary, ops_sequence).
+fn run_step_driven_scenario(seed: u64) -> (String, String, String, String) {
+    let mut cluster = bootstrap_3node(seed);
 
-    let mut cluster = new_node_cluster(seed, 3);
-    dst_setup_cluster(&mut cluster);
-    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
-    cluster.run();
-
-    for _ in 0..80 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        if cluster.leader_of_region(1).is_some() {
-            break;
-        }
-    }
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cluster.must_transfer_leader(1, new_peer(1, 1));
-    }));
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
+    // Phase-align clock + freeze hybrid + pause background poller driver.
     {
         let now = time::dst_now_nanos();
         let align: i64 = 1_000_000_000;
         let aligned = ((now / align) + 2) * align;
         time::dst_set_logical_nanos(aligned);
     }
-    // Pure step-driven phase for puts.
     batch_system::set_manual_drive(true);
     time::dst_set_manual_only(true);
     tikv_util::dst_init::dst_reseed_before_phase();
 
+    // Pure hold — only network_step delivers.
     let net = DstNetworkQueue::new(seed, 0);
     cluster.add_send_filter(CloneFilterFactory(net.clone()));
     net.clear_log();
 
+    let wall_deadline = WallInstant::now() + Duration::from_secs(45);
     let keys: &[&[u8]] = &[b"sd_a", b"sd_b", b"sd_c"];
     for (i, k) in keys.iter().enumerate() {
         let val = format!("sv{seed}_{i}");
-        let ok = put_stepped(&mut cluster, &net, k, val.as_bytes());
+        let ok = put_stepped(&mut cluster, &net, k, val.as_bytes(), wall_deadline);
         assert!(
             ok,
-            "stepped put failed for key {}",
-            String::from_utf8_lossy(k)
+            "stepped put failed for key {} (pending={} live_pollers={})",
+            String::from_utf8_lossy(k),
+            net.pending(),
+            batch_system::live_count()
         );
     }
 
@@ -248,16 +332,18 @@ fn run_step_driven_scenario(seed: u64) -> (String, String) {
 
     let stable = rich_fingerprint_stable(&mut cluster, keys);
     let app = net.log_summary_app_only();
+    let ops = net.log_ops_sequence();
     let leader = cluster
         .leader_of_region(1)
         .map(|l| l.get_store_id())
         .unwrap_or(0);
-    let full = format!("leader={leader} {stable} app=[{app}]");
+    let full = format!("leader={leader} {stable} app=[{app}] ops_len={}", ops.len());
 
+    cluster.clear_send_filters();
     cluster.shutdown();
     batch_system::set_manual_drive(false);
     time::dst_set_manual_only(false);
-    (stable, full)
+    (stable, full, app, ops)
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -297,21 +383,54 @@ fn test_dst_single_node_fingerprint_replay() {
     assert!(!a.contains("=none"), "put values missing in {a}");
 }
 
-/// Full step-driven 3-node path. Opt-in: can hang under residual races while
-/// the virtual net + manual drive path is still being hardened.
+/// 3-node + ordered virtual net (batch_size=1). Always-on claim.
+#[test]
+fn test_dst_ordered_net_3node_fingerprint() {
+    let seed: u64 = 0x03d3; // ordered-net
+    let (s1, f1) = run_ordered_net_scenario(seed);
+    let (s2, f2) = run_ordered_net_scenario(seed);
+    eprintln!("DST_ORD stable1: {s1}");
+    eprintln!("DST_ORD stable2: {s2}");
+    eprintln!("DST_ORD full1: {f1}");
+    eprintln!("DST_ORD full2: {f2}");
+    assert_eq!(
+        s1, s2,
+        "3-node ordered-net stable fingerprint must match across seed replay"
+    );
+    assert!(
+        !s1.contains("=none"),
+        "puts must land in fingerprint: {s1}"
+    );
+    // Leader forced to 1 when transfer succeeds; if not, still require data match.
+    if f1.contains("leader=1") {
+        assert!(f2.contains("leader=1"));
+    }
+}
+
+/// Pure-hold + manual drive 3-node: KV + MsgApp path summary bit-match.
+/// Wall-capped put_stepped so a regression cannot hang CI forever.
 #[test]
 fn test_dst_step_driven_put_fingerprint() {
-    if std::env::var_os("DST_FULL").is_none() {
-        eprintln!("skip test_dst_step_driven_put_fingerprint (set DST_FULL=1 to enable)");
-        return;
-    }
     let seed: u64 = 0x5d01;
-    let (s1, f1) = run_step_driven_scenario(seed);
-    let (s2, f2) = run_step_driven_scenario(seed);
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed);
     eprintln!("DST_STEP stable1: {s1}");
     eprintln!("DST_STEP stable2: {s2}");
+    eprintln!("DST_STEP app1: {app1}");
+    eprintln!("DST_STEP app2: {app2}");
+    eprintln!("DST_STEP ops_len1={} ops_len2={}", ops1.len(), ops2.len());
     eprintln!("DST_STEP full1: {f1}");
     eprintln!("DST_STEP full2: {f2}");
-    assert_eq!(s1, s2);
+    assert_eq!(s1, s2, "step-driven stable fingerprint must match");
+    assert!(!s1.contains("=none"), "puts missing: {s1}");
     assert!(f1.contains("leader=1") && f2.contains("leader=1"));
+    // Stronger: client replication path counts under pure-hold + manual drive.
+    assert_eq!(
+        app1, app2,
+        "MsgApp/AppResp summary must match under pure step-driven schedule"
+    );
+    assert_eq!(
+        ops1, ops2,
+        "MsgApp/AppResp ops sequence must match under pure step-driven schedule"
+    );
 }
