@@ -716,6 +716,24 @@ fn test_dst_step_driven_put_fingerprint() {
     );
 }
 
+/// Heavier always-on full freeze: 5 puts (max STEP_KEYS) under pure-hold.
+#[test]
+fn test_dst_step_driven_5keys_full_freeze() {
+    let seed: u64 = 0x5d01;
+    let n = STEP_KEYS.len();
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n, 0, 0);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n, 0, 0);
+    eprintln!("DST_5K stable1: {s1}");
+    eprintln!("DST_5K stable2: {s2}");
+    eprintln!("DST_5K app1: {app1}");
+    eprintln!("DST_5K ops_len1={} ops_len2={}", ops1.len(), ops2.len());
+    assert_eq!(s1, s2);
+    assert!(!s1.contains("=none"));
+    assert!(f1.contains("leader=1") && f2.contains("leader=1"));
+    assert_eq!(app1, app2, "5-key app summary must match");
+    assert_eq!(ops1, ops2, "5-key ops sequence must match");
+}
+
 /// Append one JSON object line to `DST_FUZZ_SCOREBOARD` if set.
 fn scoreboard_write(line: &str) {
     let Ok(path) = std::env::var("DST_FUZZ_SCOREBOARD") else {
