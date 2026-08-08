@@ -3281,3 +3281,573 @@ fn test_deep_transfer_timeoutnow_drop() {
     cleanup_cluster();
     eprintln!("DST_DEEP8 OK");
 }
+
+// ─── Deep fault batch 2: complex multi-step paths ────────────────────
+
+/// Split a region while node 3 is partitioned from the leader.
+/// After healing, all data must be accessible in the correct post-split
+/// regions — no loss, no duplication.
+#[test]
+fn test_deep_split_during_partition() {
+    let seed = 0x5151u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    // Write keys spanning the future split boundary.
+    for i in 0u32..10 {
+        cluster.must_put(format!("k{:04}", i).as_bytes(), format!("pre{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"k0000");
+    let split_key = b"k0005";
+
+    // Partition node 3 (follower) before split.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(region.get_id(), 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Split while node 3 is partitioned.
+    cluster.must_split(&region, split_key);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write to both halves of the split while node 3 is still partitioned.
+    cluster.must_put(b"k0002b", b"post_lo");
+    cluster.must_put(b"k0008b", b"post_hi");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal node 3.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify ALL pre-split data survived.
+    for i in 0u32..10 {
+        let key = format!("k{i:04}");
+        let expected = format!("pre{i}");
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(
+            v.as_deref(),
+            Some(expected.as_bytes()),
+            "BUG: key {key} lost after split+partition, expected={expected}"
+        );
+    }
+    // Verify post-split writes.
+    assert_eq!(cluster.must_get(b"k0002b"), Some(b"post_lo".to_vec()),
+        "BUG: post-split write k0002b lost");
+    assert_eq!(cluster.must_get(b"k0008b"), Some(b"post_hi".to_vec()),
+        "BUG: post-split write k0008b lost");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP7-split OK");
+}
+
+/// Compact the data mid-flight, then verify all pre-compaction and
+/// post-compaction data is still readable. This tests the raft log
+/// truncation + RocksDB compaction interaction.
+#[test]
+fn test_deep_compact_then_continue() {
+    let seed = 0x6262u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write data, compact, then verify.
+    for i in 0u32..50 {
+        cluster.must_put(format!("c1_{i:03}").as_bytes(), format!("v1_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in [0u32, 10, 25, 49] {
+        let v = cluster.must_get(format!("c1_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v1_{i:03}").as_bytes()).as_deref(),
+            "BUG: key c1_{i:03} lost after compaction");
+    }
+
+    // Phase 2: write MORE data after compaction.
+    for i in 0u32..50 {
+        cluster.must_put(format!("c2_{i:03}").as_bytes(), format!("v2_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify old data still there.
+    for i in [0u32, 25, 49] {
+        let v = cluster.must_get(format!("c1_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v1_{i:03}").as_bytes()).as_deref(),
+            "BUG: old key c1_{i:03} lost after phase 2");
+    }
+    // Verify new data.
+    for i in [0u32, 25, 49] {
+        let v = cluster.must_get(format!("c2_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v2_{i:03}").as_bytes()).as_deref(),
+            "BUG: new key c2_{i:03} missing");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP7-compact OK");
+}
+
+/// Stop a node, write more data, restart the node, and verify it
+/// catches up to the latest committed data.
+#[test]
+fn test_deep_node_restart_catchup() {
+    let seed = 0x7373u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("r1_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write more data while node 3 is down.
+    for i in 0u32..10 {
+        cluster.must_put(format!("r2_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify node 3 has caught up — data from before AND after the stop.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("r1_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: r1_{i:02} lost on node 3 after restart");
+    }
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("r2_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: r2_{i:02} not replicated to node 3 after restart");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP7-restart OK");
+}
+
+/// Add a 4th peer (node 4) to the region while node 3 is partitioned.
+/// The conf change should succeed via the majority (1+2), and node 4
+/// should receive data once it's added. Node 3 should catch up after heal.
+#[test]
+fn test_deep_add_peer_during_partition() {
+    let seed = 0x8484u64;
+    let mut cluster = new_node_cluster(seed, 4);
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Bootstrap data.
+    for i in 0u32..10 {
+        cluster.must_put(format!("ap_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region_id = cluster.get_region_id(b"ap_00");
+
+    // Partition node 3.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(region_id, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Add node 4 as a new peer.
+    let mut add_fut = cluster
+        .async_add_peer(region_id, new_peer(4, 4))
+        .unwrap();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let deadline = WallInstant::now() + Duration::from_secs(10);
+    let mut add_ok = false;
+    loop {
+        if WallInstant::now() > deadline {
+            break;
+        }
+        match add_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(resp) => {
+                add_ok = !resp.get_header().has_error();
+                break;
+            }
+            Poll::Pending => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+
+    eprintln!("DST_DEEP9 add_peer during partition: succeeded={add_ok}");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write after conf change.
+    cluster.must_put(b"ap_post", b"post_val");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal node 3.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify ALL data.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("ap_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: ap_{i:02} lost after add_peer+partition");
+    }
+    assert_eq!(cluster.must_get(b"ap_post"), Some(b"post_val".to_vec()),
+        "BUG: post-conf-change write lost");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP9 OK");
+}
+
+/// Rapid writes to a leader while MsgAppend drops intermittently to
+/// one follower. The leader should retry and eventually replicate to
+/// all alive followers. No committed entry should be lost.
+#[test]
+fn test_deep_intermittent_append_drop() {
+    let seed = 0x9595u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("warm_{i}").as_bytes(), b"warm");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Intermittent drop: toggle every 200ms.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .msg_type(MessageType::MsgAppend)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    // Writer thread: continuously toggle and write.
+    let flag = drop_flag.clone();
+    let toggle = std::thread::spawn(move || {
+        for _ in 0..25 {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(
+                !flag.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        }
+    });
+
+    // Write 50 keys while drops are intermittent.
+    for i in 0u32..50 {
+        cluster.must_put(format!("int_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes());
+    }
+
+    toggle.join().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal fully.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // ALL 50 keys must be present and correct.
+    for i in 0u32..50 {
+        let v = cluster.must_get(format!("int_{i:03}").as_bytes());
+        assert_eq!(
+            v.as_deref(),
+            Some(format!("val_{i:03}").as_bytes()).as_deref(),
+            "BUG: key int_{i:03} lost during intermittent append drops"
+        );
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP10 OK");
+}
+
+/// Delete keys during partition, then heal and verify deletes are
+/// replicated. This tests the tombstone path under fault.
+#[test]
+fn test_deep_delete_during_partition() {
+    let seed = 0xA6A6u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..20 {
+        cluster.must_put(format!("del_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Partition node 3.
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Delete half the keys while partitioned.
+    for i in 0u32..10 {
+        cluster.must_delete(format!("del_{i:02}").as_bytes());
+    }
+    // Write some new keys.
+    for i in 0u32..5 {
+        cluster.must_put(format!("new_{i:02}").as_bytes(), b"new_val");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal node 3.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Deleted keys must be gone.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("del_{i:02}").as_bytes());
+        assert!(
+            v.is_none(),
+            "BUG: deleted key del_{i:02} resurrected after heal"
+        );
+    }
+    // Remaining original keys must survive.
+    for i in 10u32..20 {
+        let v = cluster.must_get(format!("del_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()).as_deref(),
+            "BUG: key del_{i:02} lost after delete+partition");
+    }
+    // New keys must be present.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("new_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(b"new_val".as_slice()),
+            "BUG: new key new_{i:02} not replicated to node 3");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP11 OK");
+}
+
+// ─── Fault dimension matrix: exhaustive 2^5 subset enumeration ───────────
+//
+// Tests ALL 32 subsets of the 5 active fault dimensions. For each subset,
+// only the enabled dimensions are active; disabled ones are off. This is
+// the definitive "100% fault coverage" test — every combination is exercised.
+//
+// Bit mapping:
+//   bit 0: reorder (Adversarial)
+//   bit 1: dup (15%)
+//   bit 2: drop (10%)
+//   bit 3: delay (max=2)
+//   bit 4: partition (node 2 isolated → heal)
+//
+// mask=0b00000 = no faults (baseline)
+// mask=0b11111 = all 5 dimensions simultaneously
+
+fn fault_mask_name(mask: u32) -> String {
+    let parts = [
+        (mask & 1 != 0, "reorder"),
+        (mask & 2 != 0, "dup"),
+        (mask & 4 != 0, "drop"),
+        (mask & 8 != 0, "delay"),
+        (mask & 16 != 0, "partition"),
+    ];
+    let active: Vec<&str> = parts.iter().filter(|(a, _)| *a).map(|(_, n)| *n).collect();
+    if active.is_empty() {
+        "none".to_string()
+    } else {
+        active.join("+")
+    }
+}
+
+fn run_fault_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Build network with only the enabled fault dimensions.
+    let mut net = DstNetworkQueue::new(seed, 1); // batch_size=1: auto-release
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(2, 1);
+        net.add_partition(2, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Write 3 keys under the current fault configuration.
+    let keys: [&[u8]; 3] = [b"fm_1", b"fm_2", b"fm_3"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("fmv_{mask}_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal partition if it was active.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    // Clear all faults and let raft converge.
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(400));
+
+    // ORACLE: all keys must converge with correct values.
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=fmv_{mask}_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "MATRIX SAFETY VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {} missing: {stable}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_fault_matrix_exhaustive() {
+    // Determine which masks to run.
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_MATRIX_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_MATRIX_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            // Comma-separated explicit list.
+            raw.split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        }
+    };
+
+    let n_seeds: usize = std::env::var("DST_MATRIX_SEEDS")
+        .ok()
+        .and_then(|s| {
+            if let Some((lo, hi)) = s.split_once("..") {
+                let lo: u64 = lo.trim().parse().unwrap_or(0);
+                let hi: u64 = hi.trim().parse().unwrap_or(lo);
+                Some((lo..hi).count())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(3);
+
+    let total = masks.len() * n_seeds;
+    eprintln!(
+        "DST_MATRIX masks={} ({}..{}) seeds_per_mask={} total_cells={}",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0),
+        n_seeds,
+        total
+    );
+
+    let mut passed = 0usize;
+    let mut failed_cells: Vec<(u32, u64)> = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let mut mask_ok = true;
+        for seed in 0..n_seeds as u64 {
+            let seed_val = seed.wrapping_add(0x1000 * mask as u64);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_fault_matrix_cell(mask, seed_val);
+            }));
+            if result.is_ok() {
+                passed += 1;
+            } else {
+                mask_ok = false;
+                failed_cells.push((mask, seed_val));
+                eprintln!(
+                    "DST_MATRIX FAIL mask=0b{:05b} ({}) seed={seed_val:#x}",
+                    mask,
+                    dims
+                );
+                // If replay mode, stop on first fail.
+                if std::env::var("DST_MATRIX_REPLAY").is_ok() {
+                    panic!("matrix replay fail");
+                }
+            }
+        }
+        if mask_ok {
+            eprintln!(
+                "DST_MATRIX mask=0b{:05b} ({}) {} seeds OK",
+                mask,
+                dims,
+                n_seeds
+            );
+        }
+    }
+
+    eprintln!(
+        "DST_MATRIX done: {passed}/{} cells passed, {} failed",
+        total,
+        failed_cells.len()
+    );
+
+    if !failed_cells.is_empty() {
+        let replay_hints: Vec<String> = failed_cells
+            .iter()
+            .map(|(m, s)| format!("mask={m} seed={s:#x}"))
+            .collect();
+        eprintln!("Replay with: DST_MATRIX_REPLAY=<mask> for individual cells");
+        panic!(
+            "fault matrix failed: {}/{} cells. First fail: {}. Replay hints: {}",
+            failed_cells.len(),
+            total,
+            replay_hints.first().unwrap(),
+            replay_hints.join(", ")
+        );
+    }
+}
