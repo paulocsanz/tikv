@@ -330,7 +330,12 @@ fn run_step_driven_scenario(
     cluster.add_send_filter(CloneFilterFactory(net.clone()));
     net.clear_log();
 
-    let wall_deadline = WallInstant::now() + Duration::from_secs(45);
+    // Budget scales with keys + fault planes (delay steps need extra drain rounds).
+    let budget_secs = 45u64
+        .saturating_add(n_keys as u64 * 10)
+        .saturating_add(drop_pct as u64 / 5)
+        .saturating_add(max_delay as u64 * 15);
+    let wall_deadline = WallInstant::now() + Duration::from_secs(budget_secs);
     let keys = &STEP_KEYS[..n_keys];
     for (i, k) in keys.iter().enumerate() {
         let val = format!("sv{seed}_{i}");
