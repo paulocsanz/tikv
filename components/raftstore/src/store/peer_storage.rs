@@ -1259,6 +1259,12 @@ where
 
         drop(pending_create_peers);
 
+        // Fail point for testing the crash window between kv_db and raft_db
+        // writes in clear_meta. If the kv_db write succeeds (Tombstone) but
+        // the process crashes before the raft_db cleanup, on restart
+        // clear_stale_meta handles the orphaned raft data.
+        fail_point!("clear_meta_after_kv_write");
+
         let start = Instant::now();
         engines.raft.consume(&mut raft_wb, true)?;
         let raft_duration = start.saturating_elapsed();
@@ -2546,5 +2552,95 @@ pub mod tests {
             index: Arc::new(AtomicU64::new(0)),
             receiver: rx,
         }
+    }
+
+    /// Test the "phantom peer" scenario: after `clear_meta_in_kv_and_raft`,
+    /// if the kv_db Tombstone write is lost (lying fsync) but the raft_db
+    /// cleanup succeeds, the region reappears on restart with a synthetic
+    /// raft state (last_index=5) while apply_state shows a much higher
+    /// applied_index.
+    ///
+    /// This test verifies that PeerStorage::new does NOT panic on this
+    /// inconsistent state and creates a valid (if confused) peer.
+    #[test]
+    fn test_phantom_peer_after_clear_meta_lying_fsync() {
+        let td = Builder::new()
+            .prefix("tikv-store-test-phantom")
+            .tempdir()
+            .unwrap();
+        let region_worker = LazyWorker::new("snap-manager");
+        let region_sched = region_worker.scheduler();
+        let raftlog_fetch_worker = LazyWorker::new(RAFTLOG_FETCH_WORKER_THREAD);
+        let raftlog_fetch_sched = raftlog_fetch_worker.scheduler();
+        let kv_db = engine_test::kv::new_engine(td.path().to_str().unwrap(), ALL_CFS).unwrap();
+        let raft_path = td.path().join(Path::new("raft"));
+        let raft_db = engine_test::raft::new_engine(raft_path.to_str().unwrap(), None).unwrap();
+        let engines = Engines::new(kv_db, raft_db);
+        bootstrap_store(&engines, 1, 1).unwrap();
+
+        let region = initial_region(1, 1, 1);
+        prepare_bootstrap_cluster(&engines, &region).unwrap();
+
+        let build_storage = || -> Result<PeerStorage<KvTestEngine, RaftTestEngine>> {
+            PeerStorage::new(
+                engines.clone(),
+                &region,
+                region_sched.clone(),
+                raftlog_fetch_sched.clone(),
+                0,
+                "".to_owned(),
+                &RaftMetrics::new(false),
+            )
+        };
+
+        // Phase 1: Establish a valid state with entries 5..=20.
+        let mut raft_state = RaftLocalState::default();
+        raft_state.set_last_index(20);
+        raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
+        raft_state.mut_hard_state().set_commit(20);
+        let mut lb = engines.raft.log_batch(4096);
+        let entries: Vec<_> = (5..=20)
+            .map(|i| new_entry(i, RAFT_INIT_LOG_TERM))
+            .collect();
+        lb.append(1, None, entries).unwrap();
+        lb.put_raft_state(1, &raft_state).unwrap();
+        engines.raft.consume(&mut lb, false).unwrap();
+
+        // Write apply state consistent with raft_state.
+        let mut apply_state = RaftApplyState::default();
+        apply_state.set_applied_index(20);
+        apply_state.mut_truncated_state().set_index(13);
+        apply_state.mut_truncated_state().set_term(RAFT_INIT_LOG_TERM);
+        apply_state.set_commit_index(20);
+        apply_state.set_commit_term(RAFT_INIT_LOG_TERM);
+        let apply_state_key = keys::apply_state_key(1);
+        engines
+            .kv
+            .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
+            .unwrap();
+
+        // Sanity check.
+        let s = build_storage().unwrap();
+        assert_eq!(s.initial_state().unwrap().hard_state.get_commit(), 20);
+
+        // Phase 2: Simulate clear_meta_in_kv_and_raft with lying fsync on
+        // Phase 1 (kv_db) but successful Phase 2 (raft_db cleanup).
+        // raft_db fully cleaned:
+        engines.raft.gc(1, 0, 21, &mut lb).unwrap();
+        engines.raft.clean(1, 0, &raft_state, &mut lb).unwrap();
+        engines.raft.consume(&mut lb, false).unwrap();
+
+        // kv_db still has OLD state (Tombstone write lost to lying fsync).
+
+        // Phase 3: On restart, init_raft_state finds no raft_state → synthetic.
+        let s = build_storage()
+            .expect("PeerStorage::new should handle phantom peer gracefully");
+        let initial_state = s.initial_state().unwrap();
+        assert_eq!(
+            initial_state.hard_state.get_commit(),
+            RAFT_INIT_LOG_INDEX,
+            "phantom peer should have synthetic commit index"
+        );
+        drop(s);
     }
 }
