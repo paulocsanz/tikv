@@ -590,6 +590,24 @@ fn test_dst_step_driven_put_fingerprint() {
     );
 }
 
+/// Append one JSON object line to `DST_FUZZ_SCOREBOARD` if set.
+fn scoreboard_write(line: &str) {
+    let Ok(path) = std::env::var("DST_FUZZ_SCOREBOARD") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Multi-seed step-driven stress.
 ///
 /// Default corpus (7 seeds) always runs. Expand via:
@@ -597,6 +615,7 @@ fn test_dst_step_driven_put_fingerprint() {
 /// - `DST_FUZZ_SEEDS=1,2,0x5d01` list
 /// - `DST_FUZZ_REPLAY=<seed>` single-seed bisect
 /// - `DST_FUZZ_COUNT=1 DST_FUZZ_SEEDS=16` → seeds 0..16
+/// - `DST_FUZZ_SCOREBOARD=/path/out.jsonl` → per-seed JSONL scoreboard
 ///
 /// On mismatch: greedy minimize `n_keys` 3→1 and print `REPLAY=DST_FUZZ_REPLAY=...`.
 #[test]
@@ -609,29 +628,50 @@ fn test_dst_step_driven_multiseed() {
         .unwrap_or(3)
         .clamp(1, STEP_KEYS.len());
 
+    let started = WallInstant::now();
     eprintln!(
-        "DST_FUZZ n_seeds={} n_keys={} first={:#x} last={:#x}",
+        "DST_FUZZ n_seeds={} n_keys={} first={:#x} last={:#x} scoreboard={}",
         seeds.len(),
         n_keys,
         seeds[0],
-        seeds[seeds.len() - 1]
+        seeds[seeds.len() - 1],
+        std::env::var("DST_FUZZ_SCOREBOARD").unwrap_or_else(|_| "-".into())
     );
 
     let mut passed = 0usize;
     for &seed in &seeds {
+        let t0 = WallInstant::now();
         match check_step_driven_replay(seed, n_keys) {
             Ok(()) => {
+                let ms = t0.elapsed().as_millis();
                 passed += 1;
-                eprintln!("DST_FUZZ seed={seed:#x} OK");
+                eprintln!("DST_FUZZ seed={seed:#x} OK ms={ms}");
+                scoreboard_write(&format!(
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"ok","n_keys":{n_keys},"ms":{ms}}}"#
+                ));
             }
             Err(m) => {
+                let ms = t0.elapsed().as_millis();
                 eprintln!(
-                    "DST_FUZZ FAIL seed={seed:#x} kind={} n_keys={}",
+                    "DST_FUZZ FAIL seed={seed:#x} kind={} n_keys={} ms={ms}",
                     m.kind, m.n_keys
                 );
                 eprintln!("  left : {}", &m.left[..m.left.len().min(240)]);
                 eprintln!("  right: {}", &m.right[..m.right.len().min(240)]);
+                scoreboard_write(&format!(
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"fail","kind":"{}","n_keys":{},"ms":{ms}}}"#,
+                    m.kind, m.n_keys
+                ));
                 let mini = minimize_step_driven_fail(seed, n_keys);
+                scoreboard_write(&format!(
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"minimized","kind":"{}","n_keys":{},"replay":"DST_FUZZ_REPLAY={seed}"}}"#,
+                    mini.kind, mini.n_keys
+                ));
+                let total_ms = started.elapsed().as_millis();
+                scoreboard_write(&format!(
+                    r#"{{"status":"summary","passed":{passed},"total":{},"failed_seed":{seed},"total_ms":{total_ms}}}"#,
+                    seeds.len()
+                ));
                 panic!(
                     "step-driven nondeterminism seed={seed:#x} kind={} minimized_n_keys={} {}\n  left={}\n  right={}",
                     mini.kind,
@@ -643,6 +683,14 @@ fn test_dst_step_driven_multiseed() {
             }
         }
     }
-    eprintln!("DST_FUZZ all_passed={passed}/{}", seeds.len());
+    let total_ms = started.elapsed().as_millis();
+    eprintln!(
+        "DST_FUZZ all_passed={passed}/{} total_ms={total_ms}",
+        seeds.len()
+    );
+    scoreboard_write(&format!(
+        r#"{{"status":"summary","passed":{passed},"total":{},"failed_seed":null,"total_ms":{total_ms}}}"#,
+        seeds.len()
+    ));
     assert_eq!(passed, seeds.len());
 }
