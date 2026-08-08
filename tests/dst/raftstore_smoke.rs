@@ -302,10 +302,12 @@ const STEP_KEYS: [&[u8]; 5] = [b"sd_a", b"sd_b", b"sd_c", b"sd_d", b"sd_e"];
 /// Returns (stable_kv, full_trace, app_summary, ops_sequence).
 /// `n_keys` in 1..=STEP_KEYS.len() — used by minimize-on-fail.
 /// `drop_pct` 0..=100 — seed-stable message drops at release time.
+/// `max_delay` — seed-stable delay steps (0..=max) before a msg is releasable.
 fn run_step_driven_scenario(
     seed: u64,
     n_keys: usize,
     drop_pct: u32,
+    max_delay: u32,
 ) -> (String, String, String, String) {
     let n_keys = n_keys.clamp(1, STEP_KEYS.len());
     let mut cluster = bootstrap_3node(seed);
@@ -321,8 +323,10 @@ fn run_step_driven_scenario(
     time::dst_set_manual_only(true);
     tikv_util::dst_init::dst_reseed_before_phase();
 
-    // Pure hold — only network_step delivers. Optional seed-stable drops.
-    let net = DstNetworkQueue::new(seed, 0).with_drop_rate(drop_pct);
+    // Pure hold — only network_step delivers. Optional seed-stable drops/delays.
+    let net = DstNetworkQueue::new(seed, 0)
+        .with_drop_rate(drop_pct)
+        .with_max_delay(max_delay);
     cluster.add_send_filter(CloneFilterFactory(net.clone()));
     net.clear_log();
 
@@ -382,8 +386,17 @@ fn check_step_driven_replay_drop(
     n_keys: usize,
     drop_pct: u32,
 ) -> Result<(), StepMismatch> {
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n_keys, drop_pct);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n_keys, drop_pct);
+    check_step_driven_replay_faults(seed, n_keys, drop_pct, 0)
+}
+
+fn check_step_driven_replay_faults(
+    seed: u64,
+    n_keys: usize,
+    drop_pct: u32,
+    max_delay: u32,
+) -> Result<(), StepMismatch> {
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, n_keys, drop_pct, max_delay);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, n_keys, drop_pct, max_delay);
     if s1 != s2 {
         return Err(StepMismatch {
             seed,
@@ -411,11 +424,11 @@ fn check_step_driven_replay_drop(
             right: f2,
         });
     }
-    // Full schedule freeze (app + ops) is the default for drop=0.
-    // With drops, retries/timer residual can still diverge MsgApp counts across
-    // process-global hybrid bootstrap phase — unless DST_FUZZ_STRICT=1.
-    // Campaign finding: seed=0x1 drop=15 fails app_summary while KV still matches.
-    let strict = drop_pct == 0 || std::env::var_os("DST_FUZZ_STRICT").is_some();
+    // Full schedule freeze (app + ops) is the default for drop=0 and delay=0.
+    // With drops/delays, retries/timer residual can still diverge MsgApp counts
+    // across hybrid bootstrap — unless DST_FUZZ_STRICT=1.
+    let strict = (drop_pct == 0 && max_delay == 0)
+        || std::env::var_os("DST_FUZZ_STRICT").is_some();
     if strict {
         if app1 != app2 {
             return Err(StepMismatch {
@@ -437,7 +450,7 @@ fn check_step_driven_replay_drop(
         }
     } else if app1 != app2 {
         eprintln!(
-            "DST_FUZZ_NOTE seed={seed:#x} drop={drop_pct} app_summary diverges (KV still match); set DST_FUZZ_STRICT=1 to fail"
+            "DST_FUZZ_NOTE seed={seed:#x} drop={drop_pct} delay={max_delay} app_summary diverges (KV still match); set DST_FUZZ_STRICT=1 to fail"
         );
     }
     Ok(())
@@ -604,8 +617,8 @@ fn test_dst_ordered_net_multiseed() {
 fn test_dst_step_driven_with_drops() {
     let seed: u64 = 0xd70b;
     let drop_pct = 15u32;
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, drop_pct);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, drop_pct);
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, drop_pct, 0);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, drop_pct, 0);
     eprintln!("DST_DROP stable1: {s1}");
     eprintln!("DST_DROP stable2: {s2}");
     eprintln!("DST_DROP app1: {app1}");
@@ -618,13 +631,41 @@ fn test_dst_step_driven_with_drops() {
     assert_eq!(ops1, ops2, "ops sequence with drops must match");
 }
 
+/// Step-driven pure-hold with seed-stable **delay** steps (reorder/hold plane).
+///
+/// Hard claim: KV + leader bit-match. App/ops may still residual (same class as
+/// multi-seed drops — set DST_FUZZ_STRICT for full freeze).
+#[test]
+fn test_dst_step_driven_with_delay() {
+    let seed: u64 = 0xde1a;
+    let max_delay = 2u32;
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, 0, max_delay);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, 0, max_delay);
+    eprintln!("DST_DELAY stable1: {s1}");
+    eprintln!("DST_DELAY stable2: {s2}");
+    eprintln!("DST_DELAY app1: {app1}");
+    eprintln!("DST_DELAY app2: {app2}");
+    eprintln!("DST_DELAY ops_len1={} ops_len2={}", ops1.len(), ops2.len());
+    assert_eq!(s1, s2, "delay-path KV must match");
+    assert!(!s1.contains("=none"), "puts must land with delays: {s1}");
+    assert!(f1.contains("leader=1") && f2.contains("leader=1"));
+    if app1 == app2 {
+        assert_eq!(ops1, ops2, "when app matches, ops must match");
+        eprintln!("DST_DELAY_NOTE: full schedule freeze under delay for seed={seed:#x}");
+    } else {
+        eprintln!(
+            "DST_DELAY_NOTE: app residual under delay (KV still match); same class as DST_FUZZ_DROP"
+        );
+    }
+}
+
 /// Pure-hold + manual drive 3-node: KV + MsgApp path summary bit-match.
 /// Wall-capped put_stepped so a regression cannot hang CI forever.
 #[test]
 fn test_dst_step_driven_put_fingerprint() {
     let seed: u64 = 0x5d01;
-    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, 0);
-    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, 0);
+    let (s1, f1, app1, ops1) = run_step_driven_scenario(seed, 3, 0, 0);
+    let (s2, f2, app2, ops2) = run_step_driven_scenario(seed, 3, 0, 0);
     eprintln!("DST_STEP stable1: {s1}");
     eprintln!("DST_STEP stable2: {s2}");
     eprintln!("DST_STEP app1: {app1}");
@@ -688,13 +729,18 @@ fn test_dst_step_driven_multiseed() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
         .min(100);
+    let max_delay: u32 = std::env::var("DST_FUZZ_DELAY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let started = WallInstant::now();
     eprintln!(
-        "DST_FUZZ n_seeds={} n_keys={} drop={} first={:#x} last={:#x} scoreboard={}",
+        "DST_FUZZ n_seeds={} n_keys={} drop={} delay={} first={:#x} last={:#x} scoreboard={}",
         seeds.len(),
         n_keys,
         drop_pct,
+        max_delay,
         seeds[0],
         seeds[seeds.len() - 1],
         std::env::var("DST_FUZZ_SCOREBOARD").unwrap_or_else(|_| "-".into())
@@ -703,39 +749,41 @@ fn test_dst_step_driven_multiseed() {
     let mut passed = 0usize;
     for &seed in &seeds {
         let t0 = WallInstant::now();
-        match check_step_driven_replay_drop(seed, n_keys, drop_pct) {
+        match check_step_driven_replay_faults(seed, n_keys, drop_pct, max_delay) {
             Ok(()) => {
                 let ms = t0.elapsed().as_millis();
                 passed += 1;
-                eprintln!("DST_FUZZ seed={seed:#x} OK ms={ms} drop={drop_pct}");
+                eprintln!(
+                    "DST_FUZZ seed={seed:#x} OK ms={ms} drop={drop_pct} delay={max_delay}"
+                );
                 scoreboard_write(&format!(
-                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"ok","n_keys":{n_keys},"drop":{drop_pct},"ms":{ms}}}"#
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"ok","n_keys":{n_keys},"drop":{drop_pct},"delay":{max_delay},"ms":{ms}}}"#
                 ));
             }
             Err(m) => {
                 let ms = t0.elapsed().as_millis();
                 eprintln!(
-                    "DST_FUZZ FAIL seed={seed:#x} kind={} n_keys={} drop={drop_pct} ms={ms}",
+                    "DST_FUZZ FAIL seed={seed:#x} kind={} n_keys={} drop={drop_pct} delay={max_delay} ms={ms}",
                     m.kind, m.n_keys
                 );
                 eprintln!("  left : {}", &m.left[..m.left.len().min(240)]);
                 eprintln!("  right: {}", &m.right[..m.right.len().min(240)]);
                 scoreboard_write(&format!(
-                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"fail","kind":"{}","n_keys":{},"drop":{drop_pct},"ms":{ms}}}"#,
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"fail","kind":"{}","n_keys":{},"drop":{drop_pct},"delay":{max_delay},"ms":{ms}}}"#,
                     m.kind, m.n_keys
                 ));
                 let mini = minimize_step_driven_fail(seed, n_keys, drop_pct);
                 scoreboard_write(&format!(
-                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"minimized","kind":"{}","n_keys":{},"drop":{drop_pct},"replay":"DST_FUZZ_REPLAY={seed}"}}"#,
+                    r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"minimized","kind":"{}","n_keys":{},"drop":{drop_pct},"delay":{max_delay},"replay":"DST_FUZZ_REPLAY={seed}"}}"#,
                     mini.kind, mini.n_keys
                 ));
                 let total_ms = started.elapsed().as_millis();
                 scoreboard_write(&format!(
-                    r#"{{"status":"summary","passed":{passed},"total":{},"failed_seed":{seed},"drop":{drop_pct},"total_ms":{total_ms}}}"#,
+                    r#"{{"status":"summary","passed":{passed},"total":{},"failed_seed":{seed},"drop":{drop_pct},"delay":{max_delay},"total_ms":{total_ms}}}"#,
                     seeds.len()
                 ));
                 panic!(
-                    "step-driven nondeterminism seed={seed:#x} kind={} drop={drop_pct} minimized_n_keys={} {}\n  left={}\n  right={}",
+                    "step-driven nondeterminism seed={seed:#x} kind={} drop={drop_pct} delay={max_delay} minimized_n_keys={} {}\n  left={}\n  right={}",
                     mini.kind,
                     mini.n_keys,
                     mini.replay_hint(),
