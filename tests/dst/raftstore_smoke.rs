@@ -5936,3 +5936,183 @@ fn test_deep_snapshot_during_transfer() {
     cleanup_cluster();
     eprintln!("DST_DEEP44 OK");
 }
+
+// ─── Restart-under-matrix: node kill+restart across all 32 fault subsets ──
+//
+// The production bugs we found (PR #33 CURRENT truncation, PR #41 lying
+// fsync) were on the crash/restart path. This test systematically crosses
+// node restart with every fault dimension subset.
+
+fn run_restart_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Phase 1: write 4 keys under faults.
+    let pre_keys: [(Vec<u8>, Vec<u8>); 4] = [
+        (b"rm_pre_0".to_vec(), format!("rmv_pre_{mask}_{seed}_0").into_bytes()),
+        (b"rm_pre_1".to_vec(), format!("rmv_pre_{mask}_{seed}_1").into_bytes()),
+        (b"rm_pre_2".to_vec(), format!("rmv_pre_{mask}_{seed}_2").into_bytes()),
+        (b"rm_pre_3".to_vec(), format!("rmv_pre_{mask}_{seed}_3").into_bytes()),
+    ];
+    for (k, v) in &pre_keys {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(k, v);
+        }));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Phase 2: kill node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: write 4 more keys while node 3 is down.
+    let post_keys: [(Vec<u8>, Vec<u8>); 4] = [
+        (b"rm_post_0".to_vec(), format!("rmv_post_{mask}_{seed}_0").into_bytes()),
+        (b"rm_post_1".to_vec(), format!("rmv_post_{mask}_{seed}_1").into_bytes()),
+        (b"rm_post_2".to_vec(), format!("rmv_post_{mask}_{seed}_2").into_bytes()),
+        (b"rm_post_3".to_vec(), format!("rmv_post_{mask}_{seed}_3").into_bytes()),
+    ];
+    for (k, v) in &post_keys {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(k, v);
+        }));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 4: clear faults + restart node 3.
+    if has_partition {
+        net.clear_partitions();
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.run_node(3).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Phase 5: verify all 8 keys.
+    let all_keys: [&[u8]; 8] = [
+        b"rm_pre_0", b"rm_pre_1", b"rm_pre_2", b"rm_pre_3",
+        b"rm_post_0", b"rm_post_1", b"rm_post_2", b"rm_post_3",
+    ];
+    let stable = rich_fingerprint_stable(&mut cluster, &all_keys);
+
+    for (k, v) in &pre_keys {
+        let needle = format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+        assert!(
+            stable.contains(&needle),
+            "RESTART MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} pre-restart key {} missing: {stable}",
+            mask, fault_mask_name(mask), String::from_utf8_lossy(k)
+        );
+    }
+    for (k, v) in &post_keys {
+        let needle = format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
+        assert!(
+            stable.contains(&needle),
+            "RESTART MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} post-restart key {} missing: {stable}",
+            mask, fault_mask_name(mask), String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_restart_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_RESTART_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_RESTART_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_RESTART masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0x4000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_restart_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_RESTART mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!("DST_RESTART mask=0b{:05b} ({}) FAIL — replay: DST_RESTART_REPLAY={mask}", mask, dims);
+            if std::env::var("DST_RESTART_REPLAY").is_ok() {
+                panic!("restart matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_RESTART done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+
+    if !failures.is_empty() {
+        let names: Vec<String> = failures
+            .iter()
+            .map(|m| format!("0b{:05b} ({})", m, fault_mask_name(*m)))
+            .collect();
+        eprintln!("RESTART failures: {}", names.join(", "));
+    }
+    assert_eq!(passed, total, "restart fault matrix had failures");
+}
