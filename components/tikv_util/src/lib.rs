@@ -82,6 +82,12 @@ pub mod det_clock_bridge;
 #[cfg(feature = "dst")]
 pub mod dst_init;
 
+#[cfg(feature = "dst")]
+pub mod dst_collections;
+
+#[cfg(feature = "dst")]
+pub mod dst_sched;
+
 static PANIC_WHEN_UNEXPECTED_KEY_OR_DATA: AtomicBool = AtomicBool::new(false);
 
 pub fn panic_when_unexpected_key_or_data() -> bool {
