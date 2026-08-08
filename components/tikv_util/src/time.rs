@@ -20,6 +20,14 @@ use time::Duration as TimeDuration;
 /// Returns the monotonic raw time since some unspecified starting point.
 pub use self::inner::monotonic_raw_now;
 pub use self::inner::{monotonic_coarse_now, monotonic_now};
+
+/// DST logical clock controls (only available with `dst` feature).
+#[cfg(feature = "dst")]
+pub use self::inner::{
+    dst_advance, dst_now_nanos, dst_reset, dst_set_logical_nanos, dst_set_manual_only, dst_set_step,
+    dst_start_hybrid_driver, dst_step,
+};
+
 use crate::{sys::thread::StdThreadBuildWrapper, thread_name_prefix::TIME_MONITOR_THREAD};
 
 const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
@@ -289,7 +297,160 @@ impl Drop for Monitor {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(feature = "dst")]
+mod inner {
+    //! Deterministic logical clock for DST (Peça 2 foundation).
+    //!
+    //! Design (revised after lease breakage with per-read advance):
+    //! - `Instant::now()` returns the current logical time WITHOUT advancing.
+    //! - Time advances only via `dst_advance(nanos)` (explicit, test-driven).
+    //! - `dst_reset()` never jumps backward — it leaps to a fresh epoch so
+    //!   existing Instant values remain ≤ current time (no "jumped back" panics).
+    //! - Optional hybrid driver: advances logical time ~1:1 with wall clock so
+    //!   Raft leases and SteadyTimer continue to work while Instant remains
+    //!   seed-resettable and monotonic.
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::Timespec;
+
+    const NANOS_PER_SEC: i64 = 1_000_000_000;
+    /// Leap forward on reset so no existing Instant is in the future.
+    const RESET_EPOCH_NANOS: i64 = 3_600 * NANOS_PER_SEC; // 1 hour
+
+    static LOGICAL_NANOS: AtomicI64 = AtomicI64::new(0);
+    /// Step used by hybrid driver per wall-clock tick (default 1ms).
+    static STEP_NANOS: AtomicI64 = AtomicI64::new(1_000_000);
+    static DRIVER_RUNNING: AtomicBool = AtomicBool::new(false);
+    /// When true, hybrid driver is never auto-started. Time advances only via
+    /// `dst_advance` (pure step-driven / virtual timer mode).
+    static MANUAL_ONLY: AtomicBool = AtomicBool::new(false);
+
+    /// Set hybrid driver step (nanos of logical time per driver tick).
+    pub fn dst_set_step(nanos: i64) {
+        STEP_NANOS.store(nanos, Ordering::Relaxed);
+    }
+
+    /// Enable pure step-driven mode: no hybrid wall-clock driver.
+    /// Call before any `Instant::now()` / `dst_advance` in the test.
+    /// SteadyTimer delays fire when logical time is advanced past their deadline
+    /// (timer thread polls every 1ms under feature `dst`).
+    pub fn dst_set_manual_only(manual: bool) {
+        MANUAL_ONLY.store(manual, Ordering::SeqCst);
+    }
+
+    /// Manually advance the logical clock by a fixed amount.
+    /// Under feature `dst`, SteadyTimer re-checks within ~1ms and fires due delays.
+    /// Also syncs the value to `/tmp/dst_clock` for the C LD_PRELOAD bridge.
+    pub fn dst_advance(nanos: i64) {
+        if nanos > 0 {
+            LOGICAL_NANOS.fetch_add(nanos, Ordering::SeqCst);
+            crate::det_clock_bridge::sync();
+        }
+    }
+
+    /// Advance by `n` steps of the configured step size (default 1ms each).
+    pub fn dst_step(n: u64) {
+        let step = STEP_NANOS.load(Ordering::Relaxed);
+        if step > 0 && n > 0 {
+            let total = step.saturating_mul(n as i64);
+            LOGICAL_NANOS.fetch_add(total, Ordering::SeqCst);
+            crate::det_clock_bridge::sync();
+        }
+    }
+
+    /// Start a new logical epoch without going backward.
+    /// Existing Instants remain ≤ new now, so the time monitor never panics.
+    pub fn dst_reset() {
+        LOGICAL_NANOS.fetch_add(RESET_EPOCH_NANOS, Ordering::SeqCst);
+        crate::det_clock_bridge::sync();
+    }
+
+    /// Set the logical clock to an absolute value.
+    /// The caller must ensure `nanos` is ≥ any previously read `Instant::now()`
+    /// so the time monitor never panics.  Use to fix the clock *phase* relative
+    /// to Raft tick intervals across repeated scenario invocations.
+    pub fn dst_set_logical_nanos(nanos: i64) {
+        LOGICAL_NANOS.store(nanos, Ordering::SeqCst);
+        crate::det_clock_bridge::sync();
+    }
+
+    /// Current logical time in nanos (read-only).
+    pub fn dst_now_nanos() -> i64 {
+        LOGICAL_NANOS.load(Ordering::SeqCst)
+    }
+
+    /// Start a hybrid driver thread: advances logical time by `step` every
+    /// `wall_interval`. Call once per process; subsequent calls are no-ops.
+    ///
+    /// This keeps Raft leases and SteadyTimer roughly synchronized with real
+    /// time while preserving a process-global monotonic logical clock that
+    /// resets to a fresh epoch via `dst_reset()`.
+    pub fn dst_start_hybrid_driver(wall_interval: Duration) {
+        if MANUAL_ONLY.load(Ordering::SeqCst) {
+            return;
+        }
+        if DRIVER_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let step = STEP_NANOS.load(Ordering::Relaxed);
+        thread::Builder::new()
+            .name("dst-hybrid-clock".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(wall_interval);
+                    if MANUAL_ONLY.load(Ordering::Relaxed) {
+                        // Pause advancing while in manual mode (driver may
+                        // already have been started before manual was set).
+                        continue;
+                    }
+                    LOGICAL_NANOS.fetch_add(step, Ordering::SeqCst);
+                    // Keep C LD_PRELOAD bridge in lockstep with hybrid driver.
+                    crate::det_clock_bridge::sync();
+                }
+            })
+            .expect("failed to start dst hybrid clock driver");
+    }
+
+    fn ensure_driver() {
+        if MANUAL_ONLY.load(Ordering::Relaxed) {
+            return;
+        }
+        // Auto-start on first Instant::now() so tests that enable
+        // tikv_util/dst without calling dst_init still make progress.
+        // Without this, Instant freezes and Raft leases hang forever.
+        if !DRIVER_RUNNING.load(Ordering::Relaxed) {
+            dst_start_hybrid_driver(Duration::from_millis(1));
+        }
+    }
+
+    fn read_now() -> Timespec {
+        ensure_driver();
+        let nanos = LOGICAL_NANOS.load(Ordering::SeqCst);
+        Timespec::new(nanos / NANOS_PER_SEC, (nanos % NANOS_PER_SEC) as i32)
+    }
+
+    #[inline]
+    pub fn monotonic_raw_now() -> Timespec {
+        read_now()
+    }
+
+    #[inline]
+    pub fn monotonic_now() -> Timespec {
+        read_now()
+    }
+
+    #[inline]
+    pub fn monotonic_coarse_now() -> Timespec {
+        read_now()
+    }
+}
+
+#[cfg(all(not(feature = "dst"), not(target_os = "linux")))]
 mod inner {
     use std::{sync::OnceLock, time::Instant};
 
@@ -324,7 +485,7 @@ mod inner {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "dst"), target_os = "linux"))]
 mod inner {
     use std::io;
 
@@ -373,7 +534,17 @@ pub enum Instant {
 
 impl Instant {
     pub fn now() -> Instant {
-        Instant::Monotonic(monotonic_now())
+        // Under feature `dst`, both now() and now_coarse() read from the same
+        // logical clock. This closes all 705 std Instant::now() call sites
+        // that would otherwise bypass the deterministic clock.
+        #[cfg(feature = "dst")]
+        {
+            Instant::MonotonicCoarse(monotonic_coarse_now())
+        }
+        #[cfg(not(feature = "dst"))]
+        {
+            Instant::Monotonic(monotonic_now())
+        }
     }
 
     pub fn now_coarse() -> Instant {

@@ -1,0 +1,14 @@
+[package]
+name = "getrandom"
+version = "0.3.4"
+edition = "2021"
+publish = false
+
+[features]
+rustc-dep-of-std = []
+std = []
+js = []
+wasm_js = ["js"]
+wasm32_unknown_unknown_js = []
+custom = []
+linux_disable = []

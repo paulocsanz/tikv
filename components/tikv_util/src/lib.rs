@@ -71,6 +71,17 @@ pub mod topn;
 pub mod worker;
 pub mod yatp_pool;
 
+/// Deterministic RNG for DST mode (replaces `rand::thread_rng()`).
+#[cfg(feature = "dst")]
+pub mod dst_rng;
+
+/// Bridge between Rust logical clock and C det_clock.so LD_PRELOAD library.
+#[cfg(feature = "dst")]
+pub mod det_clock_bridge;
+
+#[cfg(feature = "dst")]
+pub mod dst_init;
+
 static PANIC_WHEN_UNEXPECTED_KEY_OR_DATA: AtomicBool = AtomicBool::new(false);
 
 pub fn panic_when_unexpected_key_or_data() -> bool {
