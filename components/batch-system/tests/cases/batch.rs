@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "dst")]
+use std::sync::Mutex;
+
 use batch_system::{test_runner::*, *};
 use kvproto::resource_manager::{GroupMode, GroupRawResourceSettings, ResourceGroup};
 use resource_control::ResourceGroupManager;
@@ -201,4 +204,143 @@ fn test_resource_group() {
     // handled with higher priority.
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(2));
     assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(1));
+}
+
+/// Pure-Rust DST harness: manual drive + logical clock + ordered callbacks.
+///
+/// Same seed ⇒ same event log across two independent BatchSystem lives.
+/// Requires `--features dst` (cooperative pollers + tikv_util logical Instant).
+/// Run with `--test-threads=1` — executor state is process-global.
+#[cfg(feature = "dst")]
+#[test]
+fn test_dst_manual_drive_bitstable() {
+    struct ManualGuard;
+    impl Drop for ManualGuard {
+        fn drop(&mut self) {
+            end_manual_scenario();
+        }
+    }
+
+    fn run_scenario(seed: u64) -> (Vec<u64>, HandleMetrics) {
+        begin_manual_scenario(seed);
+        let _guard = ManualGuard;
+
+        let (control_tx, control_fsm) = Runner::new(64);
+        let mut cfg = Config::default();
+        cfg.pool_size = 2;
+        cfg.low_priority_pool_size = 0;
+        let (router, mut system) =
+            batch_system::create_system(&cfg, control_tx, control_fsm, None);
+        let builder = Builder::new();
+        let metrics = builder.metrics.clone();
+        system.spawn("dst-manual".to_owned(), builder);
+
+        // Wait until both normal pollers are registered with the global executor.
+        for _ in 0..200 {
+            if live_count() >= 2 {
+                break;
+            }
+            let _ = step_all_once();
+        }
+        assert!(
+            live_count() >= 2,
+            "expected ≥2 pollers registered, got {}",
+            live_count()
+        );
+
+        let log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_reg = Arc::clone(&log);
+        let r = router.clone();
+
+        // Register three normal FSMs via control; record ids in log.
+        router
+            .send_control(Message::Callback(Box::new(
+                move |_: &Handler, _: &mut Runner| {
+                    for id in 1u64..=3 {
+                        let (tx, runner) = Runner::new(64);
+                        r.register(id, BasicMailbox::new(tx, runner, Arc::default()));
+                        log_reg.lock().unwrap().push(100 + id);
+                    }
+                },
+            )))
+            .unwrap();
+
+        // Drive until registration callbacks run.
+        for _ in 0..64 {
+            let _ = drive_once();
+            if log.lock().unwrap().len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[101, 102, 103],
+            "registration order must be deterministic"
+        );
+
+        // Enqueue work on each FSM: Loop work + tagged callbacks.
+        for id in 1u64..=3 {
+            router.send(id, Message::Loop(50)).unwrap();
+            let log_cb = Arc::clone(&log);
+            router
+                .send(
+                    id,
+                    Message::Callback(Box::new(move |_: &Handler, _: &mut Runner| {
+                        log_cb.lock().unwrap().push(id * 10);
+                    })),
+                )
+                .unwrap();
+        }
+
+        // Step-driven until all tags appear (or budget exhausted).
+        for _ in 0..128 {
+            let _ = drive_once();
+            if log.lock().unwrap().len() >= 6 {
+                break;
+            }
+        }
+
+        let events = log.lock().unwrap().clone();
+        let m = *metrics.lock().unwrap();
+        system.shutdown();
+        // end via Drop guard
+        (events, m)
+    }
+
+    let (e1, m1) = run_scenario(0xD57_001);
+    let (e2, m2) = run_scenario(0xD57_001);
+    assert_eq!(e1, e2, "event log must bit-match across seed replays");
+    assert_eq!(e1.len(), 6, "register(3) + tags(3): {e1:?}");
+    assert_eq!(&e1[..3], &[101, 102, 103]);
+    // Tag set must be complete (order is part of the bitstable claim via e1==e2).
+    let mut tags = e1[3..].to_vec();
+    tags.sort_unstable();
+    assert_eq!(tags, vec![10, 20, 30]);
+    assert_eq!(m1, m2, "handle metrics must match: {m1:?} vs {m2:?}");
+    assert!(m1.control >= 1);
+    assert!(m1.normal >= 3);
+}
+
+/// `drive_once` advances logical Instant between poller rounds.
+#[cfg(feature = "dst")]
+#[test]
+fn test_dst_drive_once_advances_logical_clock() {
+    begin_manual_scenario(7);
+    struct ManualGuard;
+    impl Drop for ManualGuard {
+        fn drop(&mut self) {
+            end_manual_scenario();
+        }
+    }
+    let _guard = ManualGuard;
+    let t0 = tikv_util::time::Instant::now_coarse();
+    let _ = drive_once();
+    let _ = drive_once();
+    let t1 = tikv_util::time::Instant::now_coarse();
+    let ms = t1.saturating_duration_since(t0).as_millis();
+    // Two drive_once → two dst_tick (1ms each) ≈ 2ms logical.
+    assert!(
+        ms >= 1 && ms <= 5,
+        "expected ~2ms logical advance, got {ms}ms"
+    );
 }

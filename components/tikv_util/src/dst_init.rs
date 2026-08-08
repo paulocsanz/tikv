@@ -20,11 +20,14 @@ static DST_RESET_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Full scenario init. Prefer this at the start of every DST test case.
 pub fn dst_init(seed: u64) {
-    // Manual logical clock (tests drive time with dst_advance / dst_sleep_ms).
+    // Manual logical clock by default (tests drive with dst_advance / dst_sleep_ms).
+    // Callers that need wall-tracking (raftstore bootstrap) should flip
+    // `dst_set_manual_only(false)` + `dst_start_hybrid_driver` after this.
     time::dst_set_manual_only(true);
     time::dst_set_step(1_000_000); // 1ms step unit
+    // Leap to a fresh epoch — never set absolute 0 (time monitor panics on
+    // monotonic jumps backward when Instant was already observed).
     time::dst_reset();
-    time::dst_set_logical_nanos(0);
 
     dst_rng::dst_set_rng_seed(seed);
 

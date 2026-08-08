@@ -15,6 +15,11 @@ name = "integrations"
 path = "integrations/mod.rs"
 required-features = ["testexport"]
 
+[[test]]
+name = "dst_raftstore"
+path = "dst/raftstore_smoke.rs"
+required-features = ["dst", "testexport"]
+
 [[bench]]
 name = "raftstore"
 harness = false
@@ -46,7 +51,13 @@ harness = false
 path = "benches/memory/mod.rs"
 
 [features]
-dst = ["tikv_util/dst", "batch-system/dst", "engine_rocks/dst"]
+dst = [
+  "tikv_util/dst",
+  "batch-system/dst",
+  "engine_rocks/dst",
+  "raftstore/dst",
+  "test_raftstore/dst",
+]
 default = ["failpoints", "testexport", "test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
 failpoints = ["fail/failpoints", "tikv/failpoints", "pd_client/failpoints", "server/failpoints"]
 testexport = ["raftstore/testexport", "tikv/testexport", "pd_client/testexport"]
