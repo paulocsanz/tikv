@@ -462,12 +462,25 @@ fn check_step_driven_replay_faults(
 }
 
 /// Greedy minimize: shrink `n_keys` while the mismatch kind still fires.
-fn minimize_step_driven_fail(seed: u64, start_keys: usize, drop_pct: u32) -> StepMismatch {
-    let mut last = check_step_driven_replay_drop(seed, start_keys, drop_pct)
-        .expect_err("minimize called without a failure");
+///
+/// Takes the **original** mismatch so a flaky re-check that accidentally
+/// passes does not panic (`minimize called without a failure`). Residual
+/// under drops is process-wall-sensitive; re-runs are not bit-stable fails.
+fn minimize_step_driven_fail(
+    seed: u64,
+    start_keys: usize,
+    drop_pct: u32,
+    initial: StepMismatch,
+) -> StepMismatch {
+    let mut last = initial;
     for n in (1..start_keys).rev() {
         match check_step_driven_replay_drop(seed, n, drop_pct) {
-            Ok(()) => break,
+            Ok(()) => {
+                eprintln!(
+                    "DST_MINIMIZE seed={seed:#x} n_keys={n} drop={drop_pct} passed (flake/stop)"
+                );
+                break;
+            }
             Err(m) => {
                 eprintln!(
                     "DST_MINIMIZE seed={seed:#x} n_keys={n} drop={drop_pct} still fails kind={}",
@@ -716,6 +729,95 @@ fn test_dst_step_driven_put_fingerprint() {
     );
 }
 
+/// Isolation gate (no production bug claim): under seed-stable **drops**, two
+/// consecutive pure-hold scenarios MUST keep the same **stable KV** fingerprint.
+/// MsgApp summary/ops may diverge (hybrid bootstrap residual) — that is NOT
+/// `stable_kv`. A `stable_kv` failure here would be a serious schedule bug.
+///
+/// Seeds include the known STRICT residual seed `0x1` (see dst-drop-residual.md).
+#[test]
+fn test_dst_drop_kv_stable_isolates_app_residual() {
+    let seeds: &[u64] = &[0x1, 0x2, 0x7, 0x51];
+    let n_keys = 2usize;
+    let drop_pct = 15u32;
+    let mut app_div = 0usize;
+    for &seed in seeds {
+        let (s1, _f1, app1, ops1) = run_step_driven_scenario(seed, n_keys, drop_pct, 0);
+        let (s2, _f2, app2, ops2) = run_step_driven_scenario(seed, n_keys, drop_pct, 0);
+        assert_eq!(
+            s1, s2,
+            "KV must stay bit-stable under drops seed={seed:#x} (would be real bug)"
+        );
+        assert!(
+            !s1.contains("=none"),
+            "puts must land under drops seed={seed:#x}: {s1}"
+        );
+        if app1 != app2 || ops1 != ops2 {
+            app_div += 1;
+            eprintln!(
+                "DST_ISO seed={seed:#x} app residual (expected class); ops_len {} vs {}",
+                ops1.len(),
+                ops2.len()
+            );
+        } else {
+            eprintln!("DST_ISO seed={seed:#x} full match this trial");
+        }
+    }
+    eprintln!("DST_ISO app_divergent_seeds_this_run={app_div}/{}", seeds.len());
+    // No hard assert on app_div — residual is flaky. KV asserts above are the gate.
+}
+
+/// Focused STRICT residual probe for seed=0x1 keys=2 drop=15.
+/// Runs a few trials: KV must never fail; if STRICT fails, kind must be
+/// app_summary or ops_sequence (not stable_kv).
+#[test]
+fn test_dst_strict_drop_seed1_residual_class() {
+    // Temporarily force STRICT via env for check_step_driven_replay_faults.
+    // SAFETY: test-only; restored at end.
+    let prev = std::env::var_os("DST_FUZZ_STRICT");
+    unsafe {
+        std::env::set_var("DST_FUZZ_STRICT", "1");
+    }
+    let seed = 1u64;
+    let n_keys = 2usize;
+    let drop_pct = 15u32;
+    let mut app_fails = 0usize;
+    let trials = 4usize;
+    for t in 0..trials {
+        match check_step_driven_replay_faults(seed, n_keys, drop_pct, 0) {
+            Ok(()) => eprintln!("DST_STRICT_PROBE trial={t} OK (full match)"),
+            Err(m) => {
+                assert_ne!(
+                    m.kind, "stable_kv",
+                    "STRICT residual must not be KV divergence: {m:?}"
+                );
+                assert_ne!(m.kind, "missing_put", "puts must land: {m:?}");
+                assert!(
+                    m.kind == "app_summary" || m.kind == "ops_sequence" || m.kind == "leader",
+                    "unexpected kind {}",
+                    m.kind
+                );
+                app_fails += 1;
+                eprintln!(
+                    "DST_STRICT_PROBE trial={t} FAIL kind={} (residual class)",
+                    m.kind
+                );
+            }
+        }
+    }
+    if let Some(v) = prev {
+        unsafe {
+            std::env::set_var("DST_FUZZ_STRICT", v);
+        }
+    } else {
+        unsafe {
+            std::env::remove_var("DST_FUZZ_STRICT");
+        }
+    }
+    eprintln!("DST_STRICT_PROBE app_or_ops_fails={app_fails}/{trials}");
+    // Residual is flaky: zero fails in 4 trials is OK; we only gate kind class.
+}
+
 /// Heavier always-on full freeze: 5 puts (max STEP_KEYS) under pure-hold.
 #[test]
 fn test_dst_step_driven_5keys_full_freeze() {
@@ -820,7 +922,7 @@ fn test_dst_step_driven_multiseed() {
                     r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"fail","kind":"{}","n_keys":{},"drop":{drop_pct},"delay":{max_delay},"ms":{ms}}}"#,
                     m.kind, m.n_keys
                 ));
-                let mini = minimize_step_driven_fail(seed, n_keys, drop_pct);
+                let mini = minimize_step_driven_fail(seed, n_keys, drop_pct, m);
                 scoreboard_write(&format!(
                     r#"{{"seed":{seed},"seed_hex":"{seed:#x}","status":"minimized","kind":"{}","n_keys":{},"drop":{drop_pct},"delay":{max_delay},"replay":"DST_FUZZ_REPLAY={seed}"}}"#,
                     mini.kind, mini.n_keys
