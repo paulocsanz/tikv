@@ -154,6 +154,9 @@ pub struct DstNetworkQueue {
     dup_rate_pct: u32,
     /// Reorder mode for delivery schedule.
     reorder: ReorderMode,
+    /// Partitioned peer pairs: messages between these (from, to) store IDs
+    /// are silently dropped. Simulates network partitions.
+    partitioned: Arc<Mutex<Vec<(u64, u64)>>>,
     rng: Arc<Mutex<SeededRng>>,
     pending_release: Arc<Mutex<Vec<RaftMessage>>>,
     passthrough: Arc<AtomicBool>,
@@ -171,6 +174,7 @@ impl DstNetworkQueue {
             max_delay: 0,
             dup_rate_pct: 0,
             reorder: ReorderMode::default(),
+            partitioned: Arc::new(Mutex::new(Vec::new())),
             rng: Arc::new(Mutex::new(SeededRng::new(seed.wrapping_add(NET_SEED_TAG)))),
             pending_release: Arc::new(Mutex::new(Vec::new())),
             passthrough: Arc::new(AtomicBool::new(false)),
@@ -199,6 +203,25 @@ impl DstNetworkQueue {
     pub fn with_reorder(mut self, mode: ReorderMode) -> Self {
         self.reorder = mode;
         self
+    }
+
+    /// Add a partition between two peers (bidirectional). Messages between
+    /// these store IDs are silently dropped. Can be cleared with `clear_partitions`.
+    pub fn add_partition(&self, from: u64, to: u64) {
+        let mut p = self.partitioned.lock().unwrap();
+        p.push((from, to));
+        p.push((to, from));
+    }
+
+    /// Remove all partitions.
+    pub fn clear_partitions(&self) {
+        self.partitioned.lock().unwrap().clear();
+    }
+
+    /// Check if a message's (from, to) is partitioned.
+    fn is_partitioned(&self, from: u64, to: u64) -> bool {
+        let p = self.partitioned.lock().unwrap();
+        p.contains(&(from, to))
     }
 
     pub fn set_passthrough(&self, on: bool) {
@@ -353,22 +376,31 @@ impl DstNetworkQueue {
             .join(",")
     }
 
-    /// Apply drop filter + append delivery log; returns survivors.
+    /// Apply drop filter + partition filter + append delivery log; returns survivors.
     pub fn record_and_filter(&self, msgs: Vec<RaftMessage>) -> Vec<RaftMessage> {
         let mut out = Vec::with_capacity(msgs.len());
         let recording = self.recording.load(Ordering::SeqCst);
         let mut log = self.log.lock().unwrap();
         let mut rng = self.rng.lock().unwrap();
         for m in msgs {
+            let from = m.get_from_peer().get_store_id();
+            let to = m.get_to_peer().get_store_id();
             let entry = format!(
                 "{}>{}:{}:{}:{}:{}",
-                m.get_from_peer().get_store_id(),
-                m.get_to_peer().get_store_id(),
+                from,
+                to,
                 m.get_region_id(),
                 m.get_message().get_msg_type() as i32,
                 m.get_message().get_term(),
                 m.get_message().get_index(),
             );
+            // Partition check: silently drop messages between partitioned peers.
+            if self.is_partitioned(from, to) {
+                if recording {
+                    log.push(format!("PART:{entry}"));
+                }
+                continue;
+            }
             if self.drop_rate_pct > 0 && rng.gen_range(100) < self.drop_rate_pct {
                 if recording {
                     log.push(format!("DROP:{entry}"));
@@ -590,5 +622,32 @@ mod tests {
             .map(|m| m.get_message().get_index())
             .collect();
         assert_eq!(indices.len(), 5);
+    }
+
+    #[test]
+    fn partition_drops_only_specified_peers() {
+        let net = DstNetworkQueue::new(42, 0);
+        net.add_partition(1, 2);
+        // Messages from 1→2 and 2→1 should be dropped; 1→3 should pass.
+        let mut batch = vec![
+            make_msg(1, 2, 1, 1, 0), // partitioned
+            make_msg(2, 1, 1, 1, 1), // partitioned
+            make_msg(1, 3, 1, 1, 2), // survives
+        ];
+        let _ = net.before(&mut batch);
+        let out = net.record_and_filter(net.take_sorted(usize::MAX));
+        assert_eq!(out.len(), 1, "only 1→3 should survive partition");
+        assert_eq!(out[0].get_to_peer().get_store_id(), 3);
+    }
+
+    #[test]
+    fn clear_partitions_restores_delivery() {
+        let net = DstNetworkQueue::new(42, 0);
+        net.add_partition(1, 2);
+        net.clear_partitions();
+        let mut batch = vec![make_msg(1, 2, 1, 1, 0)];
+        let _ = net.before(&mut batch);
+        let out = net.record_and_filter(net.take_sorted(usize::MAX));
+        assert_eq!(out.len(), 1, "message should pass after clear");
     }
 }
