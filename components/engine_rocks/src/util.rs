@@ -1,6 +1,13 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{ffi::CString, fs, path::Path, str::FromStr, sync::Arc};
+use std::{
+    ffi::CString,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 
 use engine_traits::{CF_DEFAULT, Engines, Range, Result};
 use fail::fail_point;
@@ -54,6 +61,12 @@ pub fn new_engine_opt(
         .into_iter()
         .map(|(name, opt)| (name, opt.into_raw()))
         .collect();
+
+    // Power-loss / crash-during-meta-write can leave RocksDB CURRENT truncated
+    // (empty or missing trailing newline). Without repair, open fails forever
+    // even when MANIFEST-* is intact. Recover CURRENT from the latest MANIFEST
+    // when possible (see recover_current_if_needed). Surface I/O failures.
+    recover_current_if_needed(path)?;
 
     // Creates a new db if it doesn't exist.
     if !db_exist(path) {
@@ -154,6 +167,148 @@ pub fn db_exist(path: &str) -> bool {
     // `DB::list_column_families` fails and we can clean up the directory by
     // this indication.
     fs::read_dir(path).unwrap().next().is_some()
+}
+
+/// Whether RocksDB's `CURRENT` file looks unusable (truncated crash mid-write).
+///
+/// RocksDB requires `CURRENT` to name a `MANIFEST-*` file and end with exactly
+/// one trailing `\n` (no leading/trailing whitespace, no extra newlines).
+/// Crash + incomplete write (e.g. buffer discard before fsync) commonly leaves:
+/// - empty file (0 bytes) → "CURRENT file does not end with newline"
+/// - missing trailing newline
+/// - name of a MANIFEST that no longer exists
+pub fn current_file_is_corrupt(path: &str) -> bool {
+    let dir = Path::new(path);
+    let current = dir.join("CURRENT");
+    match fs::read(&current) {
+        Ok(bytes) => parse_current_manifest_name(&bytes)
+            .map(|name| !dir.join(name).is_file())
+            .unwrap_or(true),
+        // Missing CURRENT is handled by db_exist / create_if_missing; not "corrupt".
+        Err(_) => false,
+    }
+}
+
+/// Parse a RocksDB CURRENT payload: `MANIFEST-<digits>\n` only.
+/// Rejects empty, missing newline, extra newlines, or any other whitespace.
+fn parse_current_manifest_name(bytes: &[u8]) -> Option<&str> {
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return None;
+    }
+    // Exactly one trailing newline required.
+    let name = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
+    if name.is_empty() || name.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    if !name.starts_with("MANIFEST-") {
+        return None;
+    }
+    let num = name.strip_prefix("MANIFEST-")?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Find the highest-numbered `MANIFEST-*` in `path`, if any.
+pub fn latest_manifest_name(path: &str) -> Option<String> {
+    let dir = Path::new(path);
+    let rd = fs::read_dir(dir).ok()?;
+    let mut best: Option<(u64, String)> = None;
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if let Some(num_s) = name.strip_prefix("MANIFEST-")
+            && let Ok(num) = num_s.parse::<u64>()
+        {
+            let better = match &best {
+                None => true,
+                Some((b, _)) => num > *b,
+            };
+            if better {
+                best = Some((num, name.into_owned()));
+            }
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// If `CURRENT` is truncated/corrupt but a `MANIFEST-*` remains, rewrite
+/// `CURRENT` to point at the latest MANIFEST (atomic write via temp+rename).
+///
+/// Returns `Ok(true)` when a rewrite was performed, `Ok(false)` when no repair
+/// was needed or no MANIFEST was available.
+///
+/// This addresses permanent store unavailability after a crash during meta
+/// update that leaves an empty or malformed CURRENT while MANIFEST files remain.
+/// Incomplete MANIFEST contents are out of scope; only the CURRENT pointer is
+/// repaired.
+pub fn recover_current_if_needed(path: &str) -> Result<bool> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    if !current_file_is_corrupt(path) {
+        // Also recover when CURRENT is missing but MANIFESTs exist (partial create).
+        let current = dir.join("CURRENT");
+        if current.exists() {
+            return Ok(false);
+        }
+        if latest_manifest_name(path).is_none() {
+            return Ok(false);
+        }
+    }
+    let Some(manifest) = latest_manifest_name(path) else {
+        return Ok(false);
+    };
+    let current = dir.join("CURRENT");
+    let tmp = dir.join("CURRENT.tikv-recover.tmp");
+    let content = format!("{}\n", manifest);
+
+    // Durable write: write + fsync temp, rename, fsync directory (same durability
+    // model RocksDB expects for CURRENT updates under power-loss).
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| {
+                engine_traits::Error::Engine(engine_traits::Status::with_error(
+                    engine_traits::Code::IoError,
+                    format!("open CURRENT recover tmp: {}", e),
+                ))
+            })?;
+        f.write_all(content.as_bytes()).map_err(|e| {
+            engine_traits::Error::Engine(engine_traits::Status::with_error(
+                engine_traits::Code::IoError,
+                format!("write CURRENT recover tmp: {}", e),
+            ))
+        })?;
+        f.sync_all().map_err(|e| {
+            engine_traits::Error::Engine(engine_traits::Status::with_error(
+                engine_traits::Code::IoError,
+                format!("fsync CURRENT recover tmp: {}", e),
+            ))
+        })?;
+    }
+    fs::rename(&tmp, &current).map_err(|e| {
+        engine_traits::Error::Engine(engine_traits::Status::with_error(
+            engine_traits::Code::IoError,
+            format!("rename CURRENT recover: {}", e),
+        ))
+    })?;
+    // Best-effort directory fsync so the rename is durable.
+    if let Ok(dir_f) = File::open(dir) {
+        let _ = dir_f.sync_all();
+    }
+
+    warn!(
+        "recovered RocksDB CURRENT from MANIFEST after truncation";
+        "path" => %dir.display(),
+        "manifest" => %manifest,
+    );
+    Ok(true)
 }
 
 /// Returns a Vec of cf which is in `a' but not in `b'.
@@ -646,6 +801,124 @@ mod tests {
             .get_options_cf("cf_dynamic_level_bytes_disabled")
             .unwrap();
         assert!(!tmp_cf_opts.get_level_compaction_dynamic_level_bytes());
+    }
+
+    /// Empty CURRENT (crash mid-meta-write) makes raw RocksDB open fail with
+    /// "CURRENT file does not end with newline" while MANIFEST remains.
+    #[test]
+    fn test_truncated_current_raw_open_fails() {
+        let path = Builder::new()
+            .prefix("rocksdb_truncated_current_raw_fail")
+            .tempdir()
+            .unwrap();
+        let path_str = path.path().to_str().unwrap();
+
+        {
+            let db = new_engine(path_str, &[CF_DEFAULT]).unwrap();
+            db.put(b"k1", b"v-committed").unwrap();
+            db.flush_cf(CF_DEFAULT, true).unwrap();
+            drop(db);
+        }
+
+        // Simulate incomplete CURRENT write leaving an empty file.
+        let current = path.path().join("CURRENT");
+        let before = std::fs::read(&current).unwrap();
+        assert!(before.ends_with(b"\n"), "precondition: CURRENT valid");
+        assert!(
+            latest_manifest_name(path_str).is_some(),
+            "precondition: MANIFEST present"
+        );
+        std::fs::write(&current, b"").unwrap();
+        assert!(current_file_is_corrupt(path_str));
+
+        // Direct open without recovery path must fail.
+        let opts = RocksDbOptions::default().into_raw();
+        let err = DB::open_cf(opts, path_str, vec![(CF_DEFAULT, Default::default())]).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("CURRENT") || msg.contains("Corruption") || msg.contains("newline"),
+            "expected CURRENT corruption error, got: {}",
+            msg
+        );
+    }
+
+    /// recover_current_if_needed rewrites CURRENT from latest MANIFEST;
+    /// new_engine_opt then reopens and committed keys remain readable.
+    #[test]
+    fn test_recover_truncated_current_reopens_with_data() {
+        let path = Builder::new()
+            .prefix("rocksdb_recover_truncated_current")
+            .tempdir()
+            .unwrap();
+        let path_str = path.path().to_str().unwrap();
+
+        {
+            let db = new_engine(path_str, &[CF_DEFAULT]).unwrap();
+            db.put(b"k1", b"v-committed").unwrap();
+            db.put(b"k2", b"v2").unwrap();
+            db.flush_cf(CF_DEFAULT, true).unwrap();
+            drop(db);
+        }
+
+        let current = path.path().join("CURRENT");
+        // Case A: empty CURRENT.
+        std::fs::write(&current, b"").unwrap();
+        assert!(current_file_is_corrupt(path_str));
+        assert!(recover_current_if_needed(path_str).unwrap());
+        assert!(!current_file_is_corrupt(path_str));
+        let recovered = std::fs::read(&current).unwrap();
+        assert!(recovered.ends_with(b"\n"));
+        assert!(recovered.starts_with(b"MANIFEST-"));
+
+        let db = new_engine(path_str, &[CF_DEFAULT]).unwrap();
+        assert_eq!(
+            db.get_value(b"k1").unwrap().unwrap().as_ref(),
+            b"v-committed"
+        );
+        drop(db);
+
+        // Case B: missing trailing newline.
+        let mut body = std::fs::read(&current).unwrap();
+        if body.ends_with(b"\n") {
+            body.pop();
+        }
+        std::fs::write(&current, &body).unwrap();
+        assert!(current_file_is_corrupt(path_str));
+        // new_engine_opt must auto-recover.
+        let db = new_engine_opt(path_str, RocksDbOptions::default(), vec![(CF_DEFAULT, Default::default())])
+            .expect("new_engine_opt should recover CURRENT without newline");
+        assert_eq!(db.get_value(b"k2").unwrap().unwrap().as_ref(), b"v2");
+    }
+
+    #[test]
+    fn test_recover_current_noop_when_healthy() {
+        let path = Builder::new()
+            .prefix("rocksdb_recover_current_noop")
+            .tempdir()
+            .unwrap();
+        let path_str = path.path().to_str().unwrap();
+        let db = new_engine(path_str, &[CF_DEFAULT]).unwrap();
+        drop(db);
+        assert!(!current_file_is_corrupt(path_str));
+        assert!(!recover_current_if_needed(path_str).unwrap());
+    }
+
+    #[test]
+    fn test_parse_current_manifest_name_strict() {
+        assert_eq!(
+            parse_current_manifest_name(b"MANIFEST-000001\n"),
+            Some("MANIFEST-000001")
+        );
+        // Empty / missing newline.
+        assert!(parse_current_manifest_name(b"").is_none());
+        assert!(parse_current_manifest_name(b"MANIFEST-000001").is_none());
+        // Leading whitespace / double newline / trailing junk rejected.
+        assert!(parse_current_manifest_name(b" MANIFEST-000001\n").is_none());
+        assert!(parse_current_manifest_name(b"MANIFEST-000001\n\n").is_none());
+        assert!(parse_current_manifest_name(b"MANIFEST-000001 \n").is_none());
+        assert!(parse_current_manifest_name(b"NOT-A-MANIFEST\n").is_none());
+        assert!(parse_current_manifest_name(b"MANIFEST-\n").is_none());
+        assert!(parse_current_manifest_name(b"MANIFEST-abc\n").is_none());
     }
 
     #[test]
