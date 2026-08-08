@@ -17,12 +17,16 @@
 #![cfg(feature = "dst")]
 
 use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant as WallInstant},
 };
 
 use futures::Future;
-use kvproto::raft_serverpb::RaftMessage;
+use kvproto::{raft_cmdpb::RaftCmdResponse, raft_serverpb::RaftMessage};
 use raft::eraftpb::MessageType;
 use rand::Rng;
 use test_raftstore::{
