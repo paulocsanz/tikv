@@ -1542,8 +1542,6 @@ fn test_dst_concurrent_two_writers() {
 /// never corrupted — all keys that land must have correct values.
 #[test]
 fn test_dst_storage_fault_raft_propose() {
-    use test_raftstore::ReorderMode;
-
     // This test requires failpoints feature.
     #[cfg(not(feature = "failpoints"))]
     {
@@ -1565,4 +1563,98 @@ fn test_dst_storage_fault_raft_propose() {
         eprintln!("DST_STORAGE_FAULT: raft_propose failpoint incompatible with async writes (known limitation)");
         eprintln!("DST_STORAGE_FAULT: see dst-adversarial-safety.md for details");
     }
+}
+
+// ─── Partition simulation: heal + safety ──────────────────────────────
+//
+// Partition node 2 from node 3 in a 3-node cluster, write under the
+// partition, then heal and verify that all nodes converge to the same KV.
+//
+// This is the classic "split-brain heal" safety test. Raft guarantees that
+// after healing, all nodes converge. The oracle checks exactly that.
+
+/// Partition one follower from the leader + other follower, write, then heal.
+/// After heal + settle, all keys must be present with correct values.
+#[test]
+fn test_dst_partition_heal_safety() {
+    // Use hybrid clock (not pure-hold) for partition test — pure-hold + partition
+    // can deadlock the leader because hold-and-release doesn't flush partitioned
+    // messages promptly. Hybrid clock + auto-release (batch_size=1) lets raft
+    // make progress under partition while still being seed-stable.
+
+    let seed = 0x5d01u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(
+        wait_leader(&mut cluster, 100),
+        "3-node cluster failed to elect leader under dst"
+    );
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 1: write under partition (node 2 isolated).
+    let net = DstNetworkQueue::new(seed, 1) // batch_size=1: auto-release
+        .with_dup_rate(10);
+    net.add_partition(2, 1);
+    net.add_partition(2, 3);
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+    net.set_recording(true);
+
+    eprintln!("DST_PART phase 1: node 2 partitioned, writing 3 keys");
+
+    let keys: [&[u8]; 3] = [b"pk_1", b"pk_2", b"pk_3"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("pv_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 2: heal.
+    eprintln!("DST_PART phase 2: healing partition");
+    net.clear_partitions();
+
+    // Let raft converge after heal.
+    std::thread::sleep(Duration::from_millis(500));
+    for _ in 0..20 {
+        let _ = batch_system::step_all_once();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ORACLE: after heal, all keys must have correct values.
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    eprintln!("DST_PART final kv after heal={stable}");
+
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=pv_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "SAFETY VIOLATION: key {} missing expected value after partition heal: {stable}",
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+    eprintln!("DST_PART OK: all keys converged after partition heal");
 }
