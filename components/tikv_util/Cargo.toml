@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [features]
 failpoints = ["fail/failpoints"]
 test-cgroup = []
+dst = []
 
 [dependencies]
 # TODO: use `async-speed-limit` in crates.io after new version(v0.4.2) is released.

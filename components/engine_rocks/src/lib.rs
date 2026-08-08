@@ -78,6 +78,8 @@ pub use compact_listener::*;
 pub mod decode_properties;
 pub use decode_properties::*;
 pub mod properties;
+#[cfg(feature = "dst")]
+pub mod det_env;
 pub use properties::*;
 
 pub mod rocks_metrics;
