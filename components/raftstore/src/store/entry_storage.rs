@@ -618,17 +618,48 @@ fn validate_states<ER: RaftEngine>(
     // The commit index of raft state may be less than the recorded commit index.
     // If so, forward the commit index.
     if commit_index < recorded_commit_index {
-        let entry = raft_engine.get_entry(region_id, recorded_commit_index)?;
-        if entry.is_none_or(|e| e.get_term() != apply_state.get_commit_term()) {
-            return Err(box_err!(
-                "log at recorded commit index [{}] {} doesn't exist, may lose data, {}",
-                apply_state.get_commit_term(),
-                recorded_commit_index,
-                state_str()
-            ));
+        match raft_engine.get_entry(region_id, recorded_commit_index)? {
+            Some(entry) if entry.get_term() == apply_state.get_commit_term() => {
+                // Normal case: the entry exists with the expected term.
+                // Forward the commit index.
+                info!("updating commit index"; "region_id" => region_id, "old" => commit_index, "new" => recorded_commit_index);
+                commit_index = recorded_commit_index;
+            }
+            Some(entry) => {
+                // The entry exists but with a *different* term than the apply
+                // state records.  This means a committed entry was overwritten
+                // by an entry from a different leader — genuine corruption, not
+                // recoverable via Raft replay.
+                return Err(box_err!(
+                    "log at recorded commit index [{}] {} doesn't match expected term {}, may lose data, {}",
+                    recorded_commit_index,
+                    entry.get_term(),
+                    apply_state.get_commit_term(),
+                    state_str()
+                ));
+            }
+            None => {
+                // The raft log entry at the recorded commit index is entirely
+                // missing.  This can happen when the storage device reports a
+                // successful fsync but the data was not actually persisted
+                // (e.g. volatile write-back cache, consumer SSD lying about
+                // fsync).  Instead of aborting boot — which turns a
+                // single-node data-loss event into a permanent cluster outage
+                // — accept the loss and let the Raft leader replay the missing
+                // entries via AppendEntries.  Entries already applied to the
+                // state machine remain there; the apply system skips
+                // re-applying indices <= applied_index.
+                warn!(
+                    "raft log entry at recorded commit index is missing; \
+                     accepting loss and deferring to Raft leader for catch-up";
+                    "region_id" => region_id,
+                    "commit_index" => commit_index,
+                    "recorded_commit_index" => recorded_commit_index,
+                    "last_index" => last_index,
+                    "applied_index" => apply_state.get_applied_index(),
+                );
+            }
         }
-        info!("updating commit index"; "region_id" => region_id, "old" => commit_index, "new" => recorded_commit_index);
-        commit_index = recorded_commit_index;
     }
     if apply_state.get_applied_index() > commit_index {
         info!("applied index is larger than recorded commit index"; "apply" => apply_state.get_applied_index(), "commit" => commit_index);

@@ -2380,7 +2380,10 @@ pub mod tests {
         lb.put_raft_state(1, &raft_state).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
 
-        // It should not recover if corresponding log doesn't exist.
+        // It should recover when the raft log entry at the recorded commit
+        // index is missing (e.g. fsync lied). Instead of failing, the commit
+        // index is left unforwarded and the Raft leader is expected to replay
+        // the missing entries via AppendEntries.
         engines.raft.gc(1, 14, 15, &mut lb).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
         let mut apply_state = RaftApplyState::default();
@@ -2393,7 +2396,11 @@ pub mod tests {
             .kv
             .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
             .unwrap();
-        assert!(build_storage().is_err());
+        // build should succeed now, with commit_index NOT forwarded.
+        raft_state.mut_hard_state().set_commit(12);
+        s = build_storage().unwrap();
+        let initial_state = s.initial_state().unwrap();
+        assert_eq!(initial_state.hard_state.get_commit(), 12);
 
         let entries = (14..=20)
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
@@ -2406,7 +2413,9 @@ pub mod tests {
         let initial_state = s.initial_state().unwrap();
         assert_eq!(initial_state.hard_state, *raft_state.get_hard_state());
 
-        // log term mismatch is invalid.
+        // log term mismatch is invalid — a committed entry was overwritten
+        // by an entry from a different term. This is genuine corruption, not
+        // recoverable via Raft replay, unlike the missing-entry case above.
         let mut entries: Vec<_> = (14..=20)
             .map(|index| new_entry(index, RAFT_INIT_LOG_TERM))
             .collect();
@@ -2434,6 +2443,101 @@ pub mod tests {
         lb.put_raft_state(1, &raft_state).unwrap();
         engines.raft.consume(&mut lb, false).unwrap();
         assert!(build_storage().is_err());
+    }
+
+    /// Test that `validate_states` recovers gracefully when the raft log entry
+    /// at the recorded commit index is missing — the "lying fsync" scenario
+    /// where storage reports success but data was not actually persisted.
+    ///
+    /// Instead of aborting boot with a FATAL, the node should start
+    /// successfully and let the Raft leader replay the missing entries via
+    /// normal AppendEntries. The hard-state commit index must NOT be forwarded
+    /// past the missing entry.
+    #[test]
+    fn test_validate_states_missing_entry_recovery() {
+        let td = Builder::new()
+            .prefix("tikv-store-test-recovery")
+            .tempdir()
+            .unwrap();
+        let region_worker = LazyWorker::new("snap-manager");
+        let region_sched = region_worker.scheduler();
+        let raftlog_fetch_worker = LazyWorker::new(RAFTLOG_FETCH_WORKER_THREAD);
+        let raftlog_fetch_sched = raftlog_fetch_worker.scheduler();
+        let kv_db = engine_test::kv::new_engine(td.path().to_str().unwrap(), ALL_CFS).unwrap();
+        let raft_path = td.path().join(Path::new("raft"));
+        let raft_db = engine_test::raft::new_engine(raft_path.to_str().unwrap(), None).unwrap();
+        let engines = Engines::new(kv_db, raft_db);
+        bootstrap_store(&engines, 1, 1).unwrap();
+
+        let region = initial_region(1, 1, 1);
+        prepare_bootstrap_cluster(&engines, &region).unwrap();
+
+        let build_storage = || -> Result<PeerStorage<KvTestEngine, RaftTestEngine>> {
+            PeerStorage::new(
+                engines.clone(),
+                &region,
+                region_sched.clone(),
+                raftlog_fetch_sched.clone(),
+                0,
+                "".to_owned(),
+                &RaftMetrics::new(false),
+            )
+        };
+
+        // Bootstrap a valid state: entries 5..=20 at RAFT_INIT_LOG_TERM.
+        let mut raft_state = RaftLocalState::default();
+        raft_state.set_last_index(20);
+        raft_state.mut_hard_state().set_term(RAFT_INIT_LOG_TERM);
+        raft_state.mut_hard_state().set_commit(20);
+
+        let mut lb = engines.raft.log_batch(4096);
+        let entries: Vec<_> = (5..=20)
+            .map(|i| new_entry(i, RAFT_INIT_LOG_TERM))
+            .collect();
+        lb.append(1, None, entries).unwrap();
+        lb.put_raft_state(1, &raft_state).unwrap();
+        engines.raft.consume(&mut lb, false).unwrap();
+
+        // Write apply state: applied_index=13 with truncated_state at 13 so
+        // init_applied_term can resolve via truncated_state (not a live lookup).
+        // commit_index=14 means validate_states will try to find entry 14.
+        let mut apply_state = RaftApplyState::default();
+        apply_state.set_applied_index(13);
+        apply_state.mut_truncated_state().set_index(13);
+        apply_state.mut_truncated_state().set_term(RAFT_INIT_LOG_TERM);
+        apply_state.set_commit_index(14);
+        apply_state.set_commit_term(RAFT_INIT_LOG_TERM);
+        let apply_state_key = keys::apply_state_key(1);
+        engines
+            .kv
+            .put_msg_cf(CF_RAFT, &apply_state_key, &apply_state)
+            .unwrap();
+
+        // Sanity: should build fine (commit 20 >= recorded commit 14, entry 14 exists).
+        let s = build_storage().unwrap();
+        let initial_state = s.initial_state().unwrap();
+        assert_eq!(initial_state.hard_state.get_commit(), 20);
+
+        // Simulate lying fsync: entry 14 is gone from the raft engine
+        // (not actually persisted despite fsync reporting success), but the
+        // apply state still records commit_index=14. Also set
+        // hard_state.commit to 12 — what the raft engine actually persisted.
+        engines.raft.gc(1, 14, 15, &mut lb).unwrap();
+        raft_state.mut_hard_state().set_commit(12);
+        lb.put_raft_state(1, &raft_state).unwrap();
+        engines.raft.consume(&mut lb, false).unwrap();
+
+        // Before the fix this would FATAL. Now it should recover.
+        let s = build_storage()
+            .expect("PeerStorage::new should succeed when entry is missing (lying fsync)");
+        let initial_state = s.initial_state().unwrap();
+
+        // Commit index must NOT be forwarded past the missing entry.
+        assert_eq!(
+            initial_state.hard_state.get_commit(),
+            12,
+            "commit index should remain at 12, not forwarded to the missing entry"
+        );
     }
 
     fn gen_snap_for_test(rx: Receiver<Snapshot>) -> SnapState {
