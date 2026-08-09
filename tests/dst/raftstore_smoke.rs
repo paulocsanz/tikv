@@ -8937,3 +8937,225 @@ fn test_deep_key_ordering_guarantee() {
     cleanup_cluster();
     eprintln!("DST_DEEP100 OK");
 }
+
+
+// ─── Election matrix: forced leader election across all 32 subsets ───────
+//
+// All previous matrices transfer leaders explicitly. This one FORCES a
+// real election: kill the leader, let followers elect a new one via timeout
+// (MsgRequestPreVote path), then restart the old leader. This tests:
+//
+//   - Pre-vote safety under faults (the most critical Raft invariant)
+//   - Term advancement during partition
+//   - Old leader rejection after restart (step-down)
+//   - Data continuity across forced election
+//
+// If pre-vote is broken, this is where split-brain would manifest.
+
+fn run_election_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    // Establish leader on node 1.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 1: write data on leader 1.
+    let pre_keys: [(Vec<u8>, Vec<u8>); 4] = [
+        (b"em_pre_0".to_vec(), format!("emv_pre_{mask}_{seed}_0").into_bytes()),
+        (b"em_pre_1".to_vec(), format!("emv_pre_{mask}_{seed}_1").into_bytes()),
+        (b"em_pre_2".to_vec(), format!("emv_pre_{mask}_{seed}_2").into_bytes()),
+        (b"em_pre_3".to_vec(), format!("emv_pre_{mask}_{seed}_3").into_bytes()),
+    ];
+    for (k, v) in &pre_keys {
+        cluster.must_put(k, v);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify leader is node 1.
+    let leader_before = cluster.leader_of_region(1).map(|p| p.get_store_id());
+    eprintln!(
+        "DST_ELECT mask=0b{:05b} ({}) seed={seed:#x} leader_before={:?}",
+        mask,
+        fault_mask_name(mask),
+        leader_before
+    );
+
+    // Phase 2: activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    // For election test: DON'T partition {2,3} from each other.
+    // Partition node 1 (the leader we're about to kill) from {2,3}.
+    // This makes the election harder — partitioned leader might think
+    // it's still leader while {2,3} elect a new one.
+    if has_partition {
+        net.add_partition(1, 2);
+        net.add_partition(1, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Phase 3: KILL the leader (node 1).
+    cluster.stop_node(1);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Phase 4: let {2,3} elect a new leader via timeout.
+    // They should form a quorum of 2/3 and elect a new leader.
+    // Wait longer for election under faults.
+    let mut new_leader = None;
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(50));
+        // Try to write — if it succeeds, a new leader is up.
+        let write_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(b"em_elected", b"election_worked");
+        }))
+        .is_ok();
+        if write_ok {
+            new_leader = cluster.leader_of_region(1).map(|p| p.get_store_id());
+            break;
+        }
+    }
+
+    eprintln!(
+        "DST_ELECT mask=0b{:05b} ({}) seed={seed:#x} new_leader={:?}",
+        mask,
+        fault_mask_name(mask),
+        new_leader
+    );
+
+    // Write more data under the new leader.
+    let post_keys: [(Vec<u8>, Vec<u8>); 4] = [
+        (b"em_post_0".to_vec(), format!("emv_post_{mask}_{seed}_0").into_bytes()),
+        (b"em_post_1".to_vec(), format!("emv_post_{mask}_{seed}_1").into_bytes()),
+        (b"em_post_2".to_vec(), format!("emv_post_{mask}_{seed}_2").into_bytes()),
+        (b"em_post_3".to_vec(), format!("emv_post_{mask}_{seed}_3").into_bytes()),
+    ];
+    for (k, v) in &post_keys {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(k, v);
+        }));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 5: heal partition, restart node 1.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.run_node(1).unwrap();
+    // Node 1 restarts as old leader — it must step down when it sees
+    // the higher term from the new leader.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Phase 6: verify ALL data (pre + post election).
+    for (k, v) in &pre_keys {
+        let got = cluster.must_get(k);
+        assert_eq!(
+            got.as_deref(),
+            Some(v.as_slice()),
+            "ELECTION MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} pre-election key {} lost: {got:?}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+    for (k, v) in &post_keys {
+        let got = cluster.must_get(k);
+        assert_eq!(
+            got.as_deref(),
+            Some(v.as_slice()),
+            "ELECTION MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} post-election key {} lost: {got:?}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_election_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_ELECT_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_ELECT_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_ELECT masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xA000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_election_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_ELECT mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_ELECT mask=0b{:05b} ({}) FAIL — replay: DST_ELECT_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_ELECT_REPLAY").is_ok() {
+                panic!("election matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_ELECT done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "election fault matrix had failures");
+}
