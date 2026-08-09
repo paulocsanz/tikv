@@ -9975,3 +9975,230 @@ fn test_deep_read_all_nodes_after_split() {
     eprintln!("DST_DEEP120 OK");
 }
 
+
+// ─── Compound admin matrix: split + transfer + compact + transfer ────────
+//
+// Stacks 4 admin operations in a single cell under each fault mask:
+//   1. Region split
+//   2. Leader transfer (1 → 2)
+//   3. Log compaction (forces raft log truncation + RocksDB compaction)
+//   4. Leader transfer (2 → 3)
+//
+// No previous matrix stacks multiple admin ops. This tests the interaction
+// between split, leader transfer, and compaction — the most complex
+// interaction path in TiKV's raftstore admin pipeline.
+
+fn run_compound_admin_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 1: write keys on both sides of the split point.
+    let pre_keys: [(&[u8], &[u8]); 4] = [
+        (b"ca_aaa", b"cval_aaa"),
+        (b"ca_eee", b"cval_eee"),
+        (b"ca_mmm", b"cval_mmm"),
+        (b"ca_zzz", b"cval_zzz"),
+    ];
+    for (k, v) in &pre_keys {
+        cluster.must_put(k, v);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 2: activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Op 1: SPLIT at "ca_mmm".
+    let region = cluster.get_region(b"ca_aaa");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_split(&region, b"ca_mmm");
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write 2 keys in each child region.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ca_bbb", b"cval_bbb");
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ca_nnn", b"cval_nnn");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Op 2: TRANSFER leader 1 → 2.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write under new leader.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ca_ccc", b"cval_ccc");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Op 3: COMPACT (force raft log truncation).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.compact_data();
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write after compaction.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ca_ddd", b"cval_ddd");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Op 4: TRANSFER leader 2 → 3.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(3, 3));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Final write under leader 3.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ca_ooo", b"cval_ooo");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: heal + converge.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(800));
+
+    // ORACLE: all 9 keys must be readable with correct values.
+    let all_keys: [(&[u8], &[u8]); 9] = [
+        (b"ca_aaa", b"cval_aaa"),
+        (b"ca_bbb", b"cval_bbb"),
+        (b"ca_ccc", b"cval_ccc"),
+        (b"ca_ddd", b"cval_ddd"),
+        (b"ca_eee", b"cval_eee"),
+        (b"ca_mmm", b"cval_mmm"),
+        (b"ca_nnn", b"cval_nnn"),
+        (b"ca_ooo", b"cval_ooo"),
+        (b"ca_zzz", b"cval_zzz"),
+    ];
+    for (k, expected) in &all_keys {
+        let v = cluster.must_get(k);
+        assert_eq!(
+            v.as_deref(),
+            Some(*expected),
+            "COMPOUND ADMIN MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+             key {} = {v:?} expected {expected:?}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    // Verify two distinct regions exist post-split.
+    let r_left = cluster.get_region(b"ca_aaa");
+    let r_right = cluster.get_region(b"ca_nnn");
+    assert_ne!(
+        r_left.get_id(),
+        r_right.get_id(),
+        "COMPOUND ADMIN MATRIX: mask=0b{:05b} ({}) seed={seed:#x} \
+         split did not persist two regions",
+        mask,
+        fault_mask_name(mask)
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_compound_admin_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_COMPOUND_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_COMPOUND_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_COMPOUND masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xB000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_compound_admin_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_COMPOUND mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_COMPOUND mask=0b{:05b} ({}) FAIL — replay: DST_COMPOUND_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_COMPOUND_REPLAY").is_ok() {
+                panic!("compound admin matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_COMPOUND done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "compound admin fault matrix had failures");
+}
