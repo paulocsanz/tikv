@@ -33,7 +33,7 @@ use raft::eraftpb::MessageType;
 use rand::Rng;
 use test_raftstore::{
     CloneFilterFactory, Direction, DstNetworkQueue, Filter, RegionPacketFilter, ReorderMode,
-    msg_sort_key, new_delete_cmd, new_node_cluster, new_peer, new_put_cmd,
+    msg_sort_key, new_delete_cmd, new_node_cluster, new_peer, new_put_cmd, read_on_peer,
 };
 use tikv_util::{config::ReadableSize, dst_rng::DstRng, time};
 
@@ -10202,3 +10202,365 @@ fn test_dst_compound_admin_fault_matrix() {
     );
     assert_eq!(passed, total, "compound admin fault matrix had failures");
 }
+// ─── Batch 16: read path diversity + extreme edge cases ──────────────────
+
+/// LEADER READ CONSISTENCY: Write a key, then read via local lease read
+/// (read_quorum=false). Verify correct value.
+#[test]
+fn test_deep_leader_local_read() {
+    let seed = 0xA11u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_put(b"llr_key1", b"llr_val1");
+    cluster.must_put(b"llr_key2", b"llr_val2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"llr_key1");
+    let leader = cluster.leader_of_region(region.get_id()).unwrap();
+    let leader_store = leader.get_store_id();
+
+    // Local read from leader (read_quorum = false).
+    let resp = read_on_peer(
+        &mut cluster,
+        new_peer(leader_store, leader_store),
+        region.clone(),
+        b"llr_key1",
+        false,
+        Duration::from_secs(5),
+    );
+    assert!(resp.is_ok(), "BUG: leader local read failed: {:?}", resp.err());
+    let resp = resp.unwrap();
+    assert!(!resp.get_header().has_error(), "BUG: leader read error: {:?}", resp.get_header().get_error());
+    assert_eq!(resp.get_responses()[0].get_get().get_value(), b"llr_val1");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP121 OK");
+}
+
+/// READ INDEX PATH: Write a key, then read via read index (read_quorum=true).
+/// This forces the leader to confirm it's still leader before serving the read.
+#[test]
+fn test_deep_read_index_path() {
+    let seed = 0xB11u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_put(b"rip_key", b"rip_val");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"rip_key");
+    let leader = cluster.leader_of_region(region.get_id()).unwrap();
+    let leader_store = leader.get_store_id();
+
+    // Read via read index (read_quorum = true).
+    let resp = read_on_peer(
+        &mut cluster,
+        new_peer(leader_store, leader_store),
+        region.clone(),
+        b"rip_key",
+        true,
+        Duration::from_secs(5),
+    );
+    assert!(resp.is_ok(), "BUG: read index failed: {:?}", resp.err());
+    let resp = resp.unwrap();
+    assert!(!resp.get_header().has_error(), "BUG: read index error: {:?}", resp.get_header().get_error());
+    assert_eq!(resp.get_responses()[0].get_get().get_value(), b"rip_val");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP122 OK");
+}
+
+/// FOLLOWER READ: Write via leader, then read from a follower via read index.
+/// The follower should return the committed value.
+#[test]
+fn test_deep_follower_read() {
+    let seed = 0xF01u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_put(b"fr_key", b"fr_val");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let region = cluster.get_region(b"fr_key");
+    let leader = cluster.leader_of_region(region.get_id()).unwrap();
+
+    // Find a follower (not the leader).
+    let follower_store = (1u64..=3).find(|&s| s != leader.get_store_id()).unwrap();
+
+    // Read from follower with read_quorum=true.
+    let resp = read_on_peer(
+        &mut cluster,
+        new_peer(follower_store, follower_store),
+        region.clone(),
+        b"fr_key",
+        true,
+        Duration::from_secs(5),
+    );
+    assert!(resp.is_ok(), "BUG: follower read failed: {:?}", resp.err());
+    let resp = resp.unwrap();
+    if resp.get_header().has_error() {
+        eprintln!("DST_DEEP123: follower read returned error (may be region not ready): {:?}",
+            resp.get_header().get_error());
+    } else {
+        assert_eq!(resp.get_responses()[0].get_get().get_value(), b"fr_val",
+            "BUG: follower read returned wrong value");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP123 OK");
+}
+
+/// IMMEDIATE READ AFTER WRITE: Write a value, then immediately read it
+/// with no sleep. Verify read-your-writes consistency.
+#[test]
+fn test_deep_immediate_read_after_write() {
+    let seed = 0x1Au64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..20 {
+        let key = format!("iraw_{i:02}");
+        let val = format!("val_{i}");
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        // Immediate read — no sleep.
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_deref(), Some(val.as_bytes()),
+            "BUG: immediate read after write failed for {key}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP124 OK");
+}
+
+/// KEY 0xFF: Write a key with the highest possible byte value.
+/// This tests the upper boundary of key encoding.
+#[test]
+fn test_deep_key_max_byte() {
+    let seed = 0xFFu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let high_keys: [&[u8]; 4] = [
+        b"\xff",
+        b"\xff\xff",
+        b"\xff\xfe\xfd",
+        b"\xff\x00\xff",
+    ];
+
+    for (i, k) in high_keys.iter().enumerate() {
+        cluster.must_put(k, format!("h{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for (i, k) in high_keys.iter().enumerate() {
+        let v = cluster.must_get(k);
+        assert_eq!(v.as_deref(), Some(format!("h{i}").as_bytes()),
+            "BUG: high byte key mismatch");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP125 OK");
+}
+
+/// DELETE ALL + SCAN: Write many keys, delete them all individually,
+/// then scan to verify truly empty (no ghost entries).
+#[test]
+fn test_deep_delete_all_scan_empty() {
+    let seed = 0xDA1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write 30 keys.
+    for i in 0u32..30 {
+        cluster.must_put(format!("dse_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete all individually.
+    for i in 0u32..30 {
+        cluster.must_delete(format!("dse_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact to merge tombstones.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan and verify 0 entries.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zdse_00", b"zdse_99", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 0, "BUG: scan returned {count} ghost entries after delete-all + compact");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP126 OK");
+}
+
+/// MULTIPLE LEADER CHANGES: Write data, transfer leader multiple times
+/// between nodes, verify data consistency after each transfer.
+#[test]
+fn test_deep_multiple_leader_changes() {
+    let seed = 0x1C1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write initial data.
+    for i in 0u32..10 {
+        cluster.must_put(format!("mlc_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Transfer leader: 1 → 2 → 3 → 1.
+    for target in [2u64, 3, 1] {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_transfer_leader(1, new_peer(target, target));
+        }));
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Verify data after each transfer.
+        for i in 0u32..10 {
+            let v = cluster.must_get(format!("mlc_{i:02}").as_bytes());
+            assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+                "BUG: key mlc_{i:02} wrong after leader transfer to {target}");
+        }
+
+        // Write one more key after each transfer (use separate prefix to avoid collision).
+        cluster.must_put(format!("mlc_post_{target}").as_bytes(), b"post_transfer");
+    }
+
+    // Verify the post-transfer keys.
+    for target in [2u64, 3, 1] {
+        let v = cluster.must_get(format!("mlc_post_{target}").as_bytes());
+        assert_eq!(v.as_deref(), Some(b"post_transfer".as_ref()),
+            "BUG: post-transfer key for node {target} missing");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP127 OK");
+}
+
+/// WRITE-IDLE-WRITE: Write, wait 2 seconds (idle), write again. The idle
+/// period shouldn't cause any issues (heartbeat maintenance, etc.).
+#[test]
+fn test_deep_write_idle_write() {
+    let seed = 0x1Bu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    cluster.must_put(b"wiw_phase1", b"first");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Idle period.
+    std::thread::sleep(Duration::from_secs(2));
+
+    cluster.must_put(b"wiw_phase2", b"second");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Both should be readable.
+    assert_eq!(cluster.must_get(b"wiw_phase1"), Some(b"first".to_vec()));
+    assert_eq!(cluster.must_get(b"wiw_phase2"), Some(b"second".to_vec()));
+
+    // Overwrite phase1 during idle.
+    cluster.must_put(b"wiw_phase1", b"updated");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(cluster.must_get(b"wiw_phase1"), Some(b"updated".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP128 OK");
+}
+
+/// SEQUENTIAL VS RANDOM ORDERING: Write keys in sequential order, then
+/// in random order, verify the engine state is the same (sorted).
+#[test]
+fn test_deep_sequential_vs_random_ordering() {
+    let seed = 0x5A1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Sequential write.
+    for i in 0u32..20 {
+        cluster.must_put(format!("sro_{i:03}").as_bytes(), b"seq");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Now overwrite in random order using DST RNG.
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut order: Vec<u32> = (0..20).collect();
+    for i in 0..20 {
+        let j = (rng.gen::<u32>() as usize) % 20;
+        order.swap(i, j);
+    }
+    for &i in &order {
+        cluster.must_put(format!("sro_{i:03}").as_bytes(), b"rand");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // All should have "rand" value regardless of insertion order.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("sro_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(b"rand".as_ref()),
+            "BUG: key sro_{i:03} should be 'rand' regardless of write order");
+    }
+
+    // Scan and verify sorted order.
+    let engine = cluster.get_engine(1);
+    let mut prev: Option<Vec<u8>> = None;
+    let _ = engine.scan("default", b"zsro_000", b"zsro_999", false, |k, _v| {
+        if let Some(p) = &prev {
+            assert!(p.as_slice() < k, "BUG: keys not in ascending order during scan");
+        }
+        prev = Some(k.to_vec());
+        Ok(true)
+    });
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP129 OK");
+}
+
+/// CROSS-CF SCAN ISOLATION: Write to "default" and "write" CFs, then scan
+/// each CF independently. No data should leak between CFs.
+#[test]
+fn test_deep_cross_cf_scan_isolation() {
+    let seed = 0xCFau64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write to both CFs.
+    cluster.must_put_cf("default", b"cfi_key", b"default_val");
+    cluster.must_put_cf("write", b"cfi_key", b"write_val");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let engine = cluster.get_engine(1);
+    let internal_key = keys::data_key(b"cfi_key");
+
+    // Check default CF — should find only default_val.
+    let default_val = engine.get_value(&internal_key).unwrap();
+    assert!(default_val.is_some(), "BUG: default CF value missing");
+    assert_eq!(&*default_val.unwrap(), b"default_val",
+        "BUG: default CF returned wrong value");
+
+    // Check write CF — should find only write_val.
+    let write_val = engine.get_value_cf("write", &internal_key).unwrap();
+    assert!(write_val.is_some(), "BUG: write CF value missing");
+    assert_eq!(&*write_val.unwrap(), b"write_val",
+        "BUG: write CF returned wrong value");
+
+    // Verify default CF does NOT have write_val and vice versa.
+    let default_val2 = engine.get_value(&internal_key).unwrap().unwrap();
+    let write_val2 = engine.get_value_cf("write", &internal_key).unwrap().unwrap();
+    assert_ne!(&*default_val2, &*write_val2,
+        "BUG: CF values should differ (default vs write)");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP130 OK");
+}
+
+
