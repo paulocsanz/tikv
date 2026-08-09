@@ -33,7 +33,7 @@ use raft::eraftpb::MessageType;
 use rand::Rng;
 use test_raftstore::{
     CloneFilterFactory, Direction, DstNetworkQueue, Filter, RegionPacketFilter, ReorderMode,
-    msg_sort_key, new_node_cluster, new_peer,
+    msg_sort_key, new_delete_cmd, new_node_cluster, new_peer, new_put_cmd,
 };
 use tikv_util::{config::ReadableSize, dst_rng::DstRng, time};
 
@@ -9159,3 +9159,419 @@ fn test_dst_election_fault_matrix() {
     );
     assert_eq!(passed, total, "election fault matrix had failures");
 }
+// ─── Batch 14: restart recovery, batch atomicity, node outage ────────────
+
+/// SINGLE NODE RESTART: Write data, stop one node (follower), restart it,
+/// verify it catches up with all committed data.
+#[test]
+fn test_deep_follower_restart_recovery() {
+    let seed = 0xF1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 20 keys.
+    for i in 0u32..20 {
+        cluster.must_put(format!("frr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop follower node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 10 more keys while node 3 is down.
+    for i in 20u32..30 {
+        cluster.must_put(format!("frr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify ALL 30 keys are readable (node 3 should catch up).
+    for i in 0u32..30 {
+        let v = cluster.must_get(format!("frr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key frr_{i:02} missing after follower restart");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP101 OK");
+}
+
+/// LEADER RESTART: Write data, stop the leader, wait for re-election,
+/// verify all committed data survives.
+#[test]
+fn test_deep_leader_restart_recovery() {
+    let seed = 0xF2u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 15 keys.
+    for i in 0u32..15 {
+        cluster.must_put(format!("lrr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Find leader and stop it.
+    let region = cluster.get_region(b"lrr_00");
+    let leader = cluster.leader_of_region(region.get_id()).unwrap();
+    let leader_id = leader.get_store_id();
+    eprintln!("DST_DEEP102: stopping leader node {leader_id}");
+    cluster.stop_node(leader_id);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Write 5 more keys with new leader.
+    for i in 15u32..20 {
+        cluster.must_put(format!("lrr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify all 20 keys survive.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("lrr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key lrr_{i:02} lost during leader restart");
+    }
+
+    // Restart the old leader.
+    let _ = cluster.run_node(leader_id);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify again after restart.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("lrr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key lrr_{i:02} lost after old leader restart");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP102 OK");
+}
+
+/// BATCH ATOMICITY: Put 5 keys + delete 2 keys in a single Raft proposal.
+/// All operations should be applied atomically (all-or-nothing).
+#[test]
+fn test_deep_batch_atomicity_mixed() {
+    let seed = 0xBAu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Pre-write 2 keys that will be deleted in the batch.
+    cluster.must_put(b"bam_del1", b"will_delete_1");
+    cluster.must_put(b"bam_del2", b"will_delete_2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Build a mixed batch: 5 puts + 2 deletes.
+    let reqs = vec![
+        new_put_cmd(b"bam_p1", b"val1"),
+        new_put_cmd(b"bam_p2", b"val2"),
+        new_put_cmd(b"bam_p3", b"val3"),
+        new_put_cmd(b"bam_p4", b"val4"),
+        new_put_cmd(b"bam_p5", b"val5"),
+        new_delete_cmd("default", b"bam_del1"),
+        new_delete_cmd("default", b"bam_del2"),
+    ];
+    let result = cluster.batch_put(b"bam_p1", reqs);
+    assert!(result.is_ok(), "BUG: batch_put failed: {:?}", result.err());
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify all 5 puts applied.
+    for i in 1u32..=5 {
+        let v = cluster.must_get(format!("bam_p{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("val{i}").as_bytes()),
+            "BUG: batch put key bam_p{i} not applied");
+    }
+
+    // Verify both deletes applied.
+    assert!(cluster.must_get(b"bam_del1").is_none(), "BUG: batch delete bam_del1 not applied");
+    assert!(cluster.must_get(b"bam_del2").is_none(), "BUG: batch delete bam_del2 not applied");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP103 OK");
+}
+
+/// LARGE BATCH: 50 puts in a single Raft proposal.
+#[test]
+fn test_deep_large_batch_50_puts() {
+    let seed = 0x1Bu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n = 50u32;
+    let reqs: Vec<_> = (0..n)
+        .map(|i| new_put_cmd(format!("lb_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes()))
+        .collect();
+    let result = cluster.batch_put(b"lb_000", reqs);
+    assert!(result.is_ok(), "BUG: large batch_put failed: {:?}", result.err());
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify all 50 keys.
+    let mut errors = 0;
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("lb_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:03}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/{n} keys missing after large batch");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP104 OK");
+}
+
+/// NODE OUTAGE + CATCH-UP: Write, stop one node, write more, restart node,
+/// then delete some keys, restart verification.
+#[test]
+fn test_deep_node_outage_catchup() {
+    let seed = 0x0Cu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 1: write 10 keys.
+    for i in 0u32..10 {
+        cluster.must_put(format!("noc_{i:02}").as_bytes(), format!("phase1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 2: write 10 more keys + delete 3 from phase 1.
+    for i in 10u32..20 {
+        cluster.must_put(format!("noc_{i:02}").as_bytes(), format!("phase2_{i}").as_bytes());
+    }
+    for i in 0u32..3 {
+        cluster.must_delete(format!("noc_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify: keys 0-2 deleted, keys 3-9 have phase1 values, keys 10-19 have phase2 values.
+    for i in 0u32..3 {
+        assert!(cluster.must_get(format!("noc_{i:02}").as_bytes()).is_none(),
+            "BUG: key noc_{i:02} should be deleted after restart");
+    }
+    for i in 3u32..10 {
+        let v = cluster.must_get(format!("noc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("phase1_{i}").as_bytes()),
+            "BUG: key noc_{i:02} wrong value after restart");
+    }
+    for i in 10u32..20 {
+        let v = cluster.must_get(format!("noc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("phase2_{i}").as_bytes()),
+            "BUG: key noc_{i:02} wrong value after restart");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP105 OK");
+}
+
+/// FLUSH + COMPACTION SEQUENCE: Write, flush, write more, flush, compact.
+/// All data should survive the full LSM-tree lifecycle.
+#[test]
+fn test_deep_flush_compaction_sequence() {
+    let seed = 0xFCu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write 10 keys.
+    for i in 0u32..10 {
+        cluster.must_put(format!("fcs_{i:02}").as_bytes(), format!("round1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Flush to L0.
+    cluster.must_flush_cf("default", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Phase 2: overwrite 5 keys + write 5 new keys.
+    for i in 0u32..5 {
+        cluster.must_put(format!("fcs_{i:02}").as_bytes(), format!("round2_{i}").as_bytes());
+    }
+    for i in 10u32..15 {
+        cluster.must_put(format!("fcs_{i:02}").as_bytes(), format!("round1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Flush again.
+    cluster.must_flush_cf("default", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Compact everything.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify: keys 0-4 should have round2 values, keys 5-14 should have round1 values.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("fcs_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("round2_{i}").as_bytes()),
+            "BUG: key fcs_{i:02} lost overwrite after flush+compact");
+    }
+    for i in 5u32..15 {
+        let v = cluster.must_get(format!("fcs_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("round1_{i}").as_bytes()),
+            "BUG: key fcs_{i:02} wrong value after flush+compact");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP106 OK");
+}
+
+/// FULL CLUSTER RESTART: Stop all 3 nodes, restart all, verify committed
+/// data survives. This tests WAL durability across full cluster restart.
+#[test]
+fn test_deep_full_cluster_restart() {
+    let seed = 0xA1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 15 keys.
+    for i in 0u32..15 {
+        cluster.must_put(format!("fcr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Stop all nodes.
+    cluster.stop_node(1);
+    cluster.stop_node(2);
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Restart all nodes.
+    let _ = cluster.run_node(1);
+    let _ = cluster.run_node(2);
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify all 15 keys survived full cluster restart.
+    let mut errors = 0;
+    for i in 0u32..15 {
+        let v = cluster.must_get(format!("fcr_{i:02}").as_bytes());
+        if v.as_deref() != Some(format!("v{i}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/15 keys lost after full cluster restart");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP107 OK");
+}
+
+/// BATCH WITH SAME KEY MULTIPLE TIMES: Put the same key 5 times in one
+/// batch with different values. The last value should win.
+#[test]
+fn test_deep_batch_same_key_overwrite() {
+    let seed = 0x50u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 5 puts for the same key in one batch.
+    let reqs = vec![
+        new_put_cmd(b"bsko", b"first"),
+        new_put_cmd(b"bsko", b"second"),
+        new_put_cmd(b"bsko", b"third"),
+        new_put_cmd(b"bsko", b"fourth"),
+        new_put_cmd(b"bsko", b"fifth"),
+    ];
+    let result = cluster.batch_put(b"bsko", reqs);
+    assert!(result.is_ok(), "BUG: batch with same key failed: {:?}", result.err());
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Last value should win.
+    let v = cluster.must_get(b"bsko");
+    assert_eq!(v.as_deref(), Some(b"fifth".as_ref()),
+        "BUG: same-key batch should have last value, got {:?}", v);
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP108 OK");
+}
+
+/// WRITE-DELETE-WRITE RESTART: Write a key, delete it, write it again,
+/// stop+restart node, verify the final write survived.
+#[test]
+fn test_deep_write_delete_write_restart() {
+    let seed = 0xDD0u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_put(b"wdwr", b"version1");
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_delete(b"wdwr");
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_put(b"wdwr", b"version2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop and restart node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The final value should be version2.
+    let v = cluster.must_get(b"wdwr");
+    assert_eq!(v.as_deref(), Some(b"version2".as_ref()),
+        "BUG: write-delete-write-restart lost final write, got {:?}", v);
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP109 OK");
+}
+
+/// DELETE RANGE AFTER RESTART: Write keys, restart a node, delete range,
+/// verify the delete range is properly replicated to the restarted node.
+#[test]
+fn test_deep_delete_range_after_restart() {
+    let seed = 0xDAu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 15 keys.
+    for i in 0u32..15 {
+        cluster.must_put(format!("drar_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Delete range covering keys 5-9.
+    cluster.must_delete_range_cf("default", b"drar_05", b"drar_10");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify: keys 0-4 survive, keys 5-9 deleted, keys 10-14 survive.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("drar_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key drar_{i:02} should survive delete range");
+    }
+    for i in 5u32..10 {
+        assert!(cluster.must_get(format!("drar_{i:02}").as_bytes()).is_none(),
+            "BUG: key drar_{i:02} should be deleted");
+    }
+    for i in 10u32..15 {
+        let v = cluster.must_get(format!("drar_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key drar_{i:02} should survive delete range");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP110 OK");
+}
+
