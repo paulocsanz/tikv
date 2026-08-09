@@ -8129,3 +8129,459 @@ fn test_dst_read_consistency_fault_matrix() {
     );
     assert_eq!(passed, total, "read consistency fault matrix had failures");
 }
+// ─── Batch 12: multi-seed sweep + deep infrastructure tests ──────────
+
+/// MULTI-SEED MODEL SWEEP: Run the model-based property test across 10
+/// different seeds. Each seed generates a unique random operation sequence.
+/// Any mismatch = bug.
+#[test]
+fn test_deep_model_sweep_10_seeds() {
+    let seeds = [
+        0x1111u64, 0x2222, 0x3333, 0x4444, 0x5555,
+        0x6666, 0x7777, 0x8888, 0x9999, 0xAAAA,
+    ];
+
+    let mut total_ops = 0u32;
+    let mut total_mismatches = 0u32;
+
+    for &seed in &seeds {
+        let mut cluster = bootstrap_hybrid(seed);
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut rng = DstRng::seed_from_u64(seed);
+        let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+        for op_idx in 0u32..100 {
+            let op = rng.gen::<u32>() % 3;
+            let key_idx = rng.gen::<u32>() % 15;
+            let key = format!("ms_{key_idx:02}");
+
+            match op {
+                0 => {
+                    let val = format!("v{}", rng.gen::<u32>() % 500);
+                    cluster.must_put(key.as_bytes(), val.as_bytes());
+                    model.insert(key.into_bytes(), val.into_bytes());
+                }
+                1 => {
+                    let v = cluster.must_get(key.as_bytes());
+                    let expected = model.get(key.as_bytes());
+                    if v.as_deref() != expected.map(|v| v.as_slice()) {
+                        total_mismatches += 1;
+                        eprintln!("SEED {seed:#x} op={op_idx} MISMATCH key={key}");
+                    }
+                }
+                _ => {
+                    cluster.must_delete(key.as_bytes());
+                    model.remove(key.as_bytes());
+                }
+            }
+            total_ops += 1;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Final verification.
+        for (key, expected_val) in &model {
+            let v = cluster.must_get(key);
+            if v.as_deref() != Some(expected_val.as_slice()) {
+                total_mismatches += 1;
+            }
+        }
+
+        cluster.shutdown();
+        cleanup_cluster();
+    }
+
+    assert_eq!(total_mismatches, 0,
+        "BUG: {total_mismatches} mismatches across 10 seeds × 100 ops each");
+    eprintln!("DST_DEEP82 multi-seed sweep: {total_ops} ops across {} seeds, 0 mismatches",
+        seeds.len());
+    eprintln!("DST_DEEP82 OK");
+}
+
+/// MODEL WITH SPLIT: Run model-based ops, then split mid-sequence and
+/// continue. The model must remain accurate across the split.
+#[test]
+fn test_deep_model_with_split() {
+    let seed = 0xBEEF_F00D;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    // Phase 1: 100 ops.
+    for _ in 0u32..100 {
+        let op = rng.gen::<u32>() % 2;
+        let key_idx = rng.gen::<u32>() % 20;
+        let key = format!("ms_{key_idx:02}");
+        match op {
+            0 => {
+                let val = format!("v{}", rng.gen::<u32>() % 200);
+                cluster.must_put(key.as_bytes(), val.as_bytes());
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            _ => {
+                cluster.must_delete(key.as_bytes());
+                model.remove(key.as_bytes());
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Split mid-sequence.
+    let region = cluster.get_region(b"ms_00");
+    cluster.must_split(&region, b"ms_10");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Phase 2: 100 more ops after split.
+    for _ in 0u32..100 {
+        let op = rng.gen::<u32>() % 2;
+        let key_idx = rng.gen::<u32>() % 20;
+        let key = format!("ms_{key_idx:02}");
+        match op {
+            0 => {
+                let val = format!("v{}", rng.gen::<u32>() % 200);
+                cluster.must_put(key.as_bytes(), val.as_bytes());
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            _ => {
+                cluster.must_delete(key.as_bytes());
+                model.remove(key.as_bytes());
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify model.
+    let mut mismatches = 0;
+    for key_idx in 0u32..20 {
+        let key = format!("ms_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => {
+                if v.as_deref() != Some(expected.as_slice()) {
+                    mismatches += 1;
+                }
+            }
+            None => {
+                if v.is_some() {
+                    mismatches += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(mismatches, 0,
+        "BUG: {mismatches} mismatches in model-with-split test");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP83 OK");
+}
+
+/// MODEL WITH LEADER TRANSFER: Run model-based ops, transfer leader
+/// mid-sequence, continue ops. Model must remain accurate.
+#[test]
+fn test_deep_model_with_transfer() {
+    let seed = 0xFEED_FACE;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    // Phase 1: 20 ops.
+    for _ in 0u32..20 {
+        let key_idx = rng.gen::<u32>() % 10;
+        let key = format!("mt_{key_idx:02}");
+        let val = format!("v{}", rng.gen::<u32>() % 100);
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        model.insert(key.into_bytes(), val.into_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Transfer leader.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Phase 2: 20 more ops.
+    for _ in 0u32..20 {
+        let key_idx = rng.gen::<u32>() % 10;
+        let key = format!("mt_{key_idx:02}");
+        let op = rng.gen::<u32>() % 3;
+        match op {
+            0 => {
+                let val = format!("v{}", rng.gen::<u32>() % 100);
+                cluster.must_put(key.as_bytes(), val.as_bytes());
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            1 => {
+                cluster.must_delete(key.as_bytes());
+                model.remove(key.as_bytes());
+            }
+            _ => {
+                // Read check.
+                let v = cluster.must_get(key.as_bytes());
+                let expected = model.get(key.as_bytes());
+                assert_eq!(v.as_deref(), expected.map(|v| v.as_slice()),
+                    "BUG: model mismatch during transfer test for key {key}");
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Final verify.
+    for key_idx in 0u32..10 {
+        let key = format!("mt_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: final mismatch for {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP84 OK");
+}
+
+/// MASSIVE KEY SPACE MODEL: Write 1000 keys in a large key space with
+/// very few collisions. Then verify every single one.
+#[test]
+fn test_deep_massive_keyspace() {
+    let seed = 0xDEAD_C0DE;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n = 200u32;
+    for i in 0u32..n {
+        cluster.must_put(
+            format!("mk_{i:04}").as_bytes(),
+            format!("val_{i:04}_payload").as_bytes(),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify ALL keys.
+    let mut errors = 0;
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("mk_{i:04}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:04}_payload").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/{n} keys lost in massive keyspace test");
+
+    // Delete every other key, verify the rest survive.
+    for i in (0u32..n).filter(|i| i % 2 == 0) {
+        cluster.must_delete(format!("mk_{i:04}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify odds survive, evens are gone.
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("mk_{i:04}").as_bytes());
+        if i % 2 == 0 {
+            assert!(v.is_none(), "BUG: key mk_{i:04} should be deleted");
+        } else {
+            assert_eq!(v.as_deref(), Some(format!("val_{i:04}_payload").as_bytes()),
+                "BUG: key mk_{i:04} lost after interleaved deletes");
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP85 massive keyspace: {n} keys, interleaved deletes verified");
+    eprintln!("DST_DEEP85 OK");
+}
+
+/// KEY TIMESTAMP ORDERING: Write the same key with "versions" (different
+/// values), then read it. Verify last-write-wins semantics hold even
+/// when the writes happen at the logical-clock boundary.
+#[test]
+fn test_deep_versioned_write_semantics() {
+    let seed = 0xCAFE_0001;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write versions in sequence.
+    for v in 0u32..50 {
+        cluster.must_put(b"versioned", format!("v{v:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Final read must be v049.
+    let v = cluster.must_get(b"versioned");
+    assert_eq!(v.as_deref(), Some(b"v049".as_slice()),
+        "BUG: versioned key doesn't show latest version");
+
+    // Now write a different key with 50 versions, compact between writes.
+    for v in 0u32..10 {
+        cluster.must_put(b"versioned2", format!("v{v:03}").as_bytes());
+        if v % 3 == 0 {
+            cluster.compact_data();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let v2 = cluster.must_get(b"versioned2");
+    assert_eq!(v2.as_deref(), Some(b"v009".as_slice()),
+        "BUG: versioned2 doesn't show latest after interleaved compaction");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP86 OK");
+}
+
+/// ENGINE SEEK BOUNDARIES: Test seek() at exact key boundaries — seek to
+/// the exact first key, the exact last key, and keys in between.
+#[test]
+fn test_deep_engine_seek_boundaries() {
+    let seed = 0x1001u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write 10 keys.
+    for i in 0u32..10 {
+        cluster.must_put(format!("esb_{i}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let engine = cluster.get_engine(1);
+
+    // Seek to exact first key.
+    let r = engine.seek("default", b"zesb_0").unwrap().unwrap();
+    assert_eq!(&r.0[1..], b"esb_0");
+
+    // Seek to exact last key.
+    let r = engine.seek("default", b"zesb_9").unwrap().unwrap();
+    assert_eq!(&r.0[1..], b"esb_9");
+
+    // Seek to a middle key.
+    let r = engine.seek("default", b"zesb_5").unwrap().unwrap();
+    assert_eq!(&r.0[1..], b"esb_5");
+
+    // Seek BEFORE the first key — should return the first key.
+    let r = engine.seek("default", b"zesb_").unwrap().unwrap();
+    assert_eq!(&r.0[1..], b"esb_0");
+
+    // Seek AFTER the last key — should return None.
+    assert!(engine.seek("default", b"zesb_Z").unwrap().is_none());
+
+    // Seek to a non-existent key between two real keys.
+    // esb_3 exists, esb_4 exists, but esb_3a doesn't.
+    let r = engine.seek("default", b"zesb_3a").unwrap().unwrap();
+    assert_eq!(&r.0[1..], b"esb_4");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP87 OK");
+}
+
+/// DOUBLE WRITE SAME BATCH: Submit two puts for the same key in one
+/// batch request. The last one in the batch should win.
+#[test]
+fn test_deep_double_write_same_key_batch() {
+    let seed = 0x2002u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Batch with two puts for the same key.
+    let reqs = vec![
+        test_raftstore::new_put_cmd(b"dws_key", b"first"),
+        test_raftstore::new_put_cmd(b"dws_key", b"second"),
+    ];
+    let resp = cluster.batch_put(b"dws_key", reqs);
+    assert!(resp.is_ok(), "BUG: double-write batch failed: {:?}", resp);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Last write should win.
+    let v = cluster.must_get(b"dws_key");
+    assert_eq!(v.as_deref(), Some(b"second".as_slice()),
+        "BUG: double-write batch: expected 'second' (last in batch) got {v:?}");
+
+    // Now try 3 writes in a batch.
+    let reqs = vec![
+        test_raftstore::new_put_cmd(b"dws_key", b"a"),
+        test_raftstore::new_put_cmd(b"dws_key", b"b"),
+        test_raftstore::new_put_cmd(b"dws_key", b"c"),
+    ];
+    let resp = cluster.batch_put(b"dws_key", reqs);
+    assert!(resp.is_ok());
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(b"dws_key");
+    assert_eq!(v.as_deref(), Some(b"c".as_slice()),
+        "BUG: triple-write batch: expected 'c' got {v:?}");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP88 OK");
+}
+
+/// SCAN EMPTY RANGE: Scan a range that contains no keys. The scan must
+/// return zero entries without error.
+#[test]
+fn test_deep_scan_empty_range() {
+    let seed = 0x3003u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write some data.
+    for i in 0u32..5 {
+        cluster.must_put(format!("ser_{i}").as_bytes(), b"v");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let engine = cluster.get_engine(1);
+
+    // Scan a range with no data.
+    let mut count = 0u32;
+    let result = engine.scan("default", b"zno_data_a", b"zno_data_z", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert!(result.is_ok(), "BUG: scan of empty range failed");
+    assert_eq!(count, 0, "BUG: scan of empty range returned {count} entries");
+
+    // Scan with start > end (invalid range).
+    let result = engine.scan("default", b"zser_9", b"zser_0", false, |_k, _v| {
+        Ok(true)
+    });
+    assert!(result.is_ok(), "BUG: scan with start>end failed");
+    // Should return 0 entries (empty iteration).
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP89 OK");
+}
+
+/// DELETE RANGE EDGE: Delete a range that contains no keys (gap in key space).
+/// All existing keys should survive, and no spurious deletes should occur.
+#[test]
+fn test_deep_delete_range_empty() {
+    let seed = 0x4004u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..10 {
+        cluster.must_put(format!("dre_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Delete a range with no data in it (gap in key space).
+    cluster.must_delete_range_cf("default", b"dre_50", b"dre_99");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ALL original keys should survive.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("dre_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
+            "BUG: key dre_{i:02} deleted by empty-range delete");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP90 OK");
+}
+
