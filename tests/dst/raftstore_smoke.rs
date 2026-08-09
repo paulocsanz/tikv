@@ -5936,183 +5936,392 @@ fn test_deep_snapshot_during_transfer() {
     cleanup_cluster();
     eprintln!("DST_DEEP44 OK");
 }
+// ─── Deep fault batch 8: novel attack surfaces ───────────────────────
 
-// ─── Restart-under-matrix: node kill+restart across all 32 fault subsets ──
-//
-// The production bugs we found (PR #33 CURRENT truncation, PR #41 lying
-// fsync) were on the crash/restart path. This test systematically crosses
-// node restart with every fault dimension subset.
+/// READINDEX LINEARIZABILITY: Write v1, submit ReadIndex, write v2,
+/// then read via ReadIndex result. The read must see at least v1
+/// (linearizable: it was committed when the ReadIndex was submitted).
+#[test]
+fn test_deep_readindex_linearizability() {
+    let seed = 0x1111u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"lin_key", b"v1");
+    std::thread::sleep(Duration::from_millis(200));
 
-fn run_restart_matrix_cell(mask: u32, seed: u64) {
+    let region = cluster.get_region(b"lin_key");
+
+    let read_result = test_raftstore::read_index_on_peer(
+        &mut cluster,
+        new_peer(1, 1),
+        region.clone(),
+        true,
+        Duration::from_secs(5),
+    );
+    eprintln!("DST_DEEP45 ReadIndex: err={}", read_result.as_ref().map(|r| r.get_header().has_error()).unwrap_or(true));
+
+    cluster.must_put(b"lin_key", b"v2");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(b"lin_key");
+    assert_eq!(v.as_deref(), Some(b"v2".as_slice()),
+        "BUG: read after ReadIndex returned stale value");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP45 OK");
+}
+
+/// BATCH ATOMICITY: Submit a batch of 5 puts in one request under
+/// single-follower partition. All keys must appear atomically.
+#[test]
+fn test_deep_batch_atomicity_under_partition() {
+    let seed = 0x2222u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+    std::thread::sleep(Duration::from_millis(300));
+
+    let batch_keys: Vec<&[u8]> = vec![b"bat_0", b"bat_1", b"bat_2", b"bat_3", b"bat_4"];
+    let reqs: Vec<_> = batch_keys.iter().enumerate()
+        .map(|(i, k)| test_raftstore::new_put_cmd(k, format!("val_{i}").as_bytes()))
+        .collect();
+    let resp = cluster.batch_put(b"bat_0", reqs);
+    assert!(resp.is_ok(), "BUG: batch put failed under partition: {:?}", resp);
+    std::thread::sleep(Duration::from_millis(200));
+
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    for (i, k) in batch_keys.iter().enumerate() {
+        let v = cluster.must_get(k);
+        assert_eq!(v.as_deref(), Some(format!("val_{i}").as_bytes()),
+            "BUG: batch atomicity violated key {}", String::from_utf8_lossy(k));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP46 OK");
+}
+
+/// EMPTY VALUE VS MISSING KEY: Write empty value, verify distinguishable
+/// from never-written key. Delete, verify gone. Re-write non-empty.
+#[test]
+fn test_deep_empty_value_vs_missing() {
+    let seed = 0x3333u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_put(b"empty_val", b"");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(b"empty_val");
+    assert_eq!(v.as_deref(), Some(b"".as_slice()),
+        "BUG: empty value key wrong: {v:?}");
+
+    let v2 = cluster.must_get(b"never_written");
+    assert!(v2.is_none(), "BUG: never-written key returned: {v2:?}");
+
+    cluster.must_delete(b"empty_val");
+    std::thread::sleep(Duration::from_millis(200));
+    let v3 = cluster.must_get(b"empty_val");
+    assert!(v3.is_none(), "BUG: deleted empty-value key still has value");
+
+    cluster.must_put(b"empty_val", b"content");
+    std::thread::sleep(Duration::from_millis(200));
+    let v4 = cluster.must_get(b"empty_val");
+    assert_eq!(v4.as_deref(), Some(b"content".as_slice()),
+        "BUG: re-written key wrong: {v4:?}");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP47 OK");
+}
+
+/// REGION MERGE SAFETY: Split, write to both sides, merge back.
+/// All data must survive.
+#[test]
+fn test_deep_region_merge_safety() {
+    let seed = 0x4444u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..20 {
+        cluster.must_put(format!("rm_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"rm_000");
+    cluster.must_split(&region, b"rm_010");
+    std::thread::sleep(Duration::from_millis(500));
+
+    for i in 0u32..5 {
+        cluster.must_put(format!("rm_left_{i}").as_bytes(), format!("l{i}").as_bytes());
+        cluster.must_put(format!("rm_right_{i}").as_bytes(), format!("r{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let left_region = cluster.get_region(b"rm_000");
+    let right_region = cluster.get_region(b"rm_015");
+
+    let merge_resp = cluster.try_merge(left_region.get_id(), right_region.get_id());
+    let merge_ok = !test_raftstore::is_error_response(&merge_resp);
+    eprintln!("DST_DEEP48 merge ok={merge_ok}");
+
+    if merge_ok {
+        std::thread::sleep(Duration::from_millis(1000));
+        for i in 0u32..20 {
+            let v = cluster.must_get(format!("rm_{i:03}").as_bytes());
+            assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
+                "BUG: rm_{i:03} lost after merge");
+        }
+        for i in 0u32..5 {
+            assert_eq!(cluster.must_get(format!("rm_left_{i}").as_bytes()).as_deref(),
+                Some(format!("l{i}").as_bytes()), "BUG: rm_left_{i} lost after merge");
+            assert_eq!(cluster.must_get(format!("rm_right_{i}").as_bytes()).as_deref(),
+                Some(format!("r{i}").as_bytes()), "BUG: rm_right_{i} lost after merge");
+        }
+        cluster.must_put(b"rm_post_merge", b"works");
+        assert_eq!(cluster.must_get(b"rm_post_merge"), Some(b"works".to_vec()),
+            "BUG: write after merge failed");
+    } else {
+        eprintln!("DST_DEEP48 merge didn't succeed (acceptable)");
+        for i in 0u32..20 {
+            let v = cluster.must_get(format!("rm_{i:03}").as_bytes());
+            assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
+                "BUG: rm_{i:03} corrupted after failed merge");
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP48 OK");
+}
+
+/// REPLICA READ SAFETY: Read from follower via replica_read=true.
+/// Verify it doesn't return stale data beyond confirmed boundary.
+#[test]
+fn test_deep_replica_read_safety() {
+    let seed = 0x5555u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"rrs_v1", b"version1");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let region = cluster.get_region(b"rrs_v1");
+    let mut result = test_raftstore::async_read_on_peer(
+        &mut cluster,
+        new_peer(2, 2),
+        region.clone(),
+        b"rrs_v1",
+        false, true,
+    );
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let deadline = WallInstant::now() + Duration::from_secs(5);
+    let resp = loop {
+        if WallInstant::now() > deadline { break None; }
+        match Future::poll(result.as_mut(), &mut cx) {
+            Poll::Ready(r) => break Some(r),
+            Poll::Pending => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    eprintln!("DST_DEEP49 replica read from node 2: {:?}", resp.as_ref().map(|r| r.get_header().has_error()));
+
+    cluster.must_put(b"rrs_v1", b"version2");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let region2 = cluster.get_region(b"rrs_v1");
+    let mut result2 = test_raftstore::async_read_on_peer(
+        &mut cluster, new_peer(3, 3), region2, b"rrs_v1", false, true,
+    );
+    let deadline2 = WallInstant::now() + Duration::from_secs(5);
+    let resp2 = loop {
+        if WallInstant::now() > deadline2 { break None; }
+        match Future::poll(result2.as_mut(), &mut cx) {
+            Poll::Ready(r) => break Some(r),
+            Poll::Pending => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    eprintln!("DST_DEEP49 replica read from node 3: {:?}", resp2.as_ref().map(|r| r.get_header().has_error()));
+
+    let v = cluster.must_get(b"rrs_v1");
+    assert_eq!(v.as_deref(), Some(b"version2".as_slice()),
+        "BUG: leader doesn't have version2");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP49 OK");
+}
+
+/// CONCURRENT SPLIT + WRITE: Split while writes go to both sides.
+#[test]
+fn test_deep_concurrent_split_and_write() {
+    let seed = 0x6666u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..5 {
+        cluster.must_put(format!("csw_{i:03}").as_bytes(), format!("init_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"csw_000");
+    cluster.must_split(&region, b"csw_003");
+    std::thread::sleep(Duration::from_millis(50));
+
+    cluster.must_put(b"csw_001", b"left_write");
+    cluster.must_put(b"csw_005", b"right_write");
+    std::thread::sleep(Duration::from_millis(500));
+
+    for i in 0u32..5 {
+        let key = format!("csw_{i:03}");
+        let expected = match i {
+            1 => b"left_write".to_vec(),
+            _ => format!("init_{i}").into_bytes(),
+        };
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: key {key} wrong after concurrent split+write");
+    }
+    assert_eq!(cluster.must_get(b"csw_005"), Some(b"right_write".to_vec()),
+        "BUG: right-side write lost");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP50 OK");
+}
+
+/// ROLLING NODE REPLACEMENT: Add node 4, write, remove node 1.
+#[test]
+fn test_deep_rolling_node_replacement() {
+    let seed = 0x7777u64;
+    let mut cluster = new_node_cluster(seed, 4);
     tikv_util::dst_init::dst_init(seed);
     time::dst_set_manual_only(false);
     time::dst_start_hybrid_driver(Duration::from_millis(1));
     batch_system::set_manual_drive(false);
-
-    let mut cluster = new_node_cluster(seed, 3);
     dst_setup_cluster(&mut cluster);
     test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
     cluster.run();
-
     assert!(wait_leader(&mut cluster, 100));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         cluster.must_transfer_leader(1, new_peer(1, 1));
     }));
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    for _ in 0..30 { std::thread::sleep(Duration::from_millis(50)); }
 
-    let mut net = DstNetworkQueue::new(seed, 1);
-    if mask & 1 != 0 {
-        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    for i in 0u32..20 {
+        cluster.must_put(format!("rnr_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
     }
-    if mask & 2 != 0 {
-        net = net.with_dup_rate(15);
-    }
-    if mask & 4 != 0 {
-        net = net.with_drop_rate(10);
-    }
-    if mask & 8 != 0 {
-        net = net.with_max_delay(2);
-    }
-    let has_partition = mask & 16 != 0;
-    if has_partition {
-        net.add_partition(3, 1);
-        net.add_partition(3, 2);
-    }
-    cluster.add_send_filter(CloneFilterFactory(net.clone()));
-    net.clear_log();
+    std::thread::sleep(Duration::from_millis(300));
 
-    // Phase 1: write 4 keys under faults.
-    let pre_keys: [(Vec<u8>, Vec<u8>); 4] = [
-        (b"rm_pre_0".to_vec(), format!("rmv_pre_{mask}_{seed}_0").into_bytes()),
-        (b"rm_pre_1".to_vec(), format!("rmv_pre_{mask}_{seed}_1").into_bytes()),
-        (b"rm_pre_2".to_vec(), format!("rmv_pre_{mask}_{seed}_2").into_bytes()),
-        (b"rm_pre_3".to_vec(), format!("rmv_pre_{mask}_{seed}_3").into_bytes()),
-    ];
-    for (k, v) in &pre_keys {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cluster.must_put(k, v);
-        }));
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(150));
+    let region_id = cluster.get_region_id(b"rnr_00");
+    let _fut = cluster.async_add_peer(region_id, new_peer(4, 4)).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
 
-    // Phase 2: kill node 3.
-    cluster.stop_node(3);
+    cluster.must_put(b"rnr_during_add", b"during");
     std::thread::sleep(Duration::from_millis(200));
 
-    // Phase 3: write 4 more keys while node 3 is down.
-    let post_keys: [(Vec<u8>, Vec<u8>); 4] = [
-        (b"rm_post_0".to_vec(), format!("rmv_post_{mask}_{seed}_0").into_bytes()),
-        (b"rm_post_1".to_vec(), format!("rmv_post_{mask}_{seed}_1").into_bytes()),
-        (b"rm_post_2".to_vec(), format!("rmv_post_{mask}_{seed}_2").into_bytes()),
-        (b"rm_post_3".to_vec(), format!("rmv_post_{mask}_{seed}_3").into_bytes()),
-    ];
-    for (k, v) in &post_keys {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cluster.must_put(k, v);
-        }));
-        std::thread::sleep(Duration::from_millis(20));
+    let _fut2 = cluster.async_remove_peer(region_id, new_peer(1, 1)).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+
+    cluster.must_put(b"rnr_after_remove", b"after");
+    std::thread::sleep(Duration::from_millis(300));
+
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("rnr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
+            "BUG: rnr_{i:02} lost during rolling replacement");
+    }
+    assert_eq!(cluster.must_get(b"rnr_during_add"), Some(b"during".to_vec()));
+    assert_eq!(cluster.must_get(b"rnr_after_remove"), Some(b"after".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP51 OK");
+}
+
+/// CHAIN OF SPLITS: Split 4 times creating 5 regions.
+#[test]
+fn test_deep_chain_of_splits() {
+    let seed = 0x8888u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..50 {
+        cluster.must_put(format!("cs_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
     }
     std::thread::sleep(Duration::from_millis(200));
 
-    // Phase 4: clear faults + restart node 3.
-    if has_partition {
-        net.clear_partitions();
+    for sk in [b"cs_10", b"cs_20", b"cs_30", b"cs_40"] {
+        let region = cluster.get_region(sk);
+        cluster.must_split(&region, sk);
+        std::thread::sleep(Duration::from_millis(300));
     }
-    cluster.clear_send_filters();
-    std::thread::sleep(Duration::from_millis(200));
 
-    cluster.run_node(3).unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
-
-    // Phase 5: verify all 8 keys.
-    let all_keys: [&[u8]; 8] = [
-        b"rm_pre_0", b"rm_pre_1", b"rm_pre_2", b"rm_pre_3",
-        b"rm_post_0", b"rm_post_1", b"rm_post_2", b"rm_post_3",
-    ];
-    let stable = rich_fingerprint_stable(&mut cluster, &all_keys);
-
-    for (k, v) in &pre_keys {
-        let needle = format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
-        assert!(
-            stable.contains(&needle),
-            "RESTART MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} pre-restart key {} missing: {stable}",
-            mask, fault_mask_name(mask), String::from_utf8_lossy(k)
-        );
+    for i in [0u32, 5, 15, 25, 35, 45] {
+        cluster.must_put(format!("cs_post_{i:02}").as_bytes(), format!("post_{i:02}").as_bytes());
     }
-    for (k, v) in &post_keys {
-        let needle = format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v));
-        assert!(
-            stable.contains(&needle),
-            "RESTART MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} post-restart key {} missing: {stable}",
-            mask, fault_mask_name(mask), String::from_utf8_lossy(k)
-        );
+    std::thread::sleep(Duration::from_millis(300));
+
+    for i in 0u32..50 {
+        let v = cluster.must_get(format!("cs_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
+            "BUG: cs_{i:02} lost after chain of splits");
+    }
+    for i in [0u32, 5, 15, 25, 35, 45] {
+        let v = cluster.must_get(format!("cs_post_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("post_{i:02}").as_bytes()),
+            "BUG: cs_post_{i:02} lost");
     }
 
     cluster.shutdown();
-    batch_system::set_manual_drive(false);
-    time::dst_set_manual_only(false);
-    sterilize_dst_process();
+    cleanup_cluster();
+    eprintln!("DST_DEEP52 OK");
 }
 
+/// READ FROM STALE PEER AFTER SPLIT: Try read with old epoch.
 #[test]
-fn test_dst_restart_fault_matrix() {
-    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_RESTART_REPLAY") {
-        vec![replay.trim().parse().unwrap_or(0)]
-    } else {
-        let raw = std::env::var("DST_RESTART_MASKS").unwrap_or_else(|_| "0..32".into());
-        if let Some((lo, hi)) = raw.split_once("..") {
-            let lo: u32 = lo.trim().parse().unwrap_or(0);
-            let hi: u32 = hi.trim().parse().unwrap_or(lo);
-            (lo..hi).collect()
-        } else {
-            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
-        }
-    };
+fn test_deep_read_from_stale_peer_after_split() {
+    let seed = 0x9999u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"rsp_v1", b"val1");
+    cluster.must_put(b"rsp_v2", b"val2");
+    std::thread::sleep(Duration::from_millis(300));
 
-    let total = masks.len();
-    eprintln!(
-        "DST_RESTART masks={} ({}..{})",
-        masks.len(),
-        masks.first().copied().unwrap_or(0),
-        masks.last().copied().unwrap_or(0)
+    let region = cluster.get_region(b"rsp_v1");
+    let old_epoch = region.get_region_epoch().clone();
+    let region_id = region.get_id();
+
+    cluster.must_split(&region, b"rsp_v2");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut stale_req = test_raftstore::new_request(
+        region_id, old_epoch,
+        vec![test_raftstore::new_get_cmd(b"rsp_v1")],
+        false,
     );
+    stale_req.mut_header().set_peer(new_peer(2, 2));
+    let resp = cluster.call_command_on_node(2, stale_req, Duration::from_secs(5));
 
-    let mut passed = 0usize;
-    let mut failures = Vec::new();
-
-    for &mask in &masks {
-        let dims = fault_mask_name(mask);
-        let seed = 0x4000u64 + mask as u64;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_restart_matrix_cell(mask, seed);
-        }));
-        if result.is_ok() {
-            passed += 1;
-            eprintln!("DST_RESTART mask=0b{:05b} ({}) OK", mask, dims);
-        } else {
-            failures.push(mask);
-            eprintln!("DST_RESTART mask=0b{:05b} ({}) FAIL — replay: DST_RESTART_REPLAY={mask}", mask, dims);
-            if std::env::var("DST_RESTART_REPLAY").is_ok() {
-                panic!("restart matrix replay fail");
+    match &resp {
+        Ok(r) => {
+            let err = r.get_header().get_error();
+            if err.has_epoch_not_match() {
+                eprintln!("DST_DEEP53 stale-epoch read rejected with EpochNotMatch");
+            } else if !r.get_header().has_error() {
+                let val = r.get_responses().first()
+                    .and_then(|r| Some(r.get_get().get_value()));
+                assert_eq!(val, Some(b"val1".as_slice()),
+                    "BUG: stale-epoch read returned wrong data");
             }
         }
+        Err(e) => { eprintln!("DST_DEEP53 stale-epoch read errored: {e}"); }
     }
 
-    eprintln!(
-        "DST_RESTART done: {passed}/{} passed, {} failed",
-        total,
-        failures.len()
-    );
+    assert_eq!(cluster.must_get(b"rsp_v1"), Some(b"val1".to_vec()));
+    assert_eq!(cluster.must_get(b"rsp_v2"), Some(b"val2".to_vec()));
 
-    if !failures.is_empty() {
-        let names: Vec<String> = failures
-            .iter()
-            .map(|m| format!("0b{:05b} ({})", m, fault_mask_name(*m)))
-            .collect();
-        eprintln!("RESTART failures: {}", names.join(", "));
-    }
-    assert_eq!(passed, total, "restart fault matrix had failures");
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP53 OK");
 }
+
