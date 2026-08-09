@@ -10974,4 +10974,384 @@ fn test_deep_delete_range_survives_restart() {
     eprintln!("DST_DEEP140 OK");
 }
 
+// ─── Batch 18: exotic data patterns + size extremes ──────────────────────
+
+/// SINGLE BYTE VALUE: Write a key with a 1-byte value.
+#[test]
+fn test_deep_single_byte_value() {
+    let seed = 0x18u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    cluster.must_put(b"sbv_key", b"X");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(b"sbv_key");
+    assert_eq!(v.as_deref(), Some(b"X".as_ref()), "BUG: single byte value mismatch");
+    assert_eq!(v.as_ref().unwrap().len(), 1, "BUG: value should be 1 byte");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP141 OK");
+}
+
+/// MULTI-BYTE UTF-8 KEYS: Keys with multi-byte UTF-8 characters.
+/// These should be treated as raw bytes, not decoded as strings.
+#[test]
+fn test_deep_utf8_multibyte_keys() {
+    let seed = 0x28u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let keys: [&[u8]; 5] = [
+        "café".as_bytes(),       // é = 2 bytes
+        "日本語".as_bytes(),      // 3 chars, 9 bytes
+        "🔑".as_bytes(),          // 4-byte emoji
+        "über".as_bytes(),        // ü = 2 bytes
+        "normal".as_bytes(),     // ASCII for comparison
+    ];
+
+    for (i, k) in keys.iter().enumerate() {
+        cluster.must_put(k, format!("u8_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for (i, k) in keys.iter().enumerate() {
+        let v = cluster.must_get(k);
+        assert_eq!(v.as_deref(), Some(format!("u8_{i}").as_bytes()),
+            "BUG: UTF-8 multi-byte key mismatch");
+    }
+
+    // Delete and verify removal.
+    cluster.must_delete("café".as_bytes());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(cluster.must_get("café".as_bytes()).is_none(), "BUG: UTF-8 key survived delete");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP142 OK");
+}
+
+/// DELETE ENTIRE REGION KEYSPACE: Write keys spanning the full range,
+/// then delete them all via a single delete range, verify empty.
+#[test]
+fn test_deep_delete_entire_keyspace() {
+    let seed = 0x38u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..20 {
+        cluster.must_put(format!("dek_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete the entire range of our keys.
+    cluster.must_delete_range_cf("default", b"dek_00", b"dek_99");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify all gone.
+    for i in 0u32..20 {
+        assert!(cluster.must_get(format!("dek_{i:02}").as_bytes()).is_none(),
+            "BUG: key dek_{i:02} survived full-keyspace delete range");
+    }
+
+    // Verify engine scan returns 0 entries.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zdek_00", b"zdek_99", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 0, "BUG: engine scan found {count} entries after full-keyspace delete");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP143 OK");
+}
+
+/// REPEATED OVERWRITE (1000x): Write the same key 1000 times with
+/// incrementing values, no compaction. Verify the final value is correct.
+#[test]
+fn test_deep_thousand_overwrites_no_compact() {
+    let seed = 0x48u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let n = 1000u32;
+    for i in 0u32..n {
+        cluster.must_put(b"ton_key", format!("v{i:04}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Final value should be the last write.
+    let last_idx = n - 1;
+    let last_val = format!("v{last_idx:04}");
+    let v = cluster.must_get(b"ton_key");
+    assert_eq!(v.as_deref(), Some(last_val.as_bytes()),
+        "BUG: 1000th overwrite didn't take effect");
+
+    // Delete and verify.
+    cluster.must_delete(b"ton_key");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(cluster.must_get(b"ton_key").is_none(),
+        "BUG: key survived delete after 1000 overwrites");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP144 OK");
+}
+
+/// MANY WRITE-DELETE CYCLES: Alternating put/delete on the same key,
+/// many times. After an odd number of operations, the key should be deleted.
+#[test]
+fn test_deep_many_write_delete_cycles() {
+    let seed = 0x58u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let n = 50u32;
+    for i in 0u32..n {
+        cluster.must_put(b"wdc_key", format!("v{i}").as_bytes());
+        cluster.must_delete(b"wdc_key");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // After 50 put+delete cycles, key should be deleted.
+    assert!(cluster.must_get(b"wdc_key").is_none(),
+        "BUG: key should be deleted after 50 write-delete cycles");
+
+    // One more put — should succeed.
+    cluster.must_put(b"wdc_key", b"final");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(cluster.must_get(b"wdc_key"), Some(b"final".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP145 OK");
+}
+
+/// ALTERNATING PUT/DELETE PATTERN: Put keyA, delete keyB, put keyC, etc.
+/// Verify that deletes don't affect other keys.
+#[test]
+fn test_deep_alternating_pattern() {
+    let seed = 0x68u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write 20 keys.
+    for i in 0u32..20 {
+        cluster.must_put(format!("alt_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete every other key.
+    for i in (0u32..20).filter(|i| i % 2 == 0) {
+        cluster.must_delete(format!("alt_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write new keys in the gaps.
+    for i in (0u32..20).filter(|i| i % 2 == 0) {
+        cluster.must_put(format!("alt_{i:02}").as_bytes(), format!("new_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // All 20 keys should exist: evens have "new" values, odds have original.
+    for i in 0u32..20 {
+        let expected = if i % 2 == 0 {
+            format!("new_{i}").into_bytes()
+        } else {
+            format!("v{i}").into_bytes()
+        };
+        let v = cluster.must_get(format!("alt_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: alt_{i:02} wrong after alternating pattern + compact");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP146 OK");
+}
+
+/// SIZE RATIO EXTREMES: 1-byte key + 16KB value, and 16KB key + 1-byte value.
+#[test]
+fn test_deep_size_ratio_extremes() {
+    let seed = 0x78u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Small key, large value.
+    let large_val: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    cluster.must_put(b"s", &large_val);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(b"s");
+    assert_eq!(v.as_deref(), Some(large_val.as_slice()),
+        "BUG: small-key large-value mismatch");
+
+    // Large key, small value.
+    let large_key: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+    cluster.must_put(&large_key, b"L");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let v = cluster.must_get(&large_key);
+    assert_eq!(v.as_deref(), Some(b"L".as_ref()),
+        "BUG: large-key small-value mismatch");
+
+    // Delete both.
+    cluster.must_delete(b"s");
+    cluster.must_delete(&large_key);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(cluster.must_get(b"s").is_none());
+    assert!(cluster.must_get(&large_key).is_none());
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP147 OK");
+}
+
+/// SCAN AFTER MANY DELETES (TOMBSTONE DENSITY): Write 50 keys, delete 40,
+/// then scan and verify only the 10 survivors appear (no tombstone leakage).
+#[test]
+fn test_deep_scan_tombstone_density() {
+    let seed = 0x88u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..50 {
+        cluster.must_put(format!("std_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete 40 of them.
+    for i in 0u32..40 {
+        cluster.must_delete(format!("std_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact to merge tombstones.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan and count.
+    let engine = cluster.get_engine(1);
+    let mut found = Vec::new();
+    let _ = engine.scan("default", b"zstd_00", b"zstd_99", false, |k, v| {
+        found.push((k.to_vec(), v.to_vec()));
+        Ok(true)
+    });
+
+    // Should have exactly 10 entries (keys 40-49).
+    assert_eq!(found.len(), 10,
+        "BUG: scan found {} entries after 40 deletes, expected 10", found.len());
+
+    // Verify the surviving keys.
+    for (k, v) in &found {
+        let user_key = &k[1..]; // strip 'z' prefix
+        let key_str = String::from_utf8_lossy(user_key);
+        let idx: u32 = key_str[4..].parse().unwrap_or(999);
+        assert!(idx >= 40, "BUG: deleted key {key_str} appeared in scan");
+        assert_eq!(v, &format!("v{idx:02}").into_bytes());
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP148 OK");
+}
+
+/// RESTART + SPLIT + WRITE: Write, restart node, split, write to both sides.
+/// Complex lifecycle test.
+#[test]
+fn test_deep_restart_split_write() {
+    let seed = 0x98u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..15 {
+        cluster.must_put(format!("rsw_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Split at rsw_08.
+    let region = cluster.get_region(b"rsw_00");
+    cluster.must_split(&region, b"rsw_08");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write to both sides.
+    cluster.must_put(b"rsw_00", b"post_restart_left");
+    cluster.must_put(b"rsw_14", b"post_restart_right");
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(cluster.must_get(b"rsw_00"), Some(b"post_restart_left".to_vec()));
+    assert_eq!(cluster.must_get(b"rsw_14"), Some(b"post_restart_right".to_vec()));
+
+    // Verify all original keys.
+    for i in 1u32..15 {
+        if i == 14 { continue; }
+        let v = cluster.must_get(format!("rsw_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: rsw_{i:02} wrong after restart+split");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP149 OK");
+}
+
+/// TWO FOLLOWERS RESTART SIMULTANEOUSLY: Stop 2 of 3 nodes, restart both,
+/// verify data integrity. The leader continues serving during the outage.
+#[test]
+fn test_deep_two_followers_restart() {
+    let seed = 0xA8u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..15 {
+        cluster.must_put(format!("tfr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Find leader and stop the other two nodes.
+    let region = cluster.get_region(b"tfr_00");
+    let leader = cluster.leader_of_region(region.get_id()).unwrap();
+    let leader_id = leader.get_store_id();
+
+    let followers: Vec<u64> = (1u64..=3).filter(|&s| s != leader_id).collect();
+    eprintln!("DST_DEEP150: leader={leader_id}, stopping followers {followers:?}");
+
+    cluster.stop_node(followers[0]);
+    cluster.stop_node(followers[1]);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write during outage (leader alone, no quorum — should fail gracefully).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"tfr_during", b"during_outage");
+    }));
+
+    // Restart both followers.
+    let _ = cluster.run_node(followers[0]);
+    let _ = cluster.run_node(followers[1]);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Write after recovery.
+    cluster.must_put(b"tfr_after", b"after_recovery");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify original data survived.
+    for i in 0u32..15 {
+        let v = cluster.must_get(format!("tfr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: tfr_{i:02} lost after two-follower restart");
+    }
+
+    // Post-recovery write should exist.
+    assert_eq!(cluster.must_get(b"tfr_after"), Some(b"after_recovery".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP150 OK");
+}
+
 
