@@ -112,6 +112,22 @@ impl rocksdb::EventListener for RocksEventListener {
             ) && err.starts_with(NO_SPACE_ERROR)
             {
                 // Ignore NoSpace error and let RocksDB automatically recover.
+                // Log the event for observability — previously this was silently
+                // swallowed with zero metric/log coverage, making disk-full
+                // conditions completely invisible to operators.
+                // See DEEP-FINDINGS.md Finding 3.
+                STORE_ENGINE_EVENT_COUNTER_VEC
+                    .with_label_values(&[&self.db_name, "", "no_space_swallowed"])
+                    .inc();
+                warn!(
+                    "rocksdb background error ignored (no space); \
+                     RocksDB will auto-recover when space is available";
+                    "db" => &self.db_name,
+                    "reason" => match reason {
+                        DBBackgroundErrorReason::Flush => "flush",
+                        _ => "compaction",
+                    },
+                );
                 return;
             }
 
