@@ -8585,3 +8585,355 @@ fn test_deep_delete_range_empty() {
     eprintln!("DST_DEEP90 OK");
 }
 
+// ─── Batch 13: encoding extremes, delete-range interactions, compaction ──
+
+/// EMPTY KEY: Write and read the empty key (b""). TiKV should handle it
+/// as a valid key (it's a byte string, not null).
+#[test]
+fn test_deep_empty_key() {
+    let seed = 0xE0u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write the empty key.
+    cluster.must_put(b"", b"empty_key_value");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Read it back.
+    let v = cluster.must_get(b"");
+    assert_eq!(v.as_deref(), Some(b"empty_key_value".as_ref()),
+        "BUG: empty key value mismatch");
+
+    // Delete it.
+    cluster.must_delete(b"");
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(cluster.must_get(b"").is_none(),
+        "BUG: empty key survived delete");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP91 OK");
+}
+
+/// BINARY KEY WITH NULL BYTES: Key contains 0x00 bytes. These are valid
+/// byte strings in TiKV and should not be treated as C-style terminators.
+#[test]
+fn test_deep_binary_null_key() {
+    let seed = 0xB1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let keys: [&[u8]; 5] = [
+        b"\x00",
+        b"\x00\x00",
+        b"key\x00null",
+        b"\x00prefix",
+        b"suffix\x00",
+    ];
+
+    for (i, k) in keys.iter().enumerate() {
+        cluster.must_put(k, format!("bin_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for (i, k) in keys.iter().enumerate() {
+        let v = cluster.must_get(k);
+        assert_eq!(v.as_deref(), Some(format!("bin_{i}").as_bytes().as_ref()),
+            "BUG: binary key with null bytes mismatch");
+    }
+
+    // Verify via engine scan that all keys are present and correctly ordered.
+    let engine = cluster.get_engine(1);
+    let mut found = Vec::new();
+    let _ = engine.scan(
+        "default",
+        b"z\x00", // data_key("") + data_key("\x00") prefix
+        b"z\x7f",
+        false,
+        |k, v| {
+            found.push((k.to_vec(), v.to_vec()));
+            Ok(true)
+        },
+    );
+    assert!(found.len() >= keys.len(),
+        "BUG: engine scan found {} keys, expected >= {}", found.len(), keys.len());
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP92 OK");
+}
+
+/// DATA PREFIX COLLISION: User key starts with 'z' (the data_key prefix b'z').
+/// TiKV prepends b'z' internally, so user key "zfoo" becomes "zzfoo".
+/// This should not cause any collision or misrouting.
+#[test]
+fn test_deep_data_prefix_collision() {
+    let seed = 0xC0u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Keys that start with 'z' — potential collision with data_key prefix.
+    cluster.must_put(b"zkey1", b"v1");
+    cluster.must_put(b"zzkey2", b"v2");
+    cluster.must_put(b"zzzkey3", b"v3");
+    cluster.must_put(b"normal", b"v4");
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(cluster.must_get(b"zkey1"), Some(b"v1".to_vec()), "BUG: z-prefix key1");
+    assert_eq!(cluster.must_get(b"zzkey2"), Some(b"v2".to_vec()), "BUG: z-prefix key2");
+    assert_eq!(cluster.must_get(b"zzzkey3"), Some(b"v3".to_vec()), "BUG: z-prefix key3");
+    assert_eq!(cluster.must_get(b"normal"), Some(b"v4".to_vec()), "BUG: normal key");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP93 OK");
+}
+
+/// LARGE VALUE: Write a single 64KB value and verify it survives intact.
+#[test]
+fn test_deep_large_value() {
+    let seed = 0x1Au64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // 64KB value with a recognizable pattern.
+    let large_val: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+
+    cluster.must_put(b"big_key", &large_val);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let v = cluster.must_get(b"big_key");
+    assert_eq!(v.as_deref(), Some(large_val.as_slice()),
+        "BUG: large value mismatch (len={}, got len={})",
+        large_val.len(), v.as_ref().map(|v| v.len()).unwrap_or(0));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP94 OK");
+}
+
+/// DELETE RANGE + IMMEDIATE REWRITE: Delete a range of keys, then immediately
+/// write new values to those same keys. The delete-range tombstones must not
+/// shadow the new writes.
+#[test]
+fn test_deep_delete_range_then_rewrite() {
+    let seed = 0xD70u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write 10 keys.
+    for i in 0u32..10 {
+        cluster.must_put(format!("drr_{i:02}").as_bytes(), format!("old_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete range covering all 10 keys.
+    cluster.must_delete_range_cf("default", b"drr_00", b"drr_99");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Immediately rewrite with new values.
+    for i in 0u32..10 {
+        cluster.must_put(format!("drr_{i:02}").as_bytes(), format!("new_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify new values survived — tombstones must NOT shadow the rewrites.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("drr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("new_{i}").as_bytes()),
+            "BUG: rewrite after delete-range lost for key drr_{i:02}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP95 OK");
+}
+
+/// COMPACTION DURING ACTIVE WRITES: Write keys continuously while triggering
+/// compaction. Verify all keys survive the compaction.
+#[test]
+fn test_deep_compaction_during_writes() {
+    let seed = 0xCDu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write 20 keys.
+    for i in 0u32..20 {
+        cluster.must_put(format!("cdw_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Trigger compaction.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Phase 2: write 20 more keys DURING compaction aftermath.
+    for i in 20u32..40 {
+        cluster.must_put(format!("cdw_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Trigger another compaction.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify ALL 40 keys survived both compactions.
+    for i in 0u32..40 {
+        let v = cluster.must_get(format!("cdw_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key cdw_{i:02} lost during compaction");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP96 OK");
+}
+
+/// OVERLAPPING DELETE RANGES: Two delete ranges that overlap. Keys in the
+/// overlap should be deleted exactly once (no double-delete issues).
+#[test]
+fn test_deep_overlapping_delete_ranges() {
+    let seed = 0x0Du64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write keys 00-19.
+    for i in 0u32..20 {
+        cluster.must_put(format!("odr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete range 1: odr_00 .. odr_15 (covers 00-14).
+    cluster.must_delete_range_cf("default", b"odr_00", b"odr_15");
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Delete range 2: odr_10 .. odr_20 (covers 10-19, overlaps with range 1 on 10-14).
+    cluster.must_delete_range_cf("default", b"odr_10", b"odr_20");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // All 20 keys should be deleted.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("odr_{i:02}").as_bytes());
+        assert!(v.is_none(),
+            "BUG: key odr_{i:02} survived overlapping delete ranges");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP97 OK");
+}
+
+/// CF ISOLATION: Write to "default" CF and "write" CF with the same key.
+/// Values in different CFs should be completely independent.
+#[test]
+fn test_deep_cf_isolation() {
+    let seed = 0xCFu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write the same key to different CFs.
+    cluster.must_put_cf("default", b"cf_key", b"default_val");
+    cluster.must_put_cf("write", b"cf_key", b"write_val");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // must_get reads from the "default" CF via raft consensus.
+    let v = cluster.must_get(b"cf_key");
+    assert_eq!(v.as_deref(), Some(b"default_val".as_ref()),
+        "BUG: must_get should return default CF value");
+
+    // Verify both CFs via direct engine access.
+    let engine = cluster.get_engine(1);
+    let default_key = keys::data_key(b"cf_key");
+
+    // Check "default" CF.
+    let default_val = engine.get_value(&default_key).unwrap();
+    assert!(default_val.is_some(), "BUG: default CF key not found");
+    assert_eq!(&*default_val.unwrap(), b"default_val",
+        "BUG: default CF value mismatch via engine");
+
+    // Check "write" CF.
+    let write_val = engine.get_value_cf("write", &default_key).unwrap();
+    assert!(write_val.is_some(), "BUG: write CF key not found");
+    assert_eq!(&*write_val.unwrap(), b"write_val",
+        "BUG: write CF value mismatch via engine");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP98 OK");
+}
+
+/// SEEK TO NON-EXISTENT KEY: Place keys at known positions, then seek to
+/// a key that doesn't exist between two existing keys. Verify the iterator
+/// lands on the correct next key.
+#[test]
+fn test_deep_seek_nonexistent_key() {
+    let seed = 0x5Eu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write keys at known positions.
+    let keys: [&[u8]; 4] = [b"sk_aaa", b"sk_bbb", b"sk_ddd", b"sk_eee"];
+    for (i, k) in keys.iter().enumerate() {
+        cluster.must_put(k, format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let engine = cluster.get_engine(1);
+
+    // Seek to "sk_ccc" — doesn't exist, should land on "sk_ddd".
+    let seek_key = keys::data_key(b"sk_ccc");
+    let seek_result = engine.seek("default", &seek_key).unwrap();
+    assert!(seek_result.is_some(),
+        "BUG: seek to nonexistent key returned None (should land on next key)");
+    let (got_key, _got_val) = seek_result.unwrap();
+    let got_user = &got_key[1..]; // strip 'z' prefix
+    assert_eq!(got_user, b"sk_ddd",
+        "BUG: seek to sk_ccc should land on sk_ddd, got {:?}",
+        String::from_utf8_lossy(got_user));
+
+    // Seek to "sk_zzz" — past all keys, should return None.
+    let seek_past = keys::data_key(b"sk_zzz");
+    let seek_past_result = engine.seek("default", &seek_past).unwrap();
+    assert!(seek_past_result.is_none(),
+        "BUG: seek past last key should return None");
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP99 OK");
+}
+
+/// KEY ORDERING: Write keys in a deliberately scrambled order, then scan
+/// and verify they come back in lexicographic (ascending) order.
+#[test]
+fn test_deep_key_ordering_guarantee() {
+    let seed = 0x0Du64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write keys in reverse, shuffled, and mixed-case order.
+    let scrambled = [
+        "zebra", "apple", "mango", "banana", "quince",
+        "apple", // duplicate (overwrites)
+        "Apple", // different case
+        "ZEBRA", // different case
+    ];
+    for k in &scrambled {
+        cluster.must_put(k.as_bytes(), k.as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan and collect all keys.
+    let engine = cluster.get_engine(1);
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    let _ = engine.scan("default", b"z", b"zz", false, |k, _v| {
+        found.push(k[1..].to_vec()); // strip 'z' prefix
+        Ok(true)
+    });
+
+    // Verify keys are in ascending order.
+    for i in 1..found.len() {
+        assert!(found[i - 1] < found[i],
+            "BUG: keys not in ascending order at index {i}: {:?} >= {:?}",
+            String::from_utf8_lossy(&found[i - 1]),
+            String::from_utf8_lossy(&found[i]));
+    }
+
+    // Verify "apple" (lowercase) appears and "Apple" is different.
+    assert!(found.iter().any(|k| k == b"apple"), "BUG: lowercase 'apple' missing");
+    assert!(found.iter().any(|k| k == b"Apple"), "BUG: 'Apple' missing");
+    assert!(found.iter().any(|k| k == b"ZEBRA"), "BUG: 'ZEBRA' missing");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP100 OK");
+}
