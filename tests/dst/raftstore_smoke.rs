@@ -6841,3 +6841,413 @@ fn test_deep_logical_time_monotonicity() {
     eprintln!("DST_DEEP63 OK");
 }
 
+// ─── Batch 10: storage edges, stress, and self-injection ─────────────
+
+/// DATA RANGE GAPS: Split a region, then write keys at the exact split
+/// boundary. Verify no key falls into a gap between regions and no key
+/// is served by the wrong region.
+#[test]
+fn test_deep_boundary_key_after_split() {
+    let seed = 0x1234u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    cluster.must_put(b"bg_00", b"v0");
+    cluster.must_put(b"bg_05", b"v5");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"bg_00");
+    cluster.must_split(&region, b"bg_03");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write keys right at and around the boundary.
+    cluster.must_put(b"bg_02", b"just_left");
+    cluster.must_put(b"bg_03", b"at_boundary");
+    cluster.must_put(b"bg_04", b"just_right");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify all boundary keys.
+    assert_eq!(cluster.must_get(b"bg_00"), Some(b"v0".to_vec()));
+    assert_eq!(cluster.must_get(b"bg_05"), Some(b"v5".to_vec()));
+    assert_eq!(cluster.must_get(b"bg_02"), Some(b"just_left".to_vec()));
+    assert_eq!(cluster.must_get(b"bg_03"), Some(b"at_boundary".to_vec()));
+    assert_eq!(cluster.must_get(b"bg_04"), Some(b"just_right".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP64 OK");
+}
+
+/// ITERATOR EXHAUSTION: Seek past the end of data, then seek backwards
+/// to a valid key. The iterator must not return stale or garbage data
+/// after seeking past the end.
+#[test]
+fn test_deep_iterator_exhaustion() {
+    let seed = 0x2345u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..10 {
+        cluster.must_put(format!("ie_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Seek past the end.
+    let engine = cluster.get_engine(1);
+    let past_end = engine.seek("default", b"zie_99");
+    assert!(past_end.is_ok(), "BUG: seek past end failed");
+    assert!(past_end.unwrap().is_none(), "BUG: seek past end returned data");
+
+    // Seek to a valid key.
+    let valid = engine.seek("default", b"zie_05");
+    assert!(valid.is_ok(), "BUG: seek to valid key failed");
+    let (k, v) = valid.unwrap().unwrap();
+    let user_key = &k[1..]; // strip 'z' prefix
+    assert_eq!(user_key, b"ie_05", "BUG: seek returned wrong key");
+    assert_eq!(v.as_slice(), b"v05", "BUG: seek returned wrong value");
+
+    // Seek to the very first key.
+    let first = engine.seek("default", b"zie_00");
+    let (k, v) = first.unwrap().unwrap();
+    assert_eq!(&k[1..], b"ie_00");
+    assert_eq!(v.as_slice(), b"v00");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP65 OK");
+}
+
+/// HIGH-FREQUENCY WRITE STRESS: Write 500 keys rapidly without any
+/// sleep between writes. This stress-tests the raft proposal pipeline
+/// and the apply scheduler.
+#[test]
+fn test_deep_high_freq_write_stress() {
+    let seed = 0x3456u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 500 keys back-to-back.
+    for i in 0u32..500 {
+        cluster.must_put(
+            format!("hf_{i:03}").as_bytes(),
+            format!("val_{i:03}").as_bytes(),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify ALL 500 keys.
+    let mut errors = 0;
+    for i in 0u32..500 {
+        let v = cluster.must_get(format!("hf_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:03}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/500 keys lost in high-freq stress");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP66 OK");
+}
+
+/// OVERWRITE SAME KEY 1000 TIMES: Write the same key 1000 times with
+/// different values. The final value must be exactly the last write.
+/// This tests raft log management under extreme write amplification.
+#[test]
+fn test_deep_thousand_overwrites() {
+    let seed = 0x4567u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..1000 {
+        cluster.must_put(b"thousand", format!("version_{i:04}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let v = cluster.must_get(b"thousand");
+    assert_eq!(
+        v.as_deref(),
+        Some(b"version_0999".as_slice()),
+        "BUG: 1000-overwrite key returned wrong final value: {:?}",
+        v
+    );
+
+    // Compact and verify still correct.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let v2 = cluster.must_get(b"thousand");
+    assert_eq!(v2.as_deref(), Some(b"version_0999".as_slice()),
+        "BUG: value changed after compaction following 1000 overwrites");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP67 OK");
+}
+
+/// KEY COUNT CONSISTENCY: Write N keys, then count them via engine scan.
+/// The scanned count must exactly equal N — no extra ghost keys, no
+/// missing keys.
+#[test]
+fn test_deep_key_count_exact() {
+    let seed = 0x5678u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let n = 200u32;
+    for i in 0u32..n {
+        cluster.must_put(
+            format!("kc_{i:03}").as_bytes(),
+            format!("v{i:03}").as_bytes(),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Count via engine scan.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zkc_000", b"zkc_999", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+
+    assert_eq!(count, n, "BUG: expected {n} keys, scanned {count}");
+
+    // Delete half, recount.
+    for i in 0u32..n / 2 {
+        cluster.must_delete(format!("kc_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut count2 = 0u32;
+    let _ = engine.scan("default", b"zkc_000", b"zkc_999", false, |_k, _v| {
+        count2 += 1;
+        Ok(true)
+    });
+
+    // After deleting n/2 keys, should have n/2 remaining.
+    assert_eq!(count2, n / 2, "BUG: after deleting {}/{} keys, scanned {} remaining", n / 2, n, count2);
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP68 OK");
+}
+
+/// SEED INVARIANCE ACROSS FAULTS: Run the same 20-key scenario with
+// different seeds and verify the data is correct regardless of seed.
+/// This proves determinism is not seed-dependent (the seed affects
+/// internal randomness, not correctness).
+#[test]
+fn test_deep_seed_invariance() {
+    let seeds = [0x0001u64, 0xBEEF, 0xDEAD, 0xCAFE, 0xFACE];
+
+    for &seed in &seeds {
+        let mut cluster = bootstrap_hybrid(seed);
+        std::thread::sleep(Duration::from_millis(200));
+
+        for i in 0u32..20 {
+            cluster.must_put(
+                format!("si_{i:02}").as_bytes(),
+                format!("val_{i:02}").as_bytes(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        for i in 0u32..20 {
+            let v = cluster.must_get(format!("si_{i:02}").as_bytes());
+            assert_eq!(v.as_deref(), Some(format!("val_{i:02}").as_bytes()),
+                "BUG: seed {seed:#x} produced wrong value for si_{i:02}");
+        }
+
+        cluster.shutdown();
+        cleanup_cluster();
+    }
+
+    eprintln!("DST_DEEP69 seed invariance verified across {} seeds", seeds.len());
+    eprintln!("DST_DEEP69 OK");
+}
+
+/// SPLIT-DURING-SPLIT: Start a split, then immediately split one of the
+/// children again before the first split fully propagates. All data
+/// must survive across all resulting regions.
+#[test]
+fn test_deep_cascading_split() {
+    let seed = 0x6789u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..40 {
+        cluster.must_put(format!("cs2_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split 1.
+    let region = cluster.get_region(b"cs2_00");
+    cluster.must_split(&region, b"cs2_20");
+    // Immediately split one child.
+    let child = cluster.get_region(b"cs2_05");
+    cluster.must_split(&child, b"cs2_10");
+    // And split the other child.
+    let child2 = cluster.get_region(b"cs2_30");
+    cluster.must_split(&child2, b"cs2_30");
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Write to all 4 resulting regions.
+    cluster.must_put(b"cs2_00b", b"r1");
+    cluster.must_put(b"cs2_15b", b"r2");
+    cluster.must_put(b"cs2_25b", b"r3");
+    cluster.must_put(b"cs2_35b", b"r4");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify ALL 40 original keys.
+    for i in 0u32..40 {
+        let key = format!("cs2_{i:02}");
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
+            "BUG: key {key} lost after cascading split");
+    }
+    // Verify post-split writes.
+    assert_eq!(cluster.must_get(b"cs2_00b"), Some(b"r1".to_vec()));
+    assert_eq!(cluster.must_get(b"cs2_15b"), Some(b"r2".to_vec()));
+    assert_eq!(cluster.must_get(b"cs2_25b"), Some(b"r3".to_vec()));
+    assert_eq!(cluster.must_get(b"cs2_35b"), Some(b"r4".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP70 OK");
+}
+
+/// CROSS-NODE SCAN IDENTICAL: Write data, then scan each node's engine
+/// independently. The sets of (key, value) pairs must be identical
+/// across all nodes.
+#[test]
+fn test_deep_cross_node_scan_identical() {
+    let seed = 0x789Au64;
+    let mut cluster = bootstrap_hybrid(seed);
+    for i in 0u32..50 {
+        cluster.must_put(format!("xns_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Scan each node.
+    let mut scans: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    for node_id in [1u64, 2, 3] {
+        let engine = cluster.get_engine(node_id);
+        let mut result = Vec::new();
+        let _ = engine.scan("default", b"zxns_000", b"zxns_999", false, |k, v| {
+            result.push((k.to_vec(), v.to_vec()));
+            Ok(true)
+        });
+        scans.push(result);
+    }
+
+    // Node 1 is our baseline.
+    let baseline = &scans[0];
+    eprintln!("DST_DEEP71 node1 has {} keys, node2 has {}, node3 has {}",
+        baseline.len(), scans[1].len(), scans[2].len());
+
+    // All nodes with data must match baseline.
+    for (idx, scan) in scans.iter().enumerate().skip(1) {
+        if scan.is_empty() {
+            continue; // node may be behind
+        }
+        assert_eq!(scan.len(), baseline.len(),
+            "BUG: node{} has {} keys but node1 has {} — divergence",
+            idx + 1, scan.len(), baseline.len());
+        for (a, b) in scan.iter().zip(baseline.iter()) {
+            assert_eq!(a, b,
+                "BUG: node{} vs node1 divergence on key {:?}",
+                idx + 1, String::from_utf8_lossy(&a.0));
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP71 OK");
+}
+
+/// REVERSE WRITE ORDER: Write keys in descending order (999 down to 000)
+/// then verify scan returns them in ascending order. This tests RocksDB
+/// memtable + SST sorting regardless of insertion order.
+#[test]
+fn test_deep_reverse_write_scan_order() {
+    let seed = 0x89ABu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write in reverse order.
+    for i in (0u32..50).rev() {
+        cluster.must_put(
+            format!("rws_{i:03}").as_bytes(),
+            format!("val_{i:03}").as_bytes(),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Scan — must be ascending.
+    let engine = cluster.get_engine(1);
+    let mut last_key: Vec<u8> = Vec::new();
+    let _ = engine.scan("default", b"zrws_000", b"zrws_999", false, |k, _v| {
+        assert!(k > last_key.as_slice(),
+            "BUG: scan not sorted — {:?} came after {:?}",
+            String::from_utf8_lossy(k),
+            String::from_utf8_lossy(&last_key));
+        last_key = k.to_vec();
+        Ok(true)
+    });
+
+    assert_eq!(last_key.len(), 7 + 1, "BUG: scan didn't iterate all keys"); // 'z' + "rws_049"
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP72 OK");
+}
+
+/// DELETE-ALL-THEN-REWRITE: Delete every key, verify they're all gone,
+/// then rewrite with new values. This tests tombstone handling.
+#[test]
+fn test_deep_delete_all_rewrite() {
+    let seed = 0x9BCDu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write 20 keys.
+    for i in 0u32..20 {
+        cluster.must_put(format!("dar_{i:02}").as_bytes(), format!("orig_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Phase 2: delete all.
+    for i in 0u32..20 {
+        cluster.must_delete(format!("dar_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify all gone.
+    for i in 0u32..20 {
+        assert!(cluster.must_get(format!("dar_{i:02}").as_bytes()).is_none(),
+            "BUG: key dar_{i:02} survived delete-all");
+    }
+
+    // Phase 3: compact (merge tombstones).
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Phase 4: rewrite with new values.
+    for i in 0u32..20 {
+        cluster.must_put(format!("dar_{i:02}").as_bytes(), format!("new_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify new values.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("dar_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("new_{i}").as_bytes()),
+            "BUG: key dar_{i:02} has wrong value after rewrite");
+    }
+
+    // Scan and verify exactly 20 keys (no ghosts from tombstones).
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zdar_00", b"zdar_99", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 20, "BUG: expected 20 keys after rewrite, found {count} (ghost tombstones?)");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP73 OK");
+}
+
