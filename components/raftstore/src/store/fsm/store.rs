@@ -1448,8 +1448,19 @@ impl<EK: KvEngine, ER: RaftEngine, T> RaftPollerBuilder<EK, ER, T> {
         })?;
 
         if !kv_wb.is_empty() {
-            kv_wb.write().unwrap();
-            self.engines.kv.sync_wal().unwrap();
+            // Use sync=true to match the write semantics of clear_meta in
+            // peer_storage.rs.  The original code used write() + sync_wal(),
+            // which only syncs the WAL — not the SST/memtable.  Under
+            // lying-fsync (drop_fsync on kv_db WAL), the stale-meta cleanup
+            // is lost on crash, creating an inconsistent state between
+            // kv_db (stale region metadata survives) and raft_db (cleaned
+            // by the sync=true consume below).  This makes the two-phase
+            // clear as crash-safe as clear_meta itself.
+            //
+            // See DEEP-FINDINGS.md Finding 2.
+            let mut write_opts = WriteOptions::new();
+            write_opts.set_sync(true);
+            kv_wb.write_opt(&write_opts).unwrap();
         }
         if !raft_wb.is_empty() {
             self.engines.raft.consume(&mut raft_wb, true).unwrap();
