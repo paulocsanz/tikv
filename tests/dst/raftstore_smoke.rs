@@ -9974,6 +9974,7 @@ fn test_deep_read_all_nodes_after_split() {
     cleanup_cluster();
     eprintln!("DST_DEEP120 OK");
 }
+}
 
 
 // ─── Compound admin matrix: split + transfer + compact + transfer ────────
@@ -11355,3 +11356,169 @@ fn test_deep_two_followers_restart() {
 }
 
 
+
+// ─── Merge matrix: region merge under all 32 fault subsets ──────────────
+fn run_merge_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let pre_keys: [(&[u8], &[u8]); 4] = [
+        (b"mg_aaa", b"mv_aaa"),
+        (b"mg_eee", b"mv_eee"),
+        (b"mg_zzz", b"mv_zzz"),
+        (b"mg_mid", b"mv_mid"),
+    ];
+    for (k, v) in &pre_keys {
+        cluster.must_put(k, v);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"mg_aaa");
+    cluster.must_split(&region, b"mg_mid");
+    std::thread::sleep(Duration::from_millis(500));
+
+    cluster.must_put(b"mg_bbb", b"mv_bbb");
+    cluster.must_put(b"mg_nnn", b"mv_nnn");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    let left_region = cluster.get_region(b"mg_aaa");
+    let right_region = cluster.get_region(b"mg_nnn");
+    let merge_resp = cluster.try_merge(left_region.get_id(), right_region.get_id());
+    let merge_ok = !test_raftstore::is_error_response(&merge_resp);
+    eprintln!(
+        "DST_MERGE mask=0b{:05b} ({}) seed={seed:#x} merge_ok={merge_ok}",
+        mask,
+        fault_mask_name(mask)
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"mg_post", b"mv_post");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(800));
+
+    let all_keys: [(&[u8], &[u8]); 7] = [
+        (b"mg_aaa", b"mv_aaa"),
+        (b"mg_bbb", b"mv_bbb"),
+        (b"mg_eee", b"mv_eee"),
+        (b"mg_mid", b"mv_mid"),
+        (b"mg_nnn", b"mv_nnn"),
+        (b"mg_post", b"mv_post"),
+        (b"mg_zzz", b"mv_zzz"),
+    ];
+    for (k, expected) in &all_keys {
+        let v = cluster.must_get(k);
+        assert_eq!(
+            v.as_deref(),
+            Some(*expected),
+            "MERGE MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+             key {} = {v:?} expected {expected:?} (merge_ok={merge_ok})",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_merge_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_MERGE_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_MERGE_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_MERGE masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xC000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_merge_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_MERGE mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_MERGE mask=0b{:05b} ({}) FAIL — replay: DST_MERGE_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_MERGE_REPLAY").is_ok() {
+                panic!("merge matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_MERGE done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "merge fault matrix had failures");
+}
