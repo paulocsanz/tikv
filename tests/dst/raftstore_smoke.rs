@@ -9974,7 +9974,6 @@ fn test_deep_read_all_nodes_after_split() {
     cleanup_cluster();
     eprintln!("DST_DEEP120 OK");
 }
-}
 
 
 // ─── Compound admin matrix: split + transfer + compact + transfer ────────
@@ -11521,4 +11520,169 @@ fn test_dst_merge_fault_matrix() {
         failures.len()
     );
     assert_eq!(passed, total, "merge fault matrix had failures");
+}
+
+// ─── Delete-range matrix: range tombstone + write-after-delete under all 32 ─
+fn run_delete_range_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write 10 keys: drl_00 .. drl_09.
+    for i in 0u32..10 {
+        let k = format!("drl_{i:02}");
+        let v = format!("v_{i:02}");
+        cluster.must_put(k.as_bytes(), v.as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Delete range [drl_03, drl_07) — removes drl_03,04,05,06.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_delete_range_cf("default", b"drl_03", b"drl_07");
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write new keys INTO the deleted range (write-after-delete).
+    // These must survive — the range tombstone must not overwrite them.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"drl_04", b"rewrite_04");
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"drl_06", b"rewrite_06");
+    }));
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(600));
+
+    // ORACLE:
+    //   drl_00,01,02 → original value (untouched)
+    //   drl_03       → None (deleted, not rewritten)
+    //   drl_04       → "rewrite_04" (deleted then rewritten)
+    //   drl_05       → None (deleted, not rewritten)
+    //   drl_06       → "rewrite_06" (deleted then rewritten)
+    //   drl_07,08,09 → original value (outside delete range)
+    for i in 0u32..10 {
+        let k = format!("drl_{i:02}");
+        let expected: Option<Vec<u8>> = match i {
+            0..=2 => Some(format!("v_{i:02}").into_bytes()),
+            3 => None,
+            4 => Some(b"rewrite_04".to_vec()),
+            5 => None,
+            6 => Some(b"rewrite_06".to_vec()),
+            7..=9 => Some(format!("v_{i:02}").into_bytes()),
+            _ => unreachable!(),
+        };
+        let got = cluster.must_get(k.as_bytes());
+        assert_eq!(
+            got,
+            expected,
+            "DELETE-RANGE MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+             key {} = {got:?} expected {expected:?}",
+            mask,
+            fault_mask_name(mask),
+            k
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_delete_range_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_DELRANGE_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_DELRANGE_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_DELRANGE masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xD000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_delete_range_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_DELRANGE mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_DELRANGE mask=0b{:05b} ({}) FAIL — replay: DST_DELRANGE_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_DELRANGE_REPLAY").is_ok() {
+                panic!("delete-range matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_DELRANGE done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "delete-range fault matrix had failures");
 }
