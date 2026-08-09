@@ -9974,6 +9974,7 @@ fn test_deep_read_all_nodes_after_split() {
     cleanup_cluster();
     eprintln!("DST_DEEP120 OK");
 }
+}
 
 
 // ─── Compound admin matrix: split + transfer + compact + transfer ────────
@@ -12797,3 +12798,211 @@ fn test_deep_flush_delete_flush() {
 }
 
 
+// ─── Cross-node convergence scan matrix ─────────────────────────────────
+// After healing, scan ALL nodes' engines and verify they have identical
+// key-value sets. Previous matrices only verified via must_get (leader-only).
+// This tests the Raft log catch-up path on all replicas.
+fn run_convergence_scan_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write 15 keys before faults.
+    for i in 0u32..15 {
+        let k = format!("cv_pre_{i:02}");
+        cluster.must_put(k.as_bytes(), format!("pre_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Write 15 more keys under faults (some may not reach all nodes yet).
+    for i in 0u32..15 {
+        let k = format!("cv_post_{i:02}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(k.as_bytes(), format!("post_{i:02}").as_bytes());
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal + give generous time for catch-up.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // ORACLE: scan each node's engine and collect key-value pairs.
+    // All 3 nodes must have identical key-value sets.
+    let mut node_data: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    for store_id in 1u64..=3 {
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let engine = cluster.get_engine(store_id);
+        // TiKV stores keys with 'z' (0x7a) data prefix. Keys like "cv_pre_00"
+        // are stored as "zcv_pre_00". Scan WITHOUT prefix (same as existing
+        // engine_scan test) — seek positions at first key >= "cv_" which is
+        // "zcv_..." since 'z' > 'c'.
+        let result = engine.scan(
+            "default",
+            b"cv_",
+            b"", // empty = no upper bound
+            false,
+            |key, val| {
+                // Strip data prefix 'z' if present.
+                let user_key = if key.starts_with(b"z") { &key[1..] } else { key };
+                if user_key.starts_with(b"cv_") {
+                    pairs.push((user_key.to_vec(), val.to_vec()));
+                }
+                // Stop when past our key range.
+                Ok(user_key < b"cv_zzz" as &[u8])
+            },
+        );
+        assert!(result.is_ok(), "CONVERGENCE SCAN: node {store_id} scan failed: {:?}", result);
+        node_data.push(pairs);
+    }
+
+    // Node 1 should have all keys (it was the leader throughout for non-partition masks).
+    // For partition masks (node 3 isolated), node 3 needs to catch up after heal.
+    // All nodes must converge to the same set after the generous sleep.
+    let n1 = &node_data[0];
+    let n2 = &node_data[1];
+    let n3 = &node_data[2];
+
+    eprintln!(
+        "DST_CONV mask=0b{:05b} ({}) seed={seed:#x} node1={} node2={} node3={}",
+        mask, fault_mask_name(mask), n1.len(), n2.len(), n3.len()
+    );
+
+    // Build expected set (all 30 keys, assuming all writes succeeded).
+    let mut expected: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    for i in 0u32..15 {
+        expected.insert(format!("cv_pre_{i:02}").into_bytes(), format!("pre_{i:02}").into_bytes());
+    }
+    for i in 0u32..15 {
+        expected.insert(format!("cv_post_{i:02}").into_bytes(), format!("post_{i:02}").into_bytes());
+    }
+
+    // Check each node against expected. All nodes must have all 30 keys.
+    for (idx, pairs) in node_data.iter().enumerate() {
+        let store_id = (idx + 1) as u64;
+        assert_eq!(
+            pairs.len(),
+            expected.len(),
+            "CONVERGENCE SCAN VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+             node {store_id} has {} keys, expected {} — missing keys: {:?}",
+            mask,
+            fault_mask_name(mask),
+            pairs.len(),
+            expected.len(),
+            expected.keys().filter(|k| !pairs.iter().any(|(pk, _)| pk == *k)).take(5).collect::<Vec<_>>()
+        );
+        // Verify each key has the correct value.
+        for (k, v) in pairs {
+            let exp = expected.get(k);
+            assert_eq!(
+                Some(v),
+                exp.map(|e| e),
+                "CONVERGENCE SCAN VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+                 node {store_id} key {} has wrong value",
+                mask,
+                fault_mask_name(mask),
+                String::from_utf8_lossy(k)
+            );
+        }
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_convergence_scan_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_CONV_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_CONV_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_CONV masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xF000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_convergence_scan_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_CONV mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_CONV mask=0b{:05b} ({}) FAIL — replay: DST_CONV_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_CONV_REPLAY").is_ok() {
+                panic!("convergence scan matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_CONV done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "convergence scan fault matrix had failures");
+}
