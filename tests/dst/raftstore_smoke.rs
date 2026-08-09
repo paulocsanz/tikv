@@ -6434,7 +6434,7 @@ fn test_deep_key_prefix_collision() {
 
     // Build expected map: last write wins for each unique key.
     use std::collections::HashMap;
-    let mut expected_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut expected_map: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
     for (key, val) in &prefix_keys {
         expected_map.insert(key.clone(), val.clone());
     }
@@ -7566,5 +7566,405 @@ fn test_dst_5node_fault_matrix() {
         failures.len()
     );
     assert_eq!(passed, total, "5node fault matrix had failures");
+}
+
+// ─── Batch 11: model-based property test + novel attacks ─────────────
+
+/// MODEL-BASED PROPERTY TEST: Generate a random sequence of operations
+/// (put, get, delete) using our DST RNG, apply them to TiKV, and verify
+/// each result against a simple HashMap model. This is the Antithesis
+/// approach — if TiKV and the model ever disagree, we found a bug.
+#[test]
+fn test_deep_model_based_random_ops() {
+    let seed = 0xCAFE_BABE;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    let n_ops = 500u32;
+    let key_space = 20u32; // small key space = more collisions
+
+    let mut mismatches = 0;
+    for op_idx in 0u32..n_ops {
+        let op = rng.gen::<u32>() % 3;
+        let key_idx = rng.gen::<u32>() % key_space;
+        let key = format!("mb_{key_idx:02}");
+
+        match op {
+            0 => {
+                // PUT
+                let val_idx = rng.gen::<u32>() % 1000;
+                let val = format!("v{val_idx:04}");
+                cluster.must_put(key.as_bytes(), val.as_bytes());
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            1 => {
+                // GET — verify against model
+                let v = cluster.must_get(key.as_bytes());
+                let expected = model.get(key.as_bytes());
+                if v.as_deref() != expected.map(|v| v.as_slice()) {
+                    eprintln!("MISMATCH op={op_idx} GET key={key} model={expected:?} tikv={v:?}");
+                    mismatches += 1;
+                }
+            }
+            2 => {
+                // DELETE
+                cluster.must_delete(key.as_bytes());
+                model.remove(key.as_bytes());
+            }
+            _ => unreachable!(),
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Final full verification — every key in the model must match TiKV.
+    for (key, expected_val) in &model {
+        let v = cluster.must_get(key);
+        if v.as_deref() != Some(expected_val.as_slice()) {
+            eprintln!("FINAL MISMATCH key={:?} model={:?} tikv={v:?}", String::from_utf8_lossy(key), String::from_utf8_lossy(expected_val));
+            mismatches += 1;
+        }
+    }
+    // Every key NOT in the model must return None.
+    for key_idx in 0u32..key_space {
+        let key = format!("mb_{key_idx:02}");
+        if !model.contains_key(key.as_bytes()) {
+            let v = cluster.must_get(key.as_bytes());
+            if v.is_some() {
+                eprintln!("GHOST key={key} should be None but tikv={v:?}");
+                mismatches += 1;
+            }
+        }
+    }
+
+    assert_eq!(mismatches, 0,
+        "BUG: {mismatches} mismatches between model and TiKV after {n_ops} random ops");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP74 model-based test: {n_ops} ops, {} surviving keys, 0 mismatches",
+        model.len());
+    eprintln!("DST_DEEP74 OK");
+}
+
+/// MODEL-BASED UNDER PARTITION: Same as above but with one follower
+/// intermittently partitioned. The model must still match after heal.
+#[test]
+fn test_deep_model_based_under_partition() {
+    let seed = 0xFACE_FEED;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let drop_flag = Arc::new(AtomicBool::new(true));
+    let filter = RegionPacketFilter::new(1, 3)
+        .direction(Direction::Recv)
+        .when(drop_flag.clone());
+    cluster.add_send_filter_on_node(3, Box::new(filter));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    let n_ops = 200u32;
+    for op_idx in 0u32..n_ops {
+        let op = rng.gen::<u32>() % 2; // only PUT and DELETE during partition
+        let key_idx = rng.gen::<u32>() % 10;
+        let key = format!("mbp_{key_idx:02}");
+
+        match op {
+            0 => {
+                let val = format!("v{}", rng.gen::<u32>() % 500);
+                cluster.must_put(key.as_bytes(), val.as_bytes());
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            _ => {
+                cluster.must_delete(key.as_bytes());
+                model.remove(key.as_bytes());
+            }
+        }
+        // Toggle partition every 20 ops.
+        if op_idx % 20 == 0 {
+            drop_flag.store(!drop_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    // Heal and settle.
+    drop_flag.store(false, Ordering::SeqCst);
+    cluster.clear_send_filter_on_node(3);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Verify model matches.
+    let mut mismatches = 0;
+    for (key, expected_val) in &model {
+        let v = cluster.must_get(key);
+        if v.as_deref() != Some(expected_val.as_slice()) {
+            mismatches += 1;
+        }
+    }
+    for key_idx in 0u32..10 {
+        let key = format!("mbp_{key_idx:02}");
+        if !model.contains_key(key.as_bytes()) {
+            if cluster.must_get(key.as_bytes()).is_some() {
+                mismatches += 1;
+            }
+        }
+    }
+
+    assert_eq!(mismatches, 0,
+        "BUG: {mismatches} mismatches after model-based test under partition");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP75 OK");
+}
+
+/// DELETE RANGE: Write keys across a range, delete a sub-range, verify
+/// only the deleted range is gone and everything else survives.
+#[test]
+fn test_deep_delete_range_semantics() {
+    let seed = 0xD1D1u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write keys 000-049.
+    for i in 0u32..50 {
+        cluster.must_put(format!("dr2_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Delete range dr2_010 to dr2_030 (exclusive end).
+    cluster.must_delete_range_cf("default", b"dr2_010", b"dr2_030");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Keys 000-009 must survive.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("dr2_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
+            "BUG: key dr2_{i:03} deleted by range but shouldn't be");
+    }
+    // Keys 010-029 must be gone.
+    for i in 10u32..30 {
+        let v = cluster.must_get(format!("dr2_{i:03}").as_bytes());
+        assert!(v.is_none(),
+            "BUG: key dr2_{i:03} survived delete_range but should be gone");
+    }
+    // Keys 030-049 must survive.
+    for i in 30u32..50 {
+        let v = cluster.must_get(format!("dr2_{i:03}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
+            "BUG: key dr2_{i:03} deleted by range but shouldn't be");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP76 OK");
+}
+
+/// IDEMPOTENT REWRITE: Write the same key-value pair 100 times, then
+/// verify it's exactly that value (not duplicated, not corrupted).
+#[test]
+fn test_deep_idempotent_rewrite() {
+    let seed = 0xD2D2u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for _ in 0..100 {
+        cluster.must_put(b"idem_key", b"idem_val");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let v = cluster.must_get(b"idem_key");
+    assert_eq!(v.as_deref(), Some(b"idem_val".as_slice()),
+        "BUG: idempotent rewrite produced wrong value: {v:?}");
+
+    // Count keys — should be exactly 1.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zidem_key", b"zidem_key\x00", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 1, "BUG: idempotent rewrite produced {count} entries (expected 1)");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP77 OK");
+}
+
+/// LARGE KEY EDGE: Write keys near TiKV's maximum key size. These stress
+/// the key encoding and raft message serialization.
+#[test]
+fn test_deep_large_key_edge() {
+    let seed = 0xD3D3u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Keys of various large sizes.
+    let key_sizes = [64usize, 256, 1024, 4096];
+    for &size in &key_sizes {
+        let key = format!("lk_").into_bytes();
+        let mut key = key;
+        key.extend(std::iter::repeat(b'X').take(size - 3));
+        let val = format!("val_for_{size}");
+        cluster.must_put(&key, val.as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    for &size in &key_sizes {
+        let key = format!("lk_").into_bytes();
+        let mut key = key;
+        key.extend(std::iter::repeat(b'X').take(size - 3));
+        let expected = format!("val_for_{size}");
+        let v = cluster.must_get(&key);
+        assert_eq!(v.as_deref(), Some(expected.as_bytes()),
+            "BUG: large key (size={size}) returned wrong value");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP78 OK");
+}
+
+/// DETERMINISM UNDER FAULTS: Run the same seed with the same fault
+/// configuration twice and verify both runs produce the same KV state.
+/// This proves our fault injection is deterministic, not just the
+/// happy path.
+#[test]
+fn test_deep_network_queue_determinism() {
+    fn run_with_faults(seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cluster = bootstrap_hybrid(seed);
+        std::thread::sleep(Duration::from_millis(200));
+
+        let drop_flag = Arc::new(AtomicBool::new(false));
+        let filter = RegionPacketFilter::new(1, 3)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgAppend)
+            .when(drop_flag.clone());
+        cluster.add_send_filter_on_node(3, Box::new(filter));
+
+        let mut rng = DstRng::seed_from_u64(seed);
+        let mut result = Vec::new();
+        for i in 0u32..30 {
+            let val_idx = rng.gen::<u32>() % 100;
+            cluster.must_put(
+                format!("nqd_{i:02}").as_bytes(),
+                format!("v{val_idx}").as_bytes(),
+            );
+            if i % 5 == 0 {
+                drop_flag.store(!drop_flag.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        for i in 0u32..30 {
+            let key = format!("nqd_{i:02}");
+            let v = cluster.must_get(key.as_bytes());
+            result.push((key.into_bytes(), v.unwrap_or_default()));
+        }
+
+        cluster.shutdown();
+        cleanup_cluster();
+        result
+    }
+
+    let run1 = run_with_faults(0xAAAA);
+    let run2 = run_with_faults(0xAAAA);
+
+    assert_eq!(run1.len(), run2.len());
+    for (i, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
+        assert_eq!(a, b,
+            "BUG: fault determinism violation — key {i} differs between identical-seed runs");
+    }
+
+    eprintln!("DST_DEEP79 fault determinism: {} keys, bit-identical across 2 runs", run1.len());
+    eprintln!("DST_DEEP79 OK");
+}
+
+/// RNG DETERMINISM: Verify that the DST RNG produces identical sequences
+/// for the same seed. This is the foundation of all determinism.
+#[test]
+fn test_deep_rng_determinism() {
+    fn gen_sequence(seed: u64) -> Vec<u64> {
+        tikv_util::dst_init::dst_init(seed);
+        let mut rng = DstRng::seed_from_u64(seed);
+        (0..1000).map(|_| rng.gen::<u64>()).collect()
+    }
+
+    let seq1 = gen_sequence(0xBEEB);
+    let seq2 = gen_sequence(0xBEEB);
+
+    assert_eq!(seq1.len(), seq2.len());
+    for (i, (a, b)) in seq1.iter().zip(seq2.iter()).enumerate() {
+        assert_eq!(a, b, "BUG: RNG output {i} differs between identical-seed runs");
+    }
+
+    // Different seeds should produce different sequences.
+    let seq3 = gen_sequence(0xDEED);
+    let mut same_count = 0;
+    for (a, b) in seq1.iter().zip(seq3.iter()) {
+        if a == b {
+            same_count += 1;
+        }
+    }
+    // With 2^64 output space, ~0 collisions expected. Allow a tiny tolerance.
+    assert!(same_count < 10,
+        "BUG: different seeds produced {same_count}/1000 identical RNG outputs (expected ~0)");
+
+    sterilize_dst_process();
+    eprintln!("DST_DEEP80 RNG: 1000 values, bit-identical same-seed, {same_count} collisions cross-seed");
+    eprintln!("DST_DEEP80 OK");
+}
+
+/// WRITE-READ-DELETE-READ CYCLE: For each key, do a full lifecycle:
+/// write, read (verify), delete, read (verify gone). 50 keys.
+/// This tests the basic CRUD invariant for every key individually.
+#[test]
+fn test_deep_crud_lifecycle_all_keys() {
+    let seed = 0xD4D4u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    let n = 50u32;
+    for i in 0u32..n {
+        let key = format!("crud_{i:02}");
+        let val = format!("val_{i:02}");
+
+        // Write.
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Read — must match.
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_deref(), Some(val.as_bytes()),
+            "BUG: CRUD key {key} read after write mismatch");
+
+        // Delete.
+        cluster.must_delete(key.as_bytes());
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Read — must be gone.
+        let v2 = cluster.must_get(key.as_bytes());
+        assert!(v2.is_none(),
+            "BUG: CRUD key {key} survived delete");
+
+        // Rewrite.
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Read — must match again.
+        let v3 = cluster.must_get(key.as_bytes());
+        assert_eq!(v3.as_deref(), Some(val.as_bytes()),
+            "BUG: CRUD key {key} read after rewrite mismatch");
+    }
+
+    // Final verification: all 50 keys present with correct values.
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("crud_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("val_{i:02}").as_bytes()),
+            "BUG: CRUD final verification failed for key crud_{i:02}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP81 CRUD lifecycle verified for {n} keys");
+    eprintln!("DST_DEEP81 OK");
 }
 
