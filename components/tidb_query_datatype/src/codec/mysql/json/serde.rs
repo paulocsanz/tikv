@@ -372,4 +372,27 @@ mod tests {
             assert_eq!(json.to_string_value(), json_str);
         }
     }
+
+    #[test]
+    fn test_to_string_value_invalid_utf8() {
+        // Regression: JSON string values containing non-UTF-8 bytes (which
+        // cast_string_as_json can now legitimately produce via from_str_bytes)
+        // must not panic during serialization (to_string_value).
+        // Previously: serialize().unwrap() panicked when get_str() returned
+        // Err on invalid UTF-8.
+        let invalid_utf8: &[u8] = &[0xff, 0xfe, 0xfd];
+        let json = Json::from_str_bytes(invalid_utf8).unwrap();
+
+        // Must not panic — lossy conversion produces U+FFFD replacement chars.
+        let result = json.to_string_value();
+        assert!(
+            !result.is_empty(),
+            "expected non-empty serialization result"
+        );
+        assert!(
+            result.contains('\u{FFFD}'),
+            "expected U+FFFD replacement char in lossy serialization: {}",
+            result
+        );
+    }
 }
