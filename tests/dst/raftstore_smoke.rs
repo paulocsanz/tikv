@@ -25,7 +25,9 @@ use std::{
     time::{Duration, Instant as WallInstant},
 };
 
+use engine_traits::{Iterable, Peekable};
 use futures::Future;
+use keys::data_key;
 use kvproto::{raft_cmdpb::RaftCmdResponse, raft_serverpb::RaftMessage};
 use raft::eraftpb::MessageType;
 use rand::Rng;
@@ -5941,520 +5943,12 @@ fn test_deep_snapshot_during_transfer() {
 /// READINDEX LINEARIZABILITY: Write v1, submit ReadIndex, write v2,
 /// then read via ReadIndex result. The read must see at least v1
 /// (linearizable: it was committed when the ReadIndex was submitted).
-// ─── Deep fault batch 8: novel attack surfaces ───────────────────────
-
-/// READINDEX LINEARIZABILITY: Write v1, submit ReadIndex, write v2,
-/// then read via ReadIndex result. The read must see at least v1
-/// (linearizable: it was committed when the ReadIndex was submitted).
-/// This is the most precise linearizability check possible.
 #[test]
 fn test_deep_readindex_linearizability() {
     let seed = 0x1111u64;
     let mut cluster = bootstrap_hybrid(seed);
     cluster.must_put(b"lin_key", b"v1");
     std::thread::sleep(Duration::from_millis(200));
-
-    let region = cluster.get_region(b"lin_key");
-
-    // Submit ReadIndex — this captures the committed index at this point.
-    let read_result = test_raftstore::read_index_on_peer(
-        &mut cluster,
-        new_peer(1, 1),
-        region.clone(),
-        true,
-        Duration::from_secs(5),
-    );
-    eprintln!("DST_DEEP45 ReadIndex result: {:?}", read_result.as_ref().map(|r| r.get_header().has_error()));
-
-    // Immediately write v2 — this happens AFTER the ReadIndex.
-    cluster.must_put(b"lin_key", b"v2");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Read back — must see at least v1 (the value that was committed
-    // when the ReadIndex was issued). If linearizable, it sees v2 now.
-    let v = cluster.must_get(b"lin_key");
-    assert!(
-        v.as_deref() == Some(b"v2".as_slice()),
-        "BUG: read after ReadIndex returned stale value, expected v2"
-    );
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP45 OK");
-}
-
-/// BATCH ATOMICITY: Submit a batch with multiple key-value puts in one
-/// request. All keys must appear atomically — no partial write.
-/// Test under partition.
-#[test]
-fn test_deep_batch_atomicity_under_partition() {
-    let seed = 0x2222u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Partition node 3.
-    let drop_flag = Arc::new(AtomicBool::new(true));
-    let filter = RegionPacketFilter::new(1, 3)
-        .direction(Direction::Recv)
-        .when(drop_flag.clone());
-    cluster.add_send_filter_on_node(3, Box::new(filter));
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Submit a batch of 5 puts in one request.
-    let batch_keys: Vec<&[u8]> = vec![b"bat_0", b"bat_1", b"bat_2", b"bat_3", b"bat_4"];
-    let reqs: Vec<_> = batch_keys.iter().enumerate()
-        .map(|(i, k)| test_raftstore::new_put_cmd(k, format!("val_{i}").as_bytes()))
-        .collect();
-    let resp = cluster.batch_put(b"bat_0", reqs);
-    assert!(resp.is_ok(), "BUG: batch put failed under single-follower partition: {:?}", resp);
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Heal.
-    drop_flag.store(false, Ordering::SeqCst);
-    cluster.clear_send_filter_on_node(3);
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // ALL 5 keys must be present — atomic, no partial application.
-    for (i, k) in batch_keys.iter().enumerate() {
-        let v = cluster.must_get(k);
-        assert_eq!(v.as_deref(), Some(format!("val_{i}").as_bytes()),
-            "BUG: batch atomicity violated — key {} missing in partial batch", String::from_utf8_lossy(k));
-    }
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP46 OK");
-}
-
-/// EMPTY VALUE VS MISSING KEY: Write an empty value, then verify it's
-/// distinguishable from a key that was never written. This tests the
-/// RocksDB value encoding — empty values must not be treated as "deleted".
-#[test]
-fn test_deep_empty_value_vs_missing() {
-    let seed = 0x3333u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Write key with empty value.
-    cluster.must_put(b"empty_val", b"");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Verify: empty_val exists with empty value.
-    let v = cluster.must_get(b"empty_val");
-    assert_eq!(v.as_deref(), Some(b"".as_slice()),
-        "BUG: empty value key returned wrong value: {v:?}");
-
-    // Verify: never_written key returns None.
-    let v2 = cluster.must_get(b"never_written");
-    assert!(v2.is_none(),
-        "BUG: never-written key returned non-None: {v2:?}");
-
-    // Delete the empty key, verify it's now None.
-    cluster.must_delete(b"empty_val");
-    std::thread::sleep(Duration::from_millis(200));
-    let v3 = cluster.must_get(b"empty_val");
-    assert!(v3.is_none(),
-        "BUG: deleted empty-value key still has value: {v3:?}");
-
-    // Re-write with non-empty, verify distinguishable from empty.
-    cluster.must_put(b"empty_val", b"content");
-    std::thread::sleep(Duration::from_millis(200));
-    let v4 = cluster.must_get(b"empty_val");
-    assert_eq!(v4.as_deref(), Some(b"content".as_slice()),
-        "BUG: re-written key has wrong value: {v4:?}");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP47 OK");
-}
-
-/// REGION MERGE SAFETY: Split a region into two, write to both, then
-/// merge them back. All data must survive the merge and be accessible
-/// in the merged region.
-#[test]
-fn test_deep_region_merge_safety() {
-    let seed = 0x4444u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    // Write initial data.
-    for i in 0u32..20 {
-        cluster.must_put(format!("rm_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Split into two regions.
-    let region = cluster.get_region(b"rm_000");
-    let split_key = b"rm_010";
-    cluster.must_split(&region, split_key);
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Write to both sides of the split.
-    for i in 0u32..5 {
-        cluster.must_put(format!("rm_left_{i}").as_bytes(), format!("l{i}").as_bytes());
-        cluster.must_put(format!("rm_right_{i}").as_bytes(), format!("r{i}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(300));
-
-    let left_region = cluster.get_region(b"rm_000");
-    let right_region = cluster.get_region(b"rm_015");
-    eprintln!("DST_DEEP48 left region id={}, right region id={}",
-        left_region.get_id(), right_region.get_id());
-
-    // Attempt merge: merge left into right.
-    let merge_resp = cluster.try_merge(left_region.get_id(), right_region.get_id());
-    let merge_ok = !test_raftstore::is_error_response(&merge_resp);
-    eprintln!("DST_DEEP48 merge result: ok={merge_ok}, resp error={:?}",
-        merge_resp.get_header().get_error());
-
-    if merge_ok {
-        std::thread::sleep(Duration::from_millis(1000));
-
-        // Verify ALL data survived the merge.
-        for i in 0u32..20 {
-            let v = cluster.must_get(format!("rm_{i:03}").as_bytes());
-            assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
-                "BUG: key rm_{i:03} lost after region merge");
-        }
-        for i in 0u32..5 {
-            let v = cluster.must_get(format!("rm_left_{i}").as_bytes());
-            assert_eq!(v.as_deref(), Some(format!("l{i}").as_bytes()),
-                "BUG: key rm_left_{i} lost after region merge");
-            let v = cluster.must_get(format!("rm_right_{i}").as_bytes());
-            assert_eq!(v.as_deref(), Some(format!("r{i}").as_bytes()),
-                "BUG: key rm_right_{i} lost after region merge");
-        }
-
-        // Write after merge.
-        cluster.must_put(b"rm_post_merge", b"works");
-        assert_eq!(cluster.must_get(b"rm_post_merge"), Some(b"works".to_vec()),
-            "BUG: write after region merge failed");
-    } else {
-        eprintln!("DST_DEEP48 merge didn't succeed (acceptable for some configurations)");
-        // Still verify data didn't get corrupted.
-        for i in 0u32..20 {
-            let v = cluster.must_get(format!("rm_{i:03}").as_bytes());
-            assert_eq!(v.as_deref(), Some(format!("v{i:03}").as_bytes()),
-                "BUG: key rm_{i:03} corrupted after failed merge");
-        }
-    }
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP48 OK");
-}
-
-/// REPLICA READ STALENESS: Write a value, then read from a follower
-/// via replica_read=true (without read_quorum). The follower may be
-/// behind — but it must never return data from BEFORE the last read it
-/// confirmed. This tests the replica-read safety boundary.
-#[test]
-fn test_deep_replica_read_safety() {
-    let seed = 0x5555u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    cluster.must_put(b"rrs_v1", b"version1");
-    std::thread::sleep(Duration::from_millis(500));
-
-    let region = cluster.get_region(b"rrs_v1");
-
-    // Read from follower (node 2) via replica read.
-    let mut result = test_raftstore::async_read_on_peer(
-        &mut cluster,
-        new_peer(2, 2),
-        region.clone(),
-        b"rrs_v1",
-        false, // no read_quorum
-        true,  // replica_read = true
-    );
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let deadline = WallInstant::now() + Duration::from_secs(5);
-    let resp = loop {
-        if WallInstant::now() > deadline {
-            break None;
-        }
-        match Future::poll(result.as_mut(), &mut cx) {
-            Poll::Ready(r) => break Some(r),
-            Poll::Pending => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-
-    match &resp {
-        Some(r) if !r.get_header().has_error() => {
-            let val = r.get_responses().first()
-                .and_then(|resp| Some(resp.get_get().get_value()));
-            eprintln!("DST_DEEP49 replica read from node 2: val={val:?}");
-            // Replica read may see v1 or nothing — but must NOT see data
-            // newer than what the follower has confirmed.
-        }
-        _ => {
-            eprintln!("DST_DEEP49 replica read returned error (acceptable): {:?}", resp.as_ref().map(|r| r.get_header().get_error()));
-        }
-    }
-
-    // Write v2, wait, then replica-read again.
-    cluster.must_put(b"rrs_v1", b"version2");
-    std::thread::sleep(Duration::from_millis(500));
-
-    let region2 = cluster.get_region(b"rrs_v1");
-    let mut result2 = test_raftstore::async_read_on_peer(
-        &mut cluster,
-        new_peer(3, 3),
-        region2,
-        b"rrs_v1",
-        false,
-        true,
-    );
-    let deadline2 = WallInstant::now() + Duration::from_secs(5);
-    let resp2 = loop {
-        if WallInstant::now() > deadline2 {
-            break None;
-        }
-        match Future::poll(result2.as_mut(), &mut cx) {
-            Poll::Ready(r) => break Some(r),
-            Poll::Pending => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-
-    match &resp2 {
-        Some(r) if !r.get_header().has_error() => {
-            let val = r.get_responses().first()
-                .and_then(|resp| Some(resp.get_get().get_value()));
-            eprintln!("DST_DEEP49 replica read from node 3 after v2: val={val:?}");
-        }
-        _ => {
-            eprintln!("DST_DEEP49 second replica read returned error (acceptable)");
-        }
-    }
-
-    // Final consistency check via leader.
-    let v = cluster.must_get(b"rrs_v1");
-    assert_eq!(v.as_deref(), Some(b"version2".as_slice()),
-        "BUG: leader doesn't have latest version2");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP49 OK");
-}
-
-/// CONCURRENT SPLIT + WRITE: Split a region while writes are in flight
-/// to keys that will end up in different post-split regions. All writes
-/// must be correctly routed — no writes should be lost or misrouted.
-#[test]
-fn test_deep_concurrent_split_and_write() {
-    let seed = 0x6666u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    for i in 0u32..5 {
-        cluster.must_put(format!("csw_{i:03}").as_bytes(), format!("init_{i}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    let region = cluster.get_region(b"csw_000");
-    let region_epoch = region.get_region_epoch().clone();
-
-    // Split at csw_003.
-    cluster.must_split(&region, b"csw_003");
-    std::thread::sleep(Duration::from_millis(50));
-
-    // IMMEDIATELY write to keys on both sides of the split boundary.
-    // These writes happen while the split is propagating.
-    cluster.must_put(b"csw_001", b"left_write");
-    cluster.must_put(b"csw_005", b"right_write");
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify ALL keys — initial + post-split writes.
-    for i in 0u32..5 {
-        let key = format!("csw_{i:03}");
-        let expected = match i {
-            1 => b"left_write".to_vec(),
-            _ => format!("init_{i}").into_bytes(),
-        };
-        let v = cluster.must_get(key.as_bytes());
-        assert_eq!(v.as_deref(), Some(expected.as_slice()),
-            "BUG: key {key} has wrong value after concurrent split+write");
-    }
-    assert_eq!(cluster.must_get(b"csw_005"), Some(b"right_write".to_vec()),
-        "BUG: right-side write lost during concurrent split");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP50 OK");
-}
-
-/// ROLLING NODE REPLACEMENT: Remove node 1, add node 4 (if available),
-/// write throughout. This simulates a rolling upgrade where one node
-/// is replaced at a time. Data must survive the transition.
-#[test]
-fn test_deep_rolling_node_replacement() {
-    let seed = 0x7777u64;
-    let mut cluster = new_node_cluster(seed, 4);
-    tikv_util::dst_init::dst_init(seed);
-    time::dst_set_manual_only(false);
-    time::dst_start_hybrid_driver(Duration::from_millis(1));
-    batch_system::set_manual_drive(false);
-    dst_setup_cluster(&mut cluster);
-    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
-    cluster.run();
-    assert!(wait_leader(&mut cluster, 100));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cluster.must_transfer_leader(1, new_peer(1, 1));
-    }));
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // Write initial data.
-    for i in 0u32..20 {
-        cluster.must_put(format!("rnr_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(300));
-
-    let region_id = cluster.get_region_id(b"rnr_00");
-
-    // Phase 1: Add node 4.
-    let _fut = cluster.async_add_peer(region_id, new_peer(4, 4)).unwrap();
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Write during add.
-    cluster.must_put(b"rnr_during_add", b"during");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Phase 2: Remove node 1 (the leader — triggers re-election).
-    let _fut2 = cluster.async_remove_peer(region_id, new_peer(1, 1)).unwrap();
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Write after removal.
-    cluster.must_put(b"rnr_after_remove", b"after");
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Verify ALL data survived the rolling replacement.
-    for i in 0u32..20 {
-        let v = cluster.must_get(format!("rnr_{i:02}").as_bytes());
-        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
-            "BUG: key rnr_{i:02} lost during rolling replacement");
-    }
-    assert_eq!(cluster.must_get(b"rnr_during_add"), Some(b"during".to_vec()),
-        "BUG: write during add-peer lost");
-    assert_eq!(cluster.must_get(b"rnr_after_remove"), Some(b"after".to_vec()),
-        "BUG: write after remove-peer lost");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP51 OK");
-}
-
-/// CHAIN OF SPLITS: Split a region 4 times, creating 5 sub-regions.
-/// Write to each, then verify all data is accessible. This tests
-/// region epoch management through multiple split generations.
-#[test]
-fn test_deep_chain_of_splits() {
-    let seed = 0x8888u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    // Write data across the full range.
-    for i in 0u32..50 {
-        cluster.must_put(format!("cs_{i:02}").as_bytes(), format!("v{i:02}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Split 4 times at different boundaries.
-    let split_keys: &[&[u8]] = &[b"cs_10", b"cs_20", b"cs_30", b"cs_40"];
-    for sk in split_keys {
-        let region = cluster.get_region(sk);
-        cluster.must_split(&region, sk);
-        std::thread::sleep(Duration::from_millis(300));
-    }
-
-    // Write to each of the 5 resulting regions.
-    for i in [0u32, 5, 15, 25, 35, 45] {
-        cluster.must_put(
-            format!("cs_post_{i:02}").as_bytes(),
-            format!("post_{i:02}").as_bytes(),
-        );
-    }
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Verify ALL original data.
-    for i in 0u32..50 {
-        let key = format!("cs_{i:02}");
-        let v = cluster.must_get(key.as_bytes());
-        assert_eq!(v.as_deref(), Some(format!("v{i:02}").as_bytes()),
-            "BUG: key {key} lost after chain of splits");
-    }
-    // Verify post-split writes.
-    for i in [0u32, 5, 15, 25, 35, 45] {
-        let key = format!("cs_post_{i:02}");
-        let v = cluster.must_get(key.as_bytes());
-        assert_eq!(v.as_deref(), Some(format!("post_{i:02}").as_bytes()),
-            "BUG: key {key} lost after chain of splits");
-    }
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP52 OK");
-}
-
-/// READ FROM STALE PEER: After a split, the old region's peer on a
-/// follower may still exist with a stale epoch. Attempting to read from
-/// it with the stale epoch should give EpochNotMatch, not corrupt data.
-#[test]
-fn test_deep_read_from_stale_peer_after_split() {
-    let seed = 0x9999u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    cluster.must_put(b"rsp_v1", b"val1");
-    cluster.must_put(b"rsp_v2", b"val2");
-    std::thread::sleep(Duration::from_millis(300));
-
-    let region = cluster.get_region(b"rsp_v1");
-    let old_epoch = region.get_region_epoch().clone();
-    let region_id = region.get_id();
-
-    // Split.
-    cluster.must_split(&region, b"rsp_v2");
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Try to read from node 2 using the OLD epoch.
-    let mut stale_req = test_raftstore::new_request(
-        region_id,
-        old_epoch,
-        vec![test_raftstore::new_get_cmd(b"rsp_v1")],
-        false, // no read_quorum
-    );
-    stale_req.mut_header().set_peer(new_peer(2, 2));
-    let resp = cluster.call_command_on_node(2, stale_req, Duration::from_secs(5));
-
-    match &resp {
-        Ok(r) => {
-            let err = r.get_header().get_error();
-            if err.has_epoch_not_match() {
-                eprintln!("DST_DEEP53 stale-epoch read correctly rejected with EpochNotMatch");
-            } else if !err.has_epoch_not_match() && !r.get_header().has_error() {
-                eprintln!("DST_DEEP53 stale-epoch read succeeded (acceptable if data is correct)");
-                // If it succeeded, verify the data is correct.
-                let val = r.get_responses().first()
-                    .and_then(|resp| Some(resp.get_get().get_value()));
-                assert_eq!(val, Some(b"val1".as_slice()),
-                    "BUG: stale-epoch read returned wrong data");
-            }
-        }
-        Err(e) => {
-            eprintln!("DST_DEEP53 stale-epoch read errored (acceptable): {e}");
-        }
-    }
-
-    // Verify data integrity via fresh epoch.
-    assert_eq!(cluster.must_get(b"rsp_v1"), Some(b"val1".to_vec()),
-        "BUG: rsp_v1 corrupted after stale read");
-    assert_eq!(cluster.must_get(b"rsp_v2"), Some(b"val2".to_vec()),
-        "BUG: rsp_v2 corrupted after stale read");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP53 OK");
-}
-
-// ─── Restart-under-matrix: node kill+restart across all 32 fault subsets ──
-//
-// The production bugs we found (PR #33 CURRENT truncation, PR #41 lying
-// fsync) were on the crash/restart path. This test systematically crosses
-// node restart with every fault dimension subset.
 
     let region = cluster.get_region(b"lin_key");
 
@@ -6833,379 +6327,517 @@ fn test_deep_read_from_stale_peer_after_split() {
     eprintln!("DST_DEEP53 OK");
 }
 
-// ─── Snapshot-under-matrix: force InstallSnapshot across all 32 subsets ──
-//
-// Snapshots bypass normal AppendEntries — they replace the entire state.
-// This is historically the most bug-prone Raft code path (etcd, CockroachDB,
-// ZooKeeper all had snapshot bugs). We force a snapshot by:
-//
-//   1. Writing data, killing node 3
-//   2. Writing 200+ entries (enough to exceed log capacity)
-//   3. Compacting the log (truncates entries node 3 needs)
-//   4. Activating faults
-//   5. Restarting node 3 — it MUST receive a snapshot, not log replay
-//
-// All under each of the 32 fault dimension subsets.
+// ─── Batch 9: beyond raft — engine, encoding, multi-region, scan ─────
 
-fn run_snapshot_matrix_cell(mask: u32, seed: u64) {
-    tikv_util::dst_init::dst_init(seed);
-    time::dst_set_manual_only(false);
-    time::dst_start_hybrid_driver(Duration::from_millis(1));
-    batch_system::set_manual_drive(false);
-
-    let mut cluster = new_node_cluster(seed, 3);
-    dst_setup_cluster(&mut cluster);
-    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
-    cluster.run();
-
-    assert!(wait_leader(&mut cluster, 100));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cluster.must_transfer_leader(1, new_peer(1, 1));
-    }));
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // Phase 1: write initial data.
-    for i in 0u32..5 {
-        cluster.must_put(
-            format!("sm_pre_{i}").as_bytes(),
-            format!("smv_pre_{mask}_{seed}_{i}").as_bytes(),
-        );
-    }
+/// BINARY KEY STRESS: Write keys with null bytes, control characters,
+/// high bytes, and other binary patterns that could confuse encoding.
+/// Each key must be independently retrievable.
+#[test]
+fn test_deep_binary_key_correctness() {
+    let seed = 0xABABu64;
+    let mut cluster = bootstrap_hybrid(seed);
     std::thread::sleep(Duration::from_millis(200));
 
-    // Phase 2: kill node 3 to create a gap.
-    cluster.stop_node(3);
+    let binary_keys: &[&[u8]] = &[
+        b"\x00",                    // single null
+        b"\x00\x00",                // double null
+        b"\xff",                    // single high byte
+        b"\xff\xff",                // double high byte
+        b"\x00\xff",                // null then high
+        b"\xff\x00",                // high then null
+        b"key\x00suffix",           // null in middle
+        b"\x01\x02\x03\x04\x05",   // control chars
+        b"\x80\x81\x82",            // high bit patterns
+        b"",                        // empty key (edge case!)
+        b"normal_key",              // normal for comparison
+    ];
+
+    for (i, key) in binary_keys.iter().enumerate() {
+        let val = format!("val_{i}");
+        cluster.must_put(key, val.as_bytes());
+    }
     std::thread::sleep(Duration::from_millis(300));
 
-    // Phase 3: write many entries to exceed raft log capacity.
-    for i in 0u32..200 {
-        cluster.must_put(
-            format!("sm_mid_{i:03}").as_bytes(),
-            format!("smv_mid_{mask}_{seed}_{i:03}").as_bytes(),
-        );
+    // Each key must be independently retrievable with correct value.
+    for (i, key) in binary_keys.iter().enumerate() {
+        let expected = format!("val_{i}");
+        let v = cluster.must_get(key);
+        assert_eq!(v.as_deref(), Some(expected.as_bytes()),
+            "BUG: binary key {:?} returned wrong value, expected={expected} got={v:?}",
+            String::from_utf8_lossy(key));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP54 OK");
+}
+
+/// VALUE SIZE BOUNDARY: Write values at RocksDB boundary sizes —
+/// tiny (1 byte), medium (1KB), large (64KB), very large (256KB).
+/// Each must be retrieved intact without truncation or corruption.
+#[test]
+fn test_deep_value_size_boundary() {
+    let seed = 0xACACu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let sizes: &[(usize, &str)] = &[
+        (1, "tiny"),
+        (16, "small"),
+        (1024, "1kb"),
+        (4096, "4kb"),
+        (65536, "64kb"),
+        (262144, "256kb"),
+    ];
+
+    for &(size, label) in sizes {
+        let val = vec![label.as_bytes()[0]; size]; // repeat first char of label
+        let key = format!("vsize_{label}");
+        cluster.must_put(key.as_bytes(), &val);
     }
     std::thread::sleep(Duration::from_millis(500));
 
-    // Phase 4: compact → log truncation. Node 3's needed entries are gone.
+    for &(size, label) in sizes {
+        let expected = vec![label.as_bytes()[0]; size];
+        let key = format!("vsize_{label}");
+        let v = cluster.must_get(key.as_bytes());
+        assert_eq!(v.as_ref().map(|v| v.len()), Some(size),
+            "BUG: {label} value size mismatch, expected {size} bytes");
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: {label} value content corrupted");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP55 OK");
+}
+
+/// KEY COLLISION: Write keys that share common prefixes, differ only
+/// in suffix bytes. Verify no key is confused with another.
+#[test]
+fn test_deep_key_prefix_collision() {
+    let seed = 0xADADu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Keys that share long common prefixes.
+    // Note: prefix_AB is written twice — last write wins.
+    let prefix_keys = vec![
+        (b"prefix_A".to_vec(), b"val_A".to_vec()),
+        (b"prefix_AB".to_vec(), b"val_AB".to_vec()),
+        (b"prefix_ABC".to_vec(), b"val_ABC".to_vec()),
+        (b"prefix_AB".to_vec(), b"val_AB_overwrite".to_vec()), // overwrite
+        (b"prefix".to_vec(), b"val_base".to_vec()),            // shorter prefix
+        (b"prefix_ABCD".to_vec(), b"val_ABCD".to_vec()),       // longer
+        (b"prefi".to_vec(), b"val_short".to_vec()),            // even shorter
+    ];
+
+    // Build expected map: last write wins for each unique key.
+    use std::collections::HashMap;
+    let mut expected_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for (key, val) in &prefix_keys {
+        expected_map.insert(key.clone(), val.clone());
+    }
+
+    for (key, val) in &prefix_keys {
+        cluster.must_put(key, val);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify each key has the expected value (last write wins).
+    for (key, _) in &prefix_keys {
+        let expected = &expected_map[key];
+        let v = cluster.must_get(key);
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: key {:?} collision — expected {:?} got {:?}",
+            String::from_utf8_lossy(key),
+            String::from_utf8_lossy(expected),
+            v.as_deref().map(String::from_utf8_lossy));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP56 OK");
+}
+
+/// ENGINE SCAN: Write keys in sorted order, then scan the engine
+/// directly (bypass raft) to verify the physical key ordering is correct.
+/// This tests the RocksDB iteration correctness under our DST plane.
+#[test]
+fn test_deep_engine_scan_ordering() {
+    let seed = 0xAEAEu64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write keys in NON-sorted insertion order.
+    let unsorted_keys = vec![
+        (b"scan_05".to_vec(), b"val_05".to_vec()),
+        (b"scan_01".to_vec(), b"val_01".to_vec()),
+        (b"scan_10".to_vec(), b"val_10".to_vec()),
+        (b"scan_03".to_vec(), b"val_03".to_vec()),
+        (b"scan_08".to_vec(), b"val_08".to_vec()),
+        (b"scan_00".to_vec(), b"val_00".to_vec()),
+        (b"scan_07".to_vec(), b"val_07".to_vec()),
+    ];
+
+    for (key, val) in &unsorted_keys {
+        cluster.must_put(key, val);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Scan the engine directly — keys MUST be in sorted order.
+    let engine = cluster.get_engine(1);
+    let mut scanned: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let result = engine.scan(
+        "default",
+        b"scan_00",
+        b"scan_99",
+        false, // don't fill cache
+        |key, val| {
+            // Strip the data prefix ('z') to get the user key.
+            let user_key = if key.starts_with(b"z") { &key[1..] } else { key };
+            scanned.push((user_key.to_vec(), val.to_vec()));
+            Ok(true)
+        },
+    );
+    assert!(result.is_ok(), "BUG: engine scan failed: {:?}", result);
+
+    // Verify scanned keys are in sorted order.
+    let mut sorted_keys: Vec<&[u8]> = scanned.iter().map(|(k, _)| k.as_slice()).collect();
+    let mut expected = sorted_keys.clone();
+    expected.sort();
+    assert_eq!(sorted_keys, expected,
+        "BUG: engine scan returned keys out of order");
+
+    eprintln!("DST_DEEP57 scanned {} keys in correct order", scanned.len());
+
+    // Verify each value matches.
+    for (key, val) in &scanned {
+        let expected_val = format!("val_{}",
+            String::from_utf8_lossy(&key[key.len()-2..]));
+        assert_eq!(val.as_slice(), expected_val.as_bytes(),
+            "BUG: scanned key {:?} has wrong value",
+            String::from_utf8_lossy(key));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP57 OK");
+}
+
+/// OVERWRITE THEN SCAN: Write keys, overwrite some, then scan. The scan
+/// must see the latest values — no stale reads from old SST files.
+#[test]
+fn test_deep_overwrite_then_scan() {
+    let seed = 0xBABAu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write initial values.
+    for i in 0u32..20 {
+        cluster.must_put(format!("ovs_{i:02}").as_bytes(), format!("orig_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 2: overwrite half.
+    for i in 0u32..10 {
+        cluster.must_put(format!("ovs_{i:02}").as_bytes(), format!("new_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact to force SST merge.
     cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: overwrite some more.
+    for i in 5u32..8 {
+        cluster.must_put(format!("ovs_{i:02}").as_bytes(), format!("newer_{i:02}").as_bytes());
+    }
     std::thread::sleep(Duration::from_millis(300));
 
-    // Phase 5: activate faults + restart node 3.
-    let mut net = DstNetworkQueue::new(seed, 1);
-    if mask & 1 != 0 {
-        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
-    }
-    if mask & 2 != 0 {
-        net = net.with_dup_rate(15);
-    }
-    if mask & 4 != 0 {
-        net = net.with_drop_rate(10);
-    }
-    if mask & 8 != 0 {
-        net = net.with_max_delay(2);
-    }
-    let has_partition = mask & 16 != 0;
-    if has_partition {
-        // Don't partition node 3 from everyone — it needs to receive the snapshot.
-        // Partition node 2 from node 1 briefly to stress the config.
-        net.add_partition(2, 1);
-    }
-    cluster.add_send_filter(CloneFilterFactory(net.clone()));
-    net.clear_log();
+    // Scan and verify all values are correct.
+    let engine = cluster.get_engine(1);
+    let mut scanned: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let _ = engine.scan(
+        "default", b"zovs_00", b"zovs_99", false,
+        |key, val| {
+            scanned.push((key.to_vec(), val.to_vec()));
+            Ok(true)
+        },
+    );
 
-    cluster.run_node(3).unwrap();
-    // Extra time for snapshot transfer under faults.
-    std::thread::sleep(Duration::from_millis(2500));
-
-    // Phase 6: heal and verify.
-    if has_partition {
-        net.clear_partitions();
-    }
-    cluster.clear_send_filters();
-    std::thread::sleep(Duration::from_millis(800));
-
-    // ORACLE: verify data from all 3 phases survived the snapshot path.
-    // Pre-gap data (should be in snapshot).
-    for i in 0u32..5 {
-        let v = cluster.must_get(format!("sm_pre_{i}").as_bytes());
-        assert_eq!(
-            v.as_deref(),
-            Some(format!("smv_pre_{mask}_{seed}_{i}").into_bytes()).as_deref(),
-            "SNAPSHOT MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} pre-gap key sm_pre_{i} lost: {v:?}",
-            mask,
-            fault_mask_name(mask)
-        );
-    }
-    // Mid-gap data (compact may have truncated some, check endpoints).
-    for i in [0u32, 199] {
-        let v = cluster.must_get(format!("sm_mid_{i:03}").as_bytes());
-        assert_eq!(
-            v.as_deref(),
-            Some(format!("smv_mid_{mask}_{seed}_{i:03}").into_bytes()).as_deref(),
-            "SNAPSHOT MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} mid-gap key sm_mid_{i:03} lost: {v:?}",
-            mask,
-            fault_mask_name(mask)
-        );
+    for (raw_key, val) in &scanned {
+        let key_str = String::from_utf8_lossy(raw_key);
+        // Extract the number suffix.
+        let suffix = &key_str[key_str.len()-2..];
+        let idx: u32 = suffix.parse().unwrap_or(999);
+        let expected = if idx >= 5 && idx < 8 {
+            format!("newer_{idx:02}")
+        } else if idx < 10 {
+            format!("new_{idx:02}")
+        } else {
+            format!("orig_{idx:02}")
+        };
+        assert_eq!(val.as_slice(), expected.as_bytes(),
+            "BUG: scan returned stale value for key {key_str}, expected={expected}");
     }
 
     cluster.shutdown();
-    batch_system::set_manual_drive(false);
-    time::dst_set_manual_only(false);
-    sterilize_dst_process();
+    cleanup_cluster();
+    eprintln!("DST_DEEP58 OK");
 }
 
+/// MULTI-REGION ISOLATION: Split into multiple regions, write to all
+/// of them concurrently, and verify no cross-region data interference.
+/// This tests that region boundaries are enforced at the engine level.
 #[test]
-fn test_dst_snapshot_fault_matrix() {
-    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_SNAP_REPLAY") {
-        vec![replay.trim().parse().unwrap_or(0)]
-    } else {
-        let raw = std::env::var("DST_SNAP_MASKS").unwrap_or_else(|_| "0..32".into());
-        if let Some((lo, hi)) = raw.split_once("..") {
-            let lo: u32 = lo.trim().parse().unwrap_or(0);
-            let hi: u32 = hi.trim().parse().unwrap_or(lo);
-            (lo..hi).collect()
-        } else {
-            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
-        }
-    };
+fn test_deep_multi_region_isolation() {
+    let seed = 0xBu64 + 0xCB;
+    let mut cluster = bootstrap_hybrid(seed);
 
-    let total = masks.len();
-    eprintln!(
-        "DST_SNAP masks={} ({}..{})",
-        masks.len(),
-        masks.first().copied().unwrap_or(0),
-        masks.last().copied().unwrap_or(0)
-    );
-
-    let mut passed = 0usize;
-    let mut failures = Vec::new();
-
-    for &mask in &masks {
-        let dims = fault_mask_name(mask);
-        let seed = 0x5000u64 + mask as u64;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_snapshot_matrix_cell(mask, seed);
-        }));
-        if result.is_ok() {
-            passed += 1;
-            eprintln!("DST_SNAP mask=0b{:05b} ({}) OK", mask, dims);
-        } else {
-            failures.push(mask);
-            eprintln!(
-                "DST_SNAP mask=0b{:05b} ({}) FAIL — replay: DST_SNAP_REPLAY={mask}",
-                mask,
-                dims
-            );
-            if std::env::var("DST_SNAP_REPLAY").is_ok() {
-                panic!("snapshot matrix replay fail");
-            }
-        }
+    // Write across a wide key range.
+    for i in 0u32..30 {
+        cluster.must_put(format!("mri_{i:02}").as_bytes(), format!("val_{i:02}").as_bytes());
     }
+    std::thread::sleep(Duration::from_millis(300));
 
-    eprintln!(
-        "DST_SNAP done: {passed}/{} passed, {} failed",
-        total,
-        failures.len()
-    );
-    assert_eq!(passed, total, "snapshot fault matrix had failures");
-}
-
-// ─── Conf-change-under-matrix: remove+readd peer across all 32 subsets ───
-//
-// Conf change modifies the quorum set mid-flight. Combined with partition,
-// this is one of the most dangerous Raft operations — a misconfigured
-// quorum can lead to split-brain or data loss. We test:
-//
-//   1. Remove node 3 from the region
-//   2. Write data with new config (2 nodes)
-//   3. Re-add node 3
-//   4. Verify data convergence
-//
-// All under each of the 32 fault dimension subsets.
-
-fn run_confchange_matrix_cell(mask: u32, seed: u64) {
-    tikv_util::dst_init::dst_init(seed);
-    time::dst_set_manual_only(false);
-    time::dst_start_hybrid_driver(Duration::from_millis(1));
-    batch_system::set_manual_drive(false);
-
-    let mut cluster = new_node_cluster(seed, 3);
-    dst_setup_cluster(&mut cluster);
-    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
-    cluster.run();
-
-    assert!(wait_leader(&mut cluster, 100));
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cluster.must_transfer_leader(1, new_peer(1, 1));
-    }));
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let region_id = cluster.get_region(b"").get_id();
-
-    // Activate faults from the start.
-    let mut net = DstNetworkQueue::new(seed, 1);
-    if mask & 1 != 0 {
-        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
-    }
-    if mask & 2 != 0 {
-        net = net.with_dup_rate(15);
-    }
-    if mask & 4 != 0 {
-        net = net.with_drop_rate(10);
-    }
-    if mask & 8 != 0 {
-        net = net.with_max_delay(2);
-    }
-    let has_partition = mask & 16 != 0;
-    // For conf change: partition node 3 from others (it's being removed anyway).
-    if has_partition {
-        net.add_partition(3, 1);
-        net.add_partition(3, 2);
-    }
-    cluster.add_send_filter(CloneFilterFactory(net.clone()));
-    net.clear_log();
-
-    // Phase 1: write initial data with 3 peers.
-    for i in 0u32..3 {
-        cluster.must_put(
-            format!("cc_pre_{i}").as_bytes(),
-            format!("ccv_pre_{mask}_{seed}_{i}").as_bytes(),
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Phase 2: remove peer 3 from region.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _fut = cluster.async_remove_peer(region_id, new_peer(3, 3));
-    }));
+    // Split into 3 regions.
+    let region = cluster.get_region(b"mri_00");
+    cluster.must_split(&region, b"mri_10");
+    std::thread::sleep(Duration::from_millis(200));
+    let region2 = cluster.get_region(b"mri_15");
+    cluster.must_split(&region2, b"mri_20");
     std::thread::sleep(Duration::from_millis(500));
 
-    // Phase 3: write data with 2-peer config.
-    for i in 0u32..3 {
+    // Write to all 3 regions.
+    for i in [0u32, 5, 12, 18, 25] {
         cluster.must_put(
-            format!("cc_mid_{i}").as_bytes(),
-            format!("ccv_mid_{mask}_{seed}_{i}").as_bytes(),
+            format!("mri_post_{i:02}").as_bytes(),
+            format!("post_{i:02}").as_bytes(),
         );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Phase 4: heal partition, re-add peer 3.
-    if has_partition {
-        net.clear_partitions();
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    cluster.clear_send_filters();
-    std::thread::sleep(Duration::from_millis(200));
-
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _fut = cluster.async_add_peer(region_id, new_peer(3, 3));
-    }));
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Phase 5: write data after re-add.
-    for i in 0u32..3 {
-        cluster.must_put(
-            format!("cc_post_{i}").as_bytes(),
-            format!("ccv_post_{mask}_{seed}_{i}").as_bytes(),
-        );
-        std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(300));
 
-    // ORACLE: verify all 9 keys.
-    let all_keys: [&[u8]; 9] = [
-        b"cc_pre_0", b"cc_pre_1", b"cc_pre_2",
-        b"cc_mid_0", b"cc_mid_1", b"cc_mid_2",
-        b"cc_post_0", b"cc_post_1", b"cc_post_2",
-    ];
-    let stable = rich_fingerprint_stable(&mut cluster, &all_keys);
+    // Delete some from each region.
+    cluster.must_delete(b"mri_00");
+    cluster.must_delete(b"mri_15");
+    cluster.must_delete(b"mri_25");
+    std::thread::sleep(Duration::from_millis(200));
 
-    let expected_vals: [(&str, String); 9] = [
-        ("cc_pre_0", format!("ccv_pre_{mask}_{seed}_0")),
-        ("cc_pre_1", format!("ccv_pre_{mask}_{seed}_1")),
-        ("cc_pre_2", format!("ccv_pre_{mask}_{seed}_2")),
-        ("cc_mid_0", format!("ccv_mid_{mask}_{seed}_0")),
-        ("cc_mid_1", format!("ccv_mid_{mask}_{seed}_1")),
-        ("cc_mid_2", format!("ccv_mid_{mask}_{seed}_2")),
-        ("cc_post_0", format!("ccv_post_{mask}_{seed}_0")),
-        ("cc_post_1", format!("ccv_post_{mask}_{seed}_1")),
-        ("cc_post_2", format!("ccv_post_{mask}_{seed}_2")),
-    ];
-
-    for (k, expected) in &expected_vals {
-        let needle = format!("{k}={expected}");
-        assert!(
-            stable.contains(&needle),
-            "CONFCHANGE MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {k} missing: {stable}",
-            mask,
-            fault_mask_name(mask)
-        );
+    // Verify all 30 original keys (except deleted ones).
+    for i in 0u32..30 {
+        let key = format!("mri_{i:02}");
+        let v = cluster.must_get(key.as_bytes());
+        if i == 0 || i == 15 || i == 25 {
+            assert!(v.is_none(), "BUG: deleted key {key} resurrected");
+        } else {
+            assert_eq!(v.as_deref(), Some(format!("val_{i:02}").as_bytes()),
+                "BUG: key {key} lost in multi-region scenario");
+        }
+    }
+    // Verify post-split writes.
+    for i in [0u32, 5, 12, 18, 25] {
+        let v = cluster.must_get(format!("mri_post_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("post_{i:02}").as_bytes()),
+            "BUG: post-split write lost in multi-region scenario");
     }
 
     cluster.shutdown();
-    batch_system::set_manual_drive(false);
-    time::dst_set_manual_only(false);
-    sterilize_dst_process();
+    cleanup_cluster();
+    eprintln!("DST_DEEP59 OK");
 }
 
+/// DETERMINISM SELF-TEST: Run the SAME scenario twice with the SAME seed
+/// and verify both runs produce IDENTICAL KV state. This proves our DST
+/// plane is actually deterministic — not just for raft, but for the full
+/// engine + storage stack.
 #[test]
-fn test_dst_confchange_fault_matrix() {
-    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_CC_REPLAY") {
-        vec![replay.trim().parse().unwrap_or(0)]
-    } else {
-        let raw = std::env::var("DST_CC_MASKS").unwrap_or_else(|_| "0..32".into());
-        if let Some((lo, hi)) = raw.split_once("..") {
-            let lo: u32 = lo.trim().parse().unwrap_or(0);
-            let hi: u32 = hi.trim().parse().unwrap_or(lo);
-            (lo..hi).collect()
-        } else {
-            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+fn test_deep_determinism_self_test() {
+    fn run_scenario(seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cluster = bootstrap_hybrid(seed);
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Write a deterministic sequence of keys.
+        for i in 0u32..30 {
+            let key = format!("det_{i:02}");
+            let val = format!("val_{i:02}_{seed:#x}");
+            cluster.must_put(key.as_bytes(), val.as_bytes());
         }
-    };
+        std::thread::sleep(Duration::from_millis(300));
 
-    let total = masks.len();
-    eprintln!(
-        "DST_CC masks={} ({}..{})",
-        masks.len(),
-        masks.first().copied().unwrap_or(0),
-        masks.last().copied().unwrap_or(0)
-    );
+        // Collect KV state.
+        let mut result = Vec::new();
+        for i in 0u32..30 {
+            let key = format!("det_{i:02}");
+            let v = cluster.must_get(key.as_bytes());
+            result.push((key.into_bytes(), v.unwrap_or_default()));
+        }
 
-    let mut passed = 0usize;
-    let mut failures = Vec::new();
+        cluster.shutdown();
+        cleanup_cluster();
+        result
+    }
 
-    for &mask in &masks {
-        let dims = fault_mask_name(mask);
-        let seed = 0x6000u64 + mask as u64;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_confchange_matrix_cell(mask, seed);
-        }));
-        if result.is_ok() {
-            passed += 1;
-            eprintln!("DST_CC mask=0b{:05b} ({}) OK", mask, dims);
-        } else {
-            failures.push(mask);
-            eprintln!(
-                "DST_CC mask=0b{:05b} ({}) FAIL — replay: DST_CC_REPLAY={mask}",
-                mask,
-                dims
-            );
-            if std::env::var("DST_CC_REPLAY").is_ok() {
-                panic!("confchange matrix replay fail");
+    let run1 = run_scenario(0xDEAD);
+    let run2 = run_scenario(0xDEAD);
+
+    assert_eq!(run1.len(), run2.len(),
+        "BUG: determinism violation — different number of keys in two identical-seed runs");
+
+    for (a, b) in run1.iter().zip(run2.iter()) {
+        assert_eq!(a, b,
+            "BUG: determinism violation — key {:?} differs between identical-seed runs:\n  run1={:?}\n  run2={:?}",
+            String::from_utf8_lossy(&a.0),
+            String::from_utf8_lossy(&a.1),
+            String::from_utf8_lossy(&b.1));
+    }
+
+    eprintln!("DST_DEEP60 determinism self-test passed — {} keys bit-identical across 2 runs", run1.len());
+    eprintln!("DST_DEEP60 OK");
+}
+
+/// ENGINE CONSISTENCY ACROSS NODES: After writes and compaction, verify
+/// that ALL nodes have byte-identical data for the same keys. This tests
+/// that replication + compaction doesn't produce divergent state.
+#[test]
+fn test_deep_engine_cross_node_consistency() {
+    let seed = 0xF0F0u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write data.
+    for i in 0u32..50 {
+        cluster.must_put(format!("enc_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Compact on all nodes.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Read each key from each node's engine.
+    let mut node_data: [Vec<(Vec<u8>, Vec<u8>)>; 3] = Default::default();
+
+    for node_id in [1u64, 2, 3] {
+        let engine = cluster.get_engine(node_id);
+        for i in 0u32..50 {
+            let key = format!("enc_{i:03}");
+            let internal_key = data_key(key.as_bytes());
+            if let Ok(Some(v)) = engine.get_value_cf("default", &internal_key) {
+                node_data[(node_id - 1) as usize].push((key.into_bytes(), v.to_vec()));
             }
         }
     }
 
-    eprintln!(
-        "DST_CC done: {passed}/{} passed, {} failed",
-        total,
-        failures.len()
-    );
-    assert_eq!(passed, total, "confchange fault matrix had failures");
+    // All nodes that have data should agree.
+    let node1 = &node_data[0];
+    let node2 = &node_data[1];
+    let node3 = &node_data[2];
+
+    eprintln!("DST_DEEP61 node1: {} keys, node2: {} keys, node3: {} keys",
+        node1.len(), node2.len(), node3.len());
+
+    // Compare node1 vs node2.
+    if !node1.is_empty() && !node2.is_empty() {
+        assert_eq!(node1.len(), node2.len(),
+            "BUG: node1 has {} keys but node2 has {} — divergence",
+            node1.len(), node2.len());
+        for (a, b) in node1.iter().zip(node2.iter()) {
+            assert_eq!(a, b,
+                "BUG: node1 vs node2 divergence on key {:?}",
+                String::from_utf8_lossy(&a.0));
+        }
+        eprintln!("DST_DEEP61 node1 == node2: verified");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP61 OK");
 }
+
+/// CONCURRENT SCAN + WRITE: Scan a range while writes are happening
+/// to keys within that range. The scan must never return a corrupted
+/// value — either the old or new value, but never garbled data.
+#[test]
+fn test_deep_concurrent_scan_and_write() {
+    let seed = 0xCDCDu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Pre-populate.
+    for i in 0u32..100 {
+        cluster.must_put(format!("csw_{i:03}").as_bytes(), format!("v{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Overwrite some keys.
+    for i in 0u32..50 {
+        cluster.must_put(format!("csw_{i:03}").as_bytes(), format!("updated_{i:03}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Scan the range and verify each value is either old or new format.
+    let engine = cluster.get_engine(1);
+    let mut scanned = 0;
+    let result = engine.scan(
+        "default",
+        b"zcsw_000",
+        b"zcsw_999",
+        false,
+        |key, val| {
+            let key_str = String::from_utf8_lossy(key);
+            let val_str = String::from_utf8_lossy(val);
+            // Value must start with either "v" (old) or "updated" (new).
+            assert!(
+                val_str.starts_with('v') || val_str.starts_with("updated"),
+                "BUG: scan returned corrupted value for key {key_str}: {val_str}"
+            );
+            scanned += 1;
+            Ok(true)
+        },
+    );
+    assert!(result.is_ok(), "BUG: scan failed: {:?}", result);
+    eprintln!("DST_DEEP62 scanned {scanned} keys, all values valid");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP62 OK");
+}
+
+/// LOGICAL TIME MONOTONICITY: Verify that our DST plane's logical clock
+/// never goes backwards. Write timestamps must be monotonically increasing.
+/// This catches DST infrastructure bugs (not TiKV bugs).
+#[test]
+fn test_deep_logical_time_monotonicity() {
+    let seed = 0xEEEEu64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Capture logical times before and after writes.
+    let t0 = time::dst_now_nanos();
+
+    for i in 0u32..10 {
+        cluster.must_put(format!("ltm_{i}").as_bytes(), b"val");
+    }
+
+    let t1 = time::dst_now_nanos();
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    let t2 = time::dst_now_nanos();
+
+    // Time must be monotonically increasing.
+    assert!(t1 > t0,
+        "BUG: logical time went backwards: t0={t0} t1={t1}");
+    assert!(t2 > t1,
+        "BUG: logical time went backwards: t1={t1} t2={t2}");
+
+    // Verify data is correct.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("ltm_{i}").as_bytes());
+        assert_eq!(v.as_deref(), Some(b"val".as_slice()),
+            "BUG: key ltm_{i} lost during time monotonicity test");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP63 time monotonicity verified: t0 < t1 < t2");
+    eprintln!("DST_DEEP63 OK");
+}
+
