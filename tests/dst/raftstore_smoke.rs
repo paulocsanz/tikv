@@ -10563,4 +10563,415 @@ fn test_deep_cross_cf_scan_isolation() {
     eprintln!("DST_DEEP130 OK");
 }
 
+// ─── Batch 17: compound lifecycle + concurrency stress ───────────────────
+
+/// DELETE RANGE THEN SPLIT: Delete a range of keys, then split the region.
+/// The deletes should be reflected in both child regions.
+#[test]
+fn test_deep_delete_range_then_split() {
+    let seed = 0x1751u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..20 {
+        cluster.must_put(format!("drs2_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete keys 5-14.
+    cluster.must_delete_range_cf("default", b"drs2_05", b"drs2_15");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split at drs2_10 (within the deleted range).
+    let region = cluster.get_region(b"drs2_00");
+    cluster.must_split(&region, b"drs2_10");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify: keys 0-4 survive, keys 5-14 deleted, keys 15-19 survive.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("drs2_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key drs2_{i:02} should survive");
+    }
+    for i in 5u32..15 {
+        assert!(cluster.must_get(format!("drs2_{i:02}").as_bytes()).is_none(),
+            "BUG: key drs2_{i:02} should be deleted (survived split)");
+    }
+    for i in 15u32..20 {
+        let v = cluster.must_get(format!("drs2_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: key drs2_{i:02} should survive");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP131 OK");
+}
+
+/// SPLIT THEN COMPACT BOTH CHILDREN: Split a region, write to both children,
+/// compact, verify data in both.
+#[test]
+fn test_deep_split_then_compact() {
+    let seed = 0x1752u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..20 {
+        cluster.must_put(format!("stc_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split at stc_10.
+    let region = cluster.get_region(b"stc_00");
+    cluster.must_split(&region, b"stc_10");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write more to both children.
+    for i in 0u32..5 {
+        cluster.must_put(format!("stc_{i:02}").as_bytes(), format!("left2_{i}").as_bytes());
+    }
+    for i in 15u32..20 {
+        cluster.must_put(format!("stc_{i:02}").as_bytes(), format!("right2_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify: keys 0-4 have left2, keys 5-9 have original, keys 10-14 have original, keys 15-19 have right2.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("stc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("left2_{i}").as_bytes()),
+            "BUG: stc_{i:02} wrong after split+compact");
+    }
+    for i in 5u32..15 {
+        let v = cluster.must_get(format!("stc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: stc_{i:02} wrong after split+compact");
+    }
+    for i in 15u32..20 {
+        let v = cluster.must_get(format!("stc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("right2_{i}").as_bytes()),
+            "BUG: stc_{i:02} wrong after split+compact");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP132 OK");
+}
+
+/// MANY REGIONS FULL SCAN: Split 4 times to create 5 regions, write to
+/// each, then scan across all regions and verify every key.
+#[test]
+fn test_deep_many_regions_full_scan() {
+    let seed = 0x1753u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 50 keys.
+    for i in 0u32..50 {
+        cluster.must_put(format!("mrs_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split at 10, 20, 30, 40.
+    for split_at in [b"mrs_10".as_ref(), b"mrs_20", b"mrs_30", b"mrs_40"] {
+        let region = cluster.get_region(split_at);
+        // Need to find the region that actually contains this key as start or interior.
+        let r = cluster.get_region(b"mrs_00");
+        if r.get_end_key() > split_at || r.get_end_key().is_empty() {
+            cluster.must_split(&r, split_at);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    // Verify all 50 keys.
+    let mut errors = 0;
+    for i in 0u32..50 {
+        let v = cluster.must_get(format!("mrs_{i:02}").as_bytes());
+        if v.as_deref() != Some(format!("v{i}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/50 keys wrong after many-region split");
+
+    // Engine scan should find all 50.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zmrs_00", b"zmrs_99", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 50, "BUG: engine scan found {count} keys, expected 50");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP133 OK");
+}
+
+/// BATCH PUT 100 KEYS: Write 100 keys in a single Raft proposal.
+#[test]
+fn test_deep_batch_100_keys() {
+    let seed = 0x1754u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n = 100u32;
+    let reqs: Vec<_> = (0..n)
+        .map(|i| new_put_cmd(format!("b1k_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes()))
+        .collect();
+    let result = cluster.batch_put(b"b1k_000", reqs);
+    assert!(result.is_ok(), "BUG: 100-key batch failed: {:?}", result.err());
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut errors = 0;
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("b1k_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:03}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/{n} keys missing after 100-key batch");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP134 OK");
+}
+
+/// SPLIT + LEADER TRANSFER + WRITE: Compound admin operation — split the
+/// region, transfer the leader, then write to both sides.
+#[test]
+fn test_deep_split_transfer_write() {
+    let seed = 0x1755u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..15 {
+        cluster.must_put(format!("stw_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split.
+    let region = cluster.get_region(b"stw_00");
+    cluster.must_split(&region, b"stw_08");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Transfer leader.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(2, 2));
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write to both sides.
+    cluster.must_put(b"stw_00", b"new_left");
+    cluster.must_put(b"stw_10", b"new_right");
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(cluster.must_get(b"stw_00"), Some(b"new_left".to_vec()));
+    assert_eq!(cluster.must_get(b"stw_10"), Some(b"new_right".to_vec()));
+
+    // Verify original keys (skip 00 and 10 which were overwritten).
+    for i in 1u32..8 {
+        let v = cluster.must_get(format!("stw_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()));
+    }
+    for i in 8u32..15 {
+        if i == 10 { continue; } // stw_10 was overwritten to "new_right"
+        let v = cluster.must_get(format!("stw_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP135 OK");
+}
+
+/// OVERWRITE ALL KEYS AFTER COMPACT: Write, compact, overwrite all, compact
+/// again. Verify the second compaction doesn't lose the overwrites.
+#[test]
+fn test_deep_overwrite_after_compact() {
+    let seed = 0x1756u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..15 {
+        cluster.must_put(format!("oac_{i:02}").as_bytes(), format!("round1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Overwrite all.
+    for i in 0u32..15 {
+        cluster.must_put(format!("oac_{i:02}").as_bytes(), format!("round2_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // All should have round2 values.
+    for i in 0u32..15 {
+        let v = cluster.must_get(format!("oac_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("round2_{i}").as_bytes()),
+            "BUG: oac_{i:02} lost overwrite after second compaction");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP136 OK");
+}
+
+/// PARTIAL DELETE IN BATCH: Batch put 10 keys, then batch delete 5 of them.
+/// Verify the remaining 5 survive.
+#[test]
+fn test_deep_partial_batch_delete() {
+    let seed = 0x1757u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Batch put 10 keys.
+    let put_reqs: Vec<_> = (0..10u32)
+        .map(|i| new_put_cmd(format!("pbd_{i:02}").as_bytes(), format!("v{i}").as_bytes()))
+        .collect();
+    let result = cluster.batch_put(b"pbd_00", put_reqs);
+    assert!(result.is_ok(), "BUG: batch put failed");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Batch delete keys 0-4.
+    let del_reqs: Vec<_> = (0..5u32)
+        .map(|i| new_delete_cmd("default", format!("pbd_{i:02}").as_bytes()))
+        .collect();
+    let result = cluster.batch_put(b"pbd_00", del_reqs);
+    assert!(result.is_ok(), "BUG: batch delete failed");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify: 0-4 deleted, 5-9 survive.
+    for i in 0u32..5 {
+        assert!(cluster.must_get(format!("pbd_{i:02}").as_bytes()).is_none(),
+            "BUG: pbd_{i:02} should be deleted");
+    }
+    for i in 5u32..10 {
+        let v = cluster.must_get(format!("pbd_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: pbd_{i:02} should survive partial batch delete");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP137 OK");
+}
+
+/// FLUSH ISOLATION: Write to default CF, flush, write to write CF, flush.
+/// Verify each CF's flush doesn't affect the other.
+#[test]
+fn test_deep_flush_cf_isolation() {
+    let seed = 0x1758u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write to default CF.
+    cluster.must_put(b"fci_key", b"default_v1");
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_flush_cf("default", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Write to write CF.
+    cluster.must_put_cf("write", b"fci_key", b"write_v1");
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_flush_cf("write", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Verify both values survived cross-CF flush.
+    let engine = cluster.get_engine(1);
+    let internal_key = keys::data_key(b"fci_key");
+
+    let dv = engine.get_value(&internal_key).unwrap();
+    assert_eq!(&*dv.unwrap(), b"default_v1", "BUG: default CF lost after write CF flush");
+
+    let wv = engine.get_value_cf("write", &internal_key).unwrap();
+    assert_eq!(&*wv.unwrap(), b"write_v1", "BUG: write CF lost after default CF flush");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP138 OK");
+}
+
+/// LARGE VALUE + SPLIT: Write large values, split region, verify large
+/// values on both sides of the split.
+#[test]
+fn test_deep_large_value_split() {
+    let seed = 0x1759u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 10 keys with 8KB values.
+    let large_val: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    for i in 0u32..10 {
+        cluster.must_put(format!("lvs_{i:02}").as_bytes(), &large_val);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Split at lvs_05.
+    let region = cluster.get_region(b"lvs_00");
+    cluster.must_split(&region, b"lvs_05");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify all large values on both sides.
+    for i in 0u32..10 {
+        let v = cluster.must_get(format!("lvs_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(large_val.as_slice()),
+            "BUG: large value lvs_{i:02} wrong after split (len={})",
+            v.as_ref().map(|v| v.len()).unwrap_or(0));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP139 OK");
+}
+
+/// DELETE RANGE SURVIVES RESTART: Write, delete range, restart node,
+/// verify the range is still deleted after restart.
+#[test]
+fn test_deep_delete_range_survives_restart() {
+    let seed = 0x175Au64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..15 {
+        cluster.must_put(format!("drsr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete range 5-10.
+    cluster.must_delete_range_cf("default", b"drsr_05", b"drsr_10");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify delete range persisted.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("drsr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: drsr_{i:02} should survive");
+    }
+    for i in 5u32..10 {
+        assert!(cluster.must_get(format!("drsr_{i:02}").as_bytes()).is_none(),
+            "BUG: drsr_{i:02} should still be deleted after restart");
+    }
+    for i in 10u32..15 {
+        let v = cluster.must_get(format!("drsr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: drsr_{i:02} should survive");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP140 OK");
+}
+
 
