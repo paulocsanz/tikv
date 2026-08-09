@@ -11686,3 +11686,221 @@ fn test_dst_delete_range_fault_matrix() {
     );
     assert_eq!(passed, total, "delete-range fault matrix had failures");
 }
+
+// ─── Cascade failure matrix: kill leader → elect → kill new leader → elect ─
+fn run_cascade_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Phase 1: write initial data under leader 1.
+    for i in 0u32..4 {
+        let k = format!("cf_p1_{i}");
+        cluster.must_put(k.as_bytes(), format!("v1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        // Don't partition for cascade — killing nodes is enough chaos.
+        // Partition would prevent election entirely.
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Phase 2: KILL leader (node 1).
+    cluster.stop_node(1);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Wait for {2,3} to elect a new leader. Try writing.
+    let mut leader2 = None;
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(50));
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(b"cf_elect1", b"ok");
+        }))
+        .is_ok();
+        if ok {
+            leader2 = cluster.leader_of_region(1).map(|p| p.get_store_id());
+            break;
+        }
+    }
+
+    // Write under new leader.
+    let l2 = leader2.unwrap_or(0);
+    for i in 0u32..4 {
+        let k = format!("cf_p2_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(k.as_bytes(), format!("v2_{i}_{l2}").as_bytes());
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 3: KILL the second leader too.
+    if l2 != 0 && l2 != 1 {
+        cluster.stop_node(l2);
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Only 1 node alive — can't elect. Restart one node to restore quorum.
+        cluster.run_node(1).unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+
+        // Wait for {1, surviving_node} to elect.
+        let mut leader3 = None;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(50));
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cluster.must_put(b"cf_elect2", b"ok");
+            }))
+            .is_ok();
+            if ok {
+                leader3 = cluster.leader_of_region(1).map(|p| p.get_store_id());
+                break;
+            }
+        }
+
+        // Write under third leader.
+        let l3 = leader3.unwrap_or(0);
+        for i in 0u32..4 {
+            let k = format!("cf_p3_{i}");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cluster.must_put(k.as_bytes(), format!("v3_{i}_{l3}").as_bytes());
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Restart the killed second leader.
+        cluster.run_node(l2).unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+
+    // Heal.
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(800));
+
+    // ORACLE: all keys from all phases must be readable.
+    // Values are unique per mask+seed, so we can verify exact values.
+    for i in 0u32..4 {
+        let k = format!("cf_p1_{i}");
+        let v = cluster.must_get(k.as_bytes());
+        assert_eq!(
+            v.as_deref(),
+            Some(format!("v1_{i}").as_bytes()),
+            "CASCADE VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} p1 key {k} = {v:?}",
+            mask,
+            fault_mask_name(mask)
+        );
+    }
+    // Phase 2 keys — verify they exist (value may vary by leader).
+    for i in 0u32..4 {
+        let k = format!("cf_p2_{i}");
+        let v = cluster.must_get(k.as_bytes());
+        assert!(
+            v.is_some(),
+            "CASCADE VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} p2 key {k} lost",
+            mask,
+            fault_mask_name(mask)
+        );
+    }
+    // Phase 3 keys (if cascade happened).
+    if l2 != 0 && l2 != 1 {
+        for i in 0u32..4 {
+            let k = format!("cf_p3_{i}");
+            let v = cluster.must_get(k.as_bytes());
+            assert!(
+                v.is_some(),
+                "CASCADE VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} p3 key {k} lost",
+                mask,
+                fault_mask_name(mask)
+            );
+        }
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_cascade_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_CASCADE_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_CASCADE_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_CASCADE masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0xE000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_cascade_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_CASCADE mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_CASCADE mask=0b{:05b} ({}) FAIL — replay: DST_CASCADE_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_CASCADE_REPLAY").is_ok() {
+                panic!("cascade matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_CASCADE done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "cascade fault matrix had failures");
+}
