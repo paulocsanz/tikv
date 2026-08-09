@@ -7249,5 +7249,322 @@ fn test_deep_delete_all_rewrite() {
     cluster.shutdown();
     cleanup_cluster();
     eprintln!("DST_DEEP73 OK");
+// ─── Split-under-matrix: region split across all 32 fault subsets ────────
+//
+// Region split is TiKV-specific: it creates new Raft groups and changes
+// request routing. This is more complex than simple conf change because:
+//   - The new region needs its own leader election
+//   - The PD must be notified of the new region
+//   - Keys on both sides of the split must be routed correctly
+//   - The split must be atomic (no key visible in both regions)
+
+fn run_split_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Pre-split writes: keys on both sides of split point.
+    cluster.must_put(b"sm_aaa", b"val_aaa");
+    cluster.must_put(b"sm_mmm", b"val_mmm");
+    cluster.must_put(b"sm_zzz", b"val_zzz");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Split at "sm_mmm".
+    let region = cluster.get_region(b"sm_aaa");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_split(&region, b"sm_mmm");
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write keys in both child regions.
+    cluster.must_put(b"sm_bbb", b"val_bbb");
+    cluster.must_put(b"sm_nnn", b"val_nnn");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Heal + converge.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: all 5 keys must be readable with correct values.
+    let keys: [&[u8]; 5] = [b"sm_aaa", b"sm_mmm", b"sm_zzz", b"sm_bbb", b"sm_nnn"];
+    for k in &keys {
+        let v = cluster.must_get(k);
+        let expected = match *k {
+            b"sm_aaa" => Some(b"val_aaa".to_vec()),
+            b"sm_mmm" => Some(b"val_mmm".to_vec()),
+            b"sm_zzz" => Some(b"val_zzz".to_vec()),
+            b"sm_bbb" => Some(b"val_bbb".to_vec()),
+            b"sm_nnn" => Some(b"val_nnn".to_vec()),
+            _ => None,
+        };
+        assert_eq!(
+            v, expected,
+            "SPLIT MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {} lost: {v:?}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    // Verify two distinct regions exist.
+    let r_left = cluster.get_region(b"sm_aaa");
+    let r_right = cluster.get_region(b"sm_nnn");
+    assert_ne!(
+        r_left.get_id(),
+        r_right.get_id(),
+        "SPLIT MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} split did not create two regions",
+        mask,
+        fault_mask_name(mask)
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_split_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_SPLIT_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_SPLIT_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_SPLIT masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0x7000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_split_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_SPLIT mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_SPLIT mask=0b{:05b} ({}) FAIL — replay: DST_SPLIT_REPLAY={mask}",
+                mask,
+                dims
+            );
+            if std::env::var("DST_SPLIT_REPLAY").is_ok() {
+                panic!("split matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_SPLIT done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "split fault matrix had failures");
+}
+
+// ─── 5-node matrix: richer quorum dynamics under all 32 fault subsets ────
+//
+// A 5-node cluster has fundamentally different quorum dynamics:
+//   - Majority = 3 (not 2), so you can lose 2 nodes
+//   - More partition topologies (3+2, 3+1+1, 2+2+1)
+//   - Elections have more candidates
+//
+// This tests whether Raft safety holds with 5 nodes under all fault subsets.
+
+fn run_5node_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 5);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        // In 5-node: isolate nodes 4 and 5 from the majority {1,2,3}.
+        net.add_partition(4, 1);
+        net.add_partition(4, 2);
+        net.add_partition(4, 3);
+        net.add_partition(5, 1);
+        net.add_partition(5, 2);
+        net.add_partition(5, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Write keys under faults.
+    let keys: [&[u8]; 5] = [b"fn_0", b"fn_1", b"fn_2", b"fn_3", b"fn_4"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("fnv_{mask}_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Heal + converge.
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: all 5 keys must converge.
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=fnv_{mask}_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "5NODE MATRIX VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {} missing: {stable}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_5node_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_5N_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_5N_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+
+    let total = masks.len();
+    eprintln!(
+        "DST_5N masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0x8000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_5node_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_5N mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_5N mask=0b{:05b} ({}) FAIL — replay: DST_5N_REPLAY={mask}",
+                mask,
+                dims
+            );
+            if std::env::var("DST_5N_REPLAY").is_ok() {
+                panic!("5node matrix replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_5N done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "5node fault matrix had failures");
 }
 
