@@ -3854,6 +3854,105 @@ fn test_dst_fault_matrix_exhaustive() {
     }
 }
 
+// ─── Swarm testing: random-mask sampling instead of exhaustive enumeration ──
+//
+// The exhaustive 32-cell sweep above enumerates the full 2^5 fault-dimension
+// product -- by construction that already covers every subset-omission
+// pattern this 5-dimension vocabulary can express. Swarm sampling's real
+// payoff shows up once a fault vocabulary grows past what's exhaustively
+// enumerable, or when you want to spend a large trial budget on repeated
+// independent draws instead of a fixed seeds-per-mask allocation. This
+// validates the sampling mechanism against the current vocabulary so it's
+// ready to point at a larger one later without a redesign.
+//
+// Trial `i`'s (mask, seed) pair is a pure function of (DST_SWARM_SEED, i),
+// so the whole run reproduces from one seed, and DST_SWARM_REPLAY=<i>
+// reproduces a single failing trial exactly without needing to record its
+// drawn mask/seed anywhere.
+
+#[test]
+fn test_dst_swarm_matrix() {
+    let swarm_seed: u64 = std::env::var("DST_SWARM_SEED")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0x5EA2_5EED_5A0C_5EED_u64);
+
+    let n_trials: usize = std::env::var("DST_SWARM_TRIALS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(24);
+
+    let replay_idx: Option<usize> = std::env::var("DST_SWARM_REPLAY")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+
+    let trial_indices: Vec<usize> = if let Some(i) = replay_idx {
+        vec![i]
+    } else {
+        (0..n_trials).collect()
+    };
+
+    eprintln!(
+        "DST_SWARM swarm_seed={swarm_seed:#x} trials={}",
+        trial_indices.len()
+    );
+
+    let mut passed = 0usize;
+    let mut failed: Vec<(usize, u32, u64)> = Vec::new();
+
+    for &i in &trial_indices {
+        // Two decorrelated draws from (swarm_seed, i): which mask, and the
+        // cell's own seed. Distinct multipliers keep them from lining up.
+        let mut mask_rng = DstRng::seed_from_u64(
+            swarm_seed
+                .wrapping_add(i as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        );
+        let mask: u32 = mask_rng.gen_range(0..32u32);
+        let seed_val = swarm_seed
+            .wrapping_add((i as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+            .wrapping_add(mask as u64);
+        let dims = fault_mask_name(mask);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_fault_matrix_cell(mask, seed_val);
+        }));
+        if result.is_ok() {
+            passed += 1;
+        } else {
+            failed.push((i, mask, seed_val));
+            eprintln!(
+                "DST_SWARM FAIL trial={i} mask=0b{:05b} ({dims}) seed={seed_val:#x}",
+                mask
+            );
+            if replay_idx.is_some() {
+                panic!("swarm replay fail");
+            }
+        }
+    }
+
+    eprintln!(
+        "DST_SWARM done: {passed}/{} trials passed, {} failed",
+        trial_indices.len(),
+        failed.len()
+    );
+
+    if !failed.is_empty() {
+        let hints: Vec<String> = failed
+            .iter()
+            .map(|(i, m, s)| format!("trial={i} (mask={m} seed={s:#x})"))
+            .collect();
+        eprintln!("Replay with: DST_SWARM_SEED={swarm_seed:#x} DST_SWARM_REPLAY=<trial>");
+        panic!(
+            "swarm matrix failed: {}/{} trials. First fail: {}. Replay hints: {}",
+            failed.len(),
+            trial_indices.len(),
+            hints.first().unwrap(),
+            hints.join(", ")
+        );
+    }
+}
+
 // ─── Buggification: baseline probabilistic perturbation on every cell ──
 //
 // FoundationDB-BUGGIFY-style: instead of only the fault dimensions a mask
