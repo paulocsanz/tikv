@@ -3854,6 +3854,179 @@ fn test_dst_fault_matrix_exhaustive() {
     }
 }
 
+// ─── Buggification: baseline probabilistic perturbation on every cell ──
+//
+// FoundationDB-BUGGIFY-style: instead of only the fault dimensions a mask
+// schedules, every cell (including mask=0, "no faults") additionally gets a
+// small independent chance of a drop or duplicate on *every* message. Scheduled
+// fault injection only ever exercises retry/recovery paths on the specific
+// cells that scheduled them; buggification exercises those same paths on
+// runs that were never supposed to need them, which is where FoundationDB's
+// own BUGGIFY macro found the bulk of its historical bugs.
+//
+// `DstNetworkQueue::with_buggify` guarantees 0% reproduces the exact prior
+// rng-call sequence (see its doc comment), so this is purely additive: the
+// existing `test_dst_fault_matrix_exhaustive` 32-cell sweep is untouched by
+// this test existing.
+
+fn run_buggified_matrix_cell(mask: u32, seed: u64, buggify_pct: u32) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Same mask-driven dimension selection as run_fault_matrix_cell, plus an
+    // always-on buggify roll regardless of which (if any) bits are set.
+    let mut net = DstNetworkQueue::new(seed, 1).with_buggify(buggify_pct);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(2, 1);
+        net.add_partition(2, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    let keys: [&[u8]; 3] = [b"bg_1", b"bg_2", b"bg_3"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("bgv_{mask}_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(400));
+
+    // ORACLE: identical to run_fault_matrix_cell -- all keys converge with
+    // correct values, even under the added buggify noise.
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=bgv_{mask}_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "BUGGIFY SAFETY VIOLATION: mask=0b{:05b} ({}) buggify_pct={buggify_pct} seed={seed:#x} key {} missing: {stable}",
+            mask,
+            fault_mask_name(mask),
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
+#[test]
+fn test_dst_buggified_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_BUGGIFY_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_BUGGIFY_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        }
+    };
+    let n_seeds: usize = std::env::var("DST_BUGGIFY_SEEDS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2);
+    let buggify_pct: u32 = std::env::var("DST_BUGGIFY_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2);
+
+    let total = masks.len() * n_seeds;
+    eprintln!(
+        "DST_BUGGIFY masks={} buggify_pct={buggify_pct}% seeds_per_mask={} total_cells={}",
+        masks.len(),
+        n_seeds,
+        total
+    );
+
+    let mut passed = 0usize;
+    let mut failed_cells: Vec<(u32, u64)> = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        for seed in 0..n_seeds as u64 {
+            // Distinct seed space from run_fault_matrix_cell's own 0x1000*mask
+            // scaling, so the two matrices never accidentally replay the same
+            // schedule.
+            let seed_val = seed
+                .wrapping_add(0x2000 * mask as u64)
+                .wrapping_add(0xB0770001);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_buggified_matrix_cell(mask, seed_val, buggify_pct);
+            }));
+            if result.is_ok() {
+                passed += 1;
+            } else {
+                failed_cells.push((mask, seed_val));
+                eprintln!(
+                    "DST_BUGGIFY FAIL mask=0b{:05b} ({}) seed={seed_val:#x}",
+                    mask, dims
+                );
+                if std::env::var("DST_BUGGIFY_REPLAY").is_ok() {
+                    panic!("buggify replay fail");
+                }
+            }
+        }
+    }
+
+    eprintln!("DST_BUGGIFY done: {passed}/{total} cells passed, {} failed", failed_cells.len());
+
+    if !failed_cells.is_empty() {
+        let replay_hints: Vec<String> = failed_cells
+            .iter()
+            .map(|(m, s)| format!("mask={m} seed={s:#x}"))
+            .collect();
+        panic!(
+            "buggified matrix failed: {}/{total} cells. First fail: {}. Replay hints: {}",
+            failed_cells.len(),
+            replay_hints.first().unwrap(),
+            replay_hints.join(", ")
+        );
+    }
+}
+
 // ─── Deep fault batch 3: edge-case safety oracles ────────────────────
 
 /// Transfer leadership to a lagging follower (node 3), which is behind
