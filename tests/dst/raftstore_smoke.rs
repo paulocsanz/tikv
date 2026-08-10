@@ -8401,6 +8401,212 @@ fn test_dst_read_consistency_fault_matrix() {
     );
     assert_eq!(passed, total, "read consistency fault matrix had failures");
 }
+
+// ─── Continuous property checking: sampled throughout the fault window ──
+//
+// Every oracle above (including the read-consistency matrix just above)
+// checks correctness *once*, either after heal+settle, or at one fixed
+// point mid-chaos. A property that's violated for a brief window and then
+// "heals" itself before that one check runs is invisible to both -- this is
+// exactly the gap Antithesis's "continuous property checking" targets:
+// properties checked *during* the whole run, not only at chosen points.
+//
+// This harness is deliberately single-threaded/cooperative (nothing here
+// spawns a real concurrent verifier thread -- see dst_net.rs's own design
+// notes on why a second thread touching cluster state would itself be a
+// source of nondeterminism). So "continuous" here means: interleave a
+// non-blocking read-consistency pass between every write, at N points
+// spread across the *entire* active-fault window, all on the same
+// deterministic driving thread -- not a background thread racing the test.
+//
+// To make the mechanism's own value legible (not just "0 violations, trust
+// me"), each cell separately tracks what a single fixed-point check at the
+// window's midpoint *would* have seen vs. what continuous sampling actually
+// saw, and reports the two counts distinctly.
+
+fn run_continuous_check_cell(mask: u32, seed: u64) -> (usize, usize) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let keys: [[u8; 6]; 3] = [*b"cc_k00", *b"cc_k01", *b"cc_k02"];
+    let vals_v0: [Vec<u8>; 3] = std::array::from_fn(|i| format!("cc_v0_{mask}_{seed}_{i}").into_bytes());
+    for (k, v) in keys.iter().zip(vals_v0.iter()) {
+        cluster.must_put(k, v);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // N rounds, each writing one rotating key then immediately sampling all
+    // three -- spread across the whole active-fault window rather than one
+    // spot check. `known_good[i]` accumulates every value key i has ever
+    // legitimately held (v0, plus every vN written for it so far), so a
+    // read is only a violation if it matches *none* of them -- the same
+    // never-flag-legitimate-unavailability discipline as the read-consistency
+    // matrix's oracle above, just re-checked every round instead of once.
+    const ROUNDS: usize = 10;
+    const MIDPOINT: usize = ROUNDS / 2;
+    let mut known_good: [Vec<Vec<u8>>; 3] = std::array::from_fn(|i| vec![vals_v0[i].clone()]);
+    let mut continuous_violations = 0usize;
+    let mut midpoint_only_violations = 0usize;
+
+    for round in 0..ROUNDS {
+        let write_idx = round % keys.len();
+        let new_val = format!("cc_v{}_{mask}_{seed}_{write_idx}", round + 1).into_bytes();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(&keys[write_idx], &new_val);
+        }));
+        known_good[write_idx].push(new_val);
+        std::thread::sleep(Duration::from_millis(25));
+
+        for (idx, k) in keys.iter().enumerate() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cluster.get(k)));
+            if let Some(v) = result.ok().flatten() {
+                if !known_good[idx].iter().any(|good| *good == v) {
+                    continuous_violations += 1;
+                    if round == MIDPOINT {
+                        midpoint_only_violations += 1;
+                    }
+                    eprintln!(
+                        "CONTINUOUS VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} round={round} key={} got {:?}",
+                        mask, fault_mask_name(mask), String::from_utf8_lossy(k), String::from_utf8_lossy(&v)
+                    );
+                }
+            }
+        }
+    }
+
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Final oracle: last writer per key must have won after settle.
+    for (idx, k) in keys.iter().enumerate() {
+        let expected = known_good[idx].last().unwrap();
+        assert_eq!(
+            cluster.must_get(k).as_ref(),
+            Some(expected),
+            "SAFETY VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {} did not settle to last write",
+            mask, fault_mask_name(mask), String::from_utf8_lossy(k)
+        );
+    }
+    assert_eq!(
+        continuous_violations, 0,
+        "phantom read detected mid-window under continuous checking (mask=0b{mask:05b} seed={seed:#x})"
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+
+    (continuous_violations, midpoint_only_violations)
+}
+
+#[test]
+fn test_dst_continuous_property_check() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_CC_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_CC_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+    let n_seeds: usize = std::env::var("DST_CC_SEEDS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2);
+
+    let mut passed = 0usize;
+    let mut failed_cells: Vec<(u32, u64)> = Vec::new();
+    let mut total_continuous_violations = 0usize;
+    let mut total_midpoint_only = 0usize;
+
+    for &mask in &masks {
+        for seed in 0..n_seeds as u64 {
+            let seed_val = seed.wrapping_add(0x3000 * mask as u64).wrapping_add(0xC0117);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_continuous_check_cell(mask, seed_val)
+            }));
+            match result {
+                Ok((cont, mid)) => {
+                    passed += 1;
+                    total_continuous_violations += cont;
+                    total_midpoint_only += mid;
+                }
+                Err(_) => {
+                    failed_cells.push((mask, seed_val));
+                    eprintln!(
+                        "DST_CONTINUOUS FAIL mask=0b{:05b} ({}) seed={seed_val:#x}",
+                        mask, fault_mask_name(mask)
+                    );
+                    if std::env::var("DST_CC_REPLAY").is_ok() {
+                        panic!("continuous-check replay fail");
+                    }
+                }
+            }
+        }
+    }
+
+    let total = masks.len() * n_seeds;
+    eprintln!(
+        "DST_CONTINUOUS done: {passed}/{total} cells passed, {} failed, {total_continuous_violations} total mid-window violations sampled ({total_midpoint_only} would a single midpoint-only check have caught)",
+        failed_cells.len()
+    );
+
+    if !failed_cells.is_empty() {
+        let hints: Vec<String> = failed_cells.iter().map(|(m, s)| format!("mask={m} seed={s:#x}")).collect();
+        eprintln!("Replay with: DST_CC_REPLAY=<mask>");
+        panic!(
+            "continuous property check failed: {}/{total} cells. Replay hints: {}",
+            failed_cells.len(),
+            hints.join(", ")
+        );
+    }
+}
+
 // ─── Batch 12: multi-seed sweep + deep infrastructure tests ──────────
 
 /// MULTI-SEED MODEL SWEEP: Run the model-based property test across 10
