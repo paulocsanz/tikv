@@ -1328,7 +1328,7 @@ fn print_bad_ssts(data_dir: &str, manifest: Option<&str>, pd_client: RpcClient, 
     let mut stderr_buf = stderr.into_inner();
     let mut buffer = Vec::new();
     stderr_buf.read_to_end(&mut buffer).unwrap();
-    let corruptions = unsafe { String::from_utf8_unchecked(buffer) };
+    let corruptions = String::from_utf8_lossy(&buffer);
 
     let r = Regex::new(r"/\w*\.sst").unwrap();
     let column_r = Regex::new(r"--------------- (.*) --------------\n(.*)").unwrap();

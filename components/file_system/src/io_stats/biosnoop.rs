@@ -226,8 +226,8 @@ macro_rules! flush_io_latency {
             .table(concat!(stringify!($metrics), "_read_latency"))
             .unwrap();
         for mut e in t.iter() {
-            let bucket = 2_u64.pow(ptr::read(e.key.as_ptr() as *const libc::c_int) as u32);
-            let count = ptr::read(e.value.as_ptr() as *const u64);
+            let bucket = 2_u64.pow(ptr::read_unaligned(e.key.as_ptr() as *const libc::c_int) as u32);
+            let count = ptr::read_unaligned(e.value.as_ptr() as *const u64);
 
             for _ in 0..count {
                 IO_LATENCY_MICROS_VEC.$metrics.read.observe(bucket as f64);
@@ -240,8 +240,8 @@ macro_rules! flush_io_latency {
             .table(concat!(stringify!($metrics), "_write_latency"))
             .unwrap();
         for mut e in t.iter() {
-            let bucket = 2_u64.pow(ptr::read(e.key.as_ptr() as *const libc::c_int) as u32);
-            let count = ptr::read(e.value.as_ptr() as *const u64);
+            let bucket = 2_u64.pow(ptr::read_unaligned(e.key.as_ptr() as *const libc::c_int) as u32);
+            let count = ptr::read_unaligned(e.value.as_ptr() as *const u64);
 
             for _ in 0..count {
                 IO_LATENCY_MICROS_VEC.$metrics.write.observe(bucket as f64);

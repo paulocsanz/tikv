@@ -116,7 +116,10 @@ impl Serialize for JsonRef<'_> {
             },
             JsonType::String => match self.get_str() {
                 Ok(s) => serializer.serialize_str(s),
-                Err(_) => Err(SerError::custom("json contains invalid UTF-8 characters")),
+                Err(_) => {
+                    let bytes = self.get_str_bytes().unwrap_or(&[]);
+                    serializer.serialize_str(&String::from_utf8_lossy(bytes))
+                }
             },
             JsonType::Double => serializer.serialize_f64(self.get_double()),
             JsonType::I64 => serializer.serialize_i64(self.get_i64()),
@@ -127,7 +130,15 @@ impl Serialize for JsonRef<'_> {
                 for i in 0..elem_count {
                     let key = self.object_get_key(i).map_err(SerError::custom)?;
                     let val = self.object_get_val(i).map_err(SerError::custom)?;
-                    map.serialize_entry(str::from_utf8(key).unwrap(), &val)?;
+                    let key_owned;
+                    let key_str = match str::from_utf8(key) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            key_owned = String::from_utf8_lossy(key).into_owned();
+                            key_owned.as_str()
+                        }
+                    };
+                    map.serialize_entry(key_str, &val)?;
                 }
                 map.end()
             }
@@ -392,6 +403,47 @@ mod tests {
         assert!(
             result.contains('\u{FFFD}'),
             "expected U+FFFD replacement char in lossy serialization: {}",
+            result
+        );
+    }
+
+    /// Regression test for the object-key branch of the J2 fix.
+    /// A JSON object with a non-UTF-8 key (constructed from raw binary)
+    /// must serialize without panicking — the old code called
+    /// `str::from_utf8(key).unwrap()`.
+    #[test]
+    fn test_serialize_object_invalid_utf8_key() {
+        use super::super::constants::*;
+        // Build raw binary for {"\xff\xfe\xfd": true}
+        // Layout: element_count(u32) + size(u32) + key_entry(u32 off + u16 len)
+        //         + value_entry(u8 type + u32 inline) + key_data(3 bytes)
+        // Literal values have encoded_len = 0, so no value data is appended.
+        let key_offset = HEADER_LEN + KEY_ENTRY_LEN + VALUE_ENTRY_LEN; // 8+6+5 = 19
+        let value: Vec<u8> = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&1u32.to_le_bytes()); // element_count = 1
+            let total_size = ELEMENT_COUNT_LEN + SIZE_LEN
+                + KEY_ENTRY_LEN
+                + VALUE_ENTRY_LEN
+                + 3; // key is 3 bytes
+            buf.extend_from_slice(&(total_size as u32).to_le_bytes());
+            buf.extend_from_slice(&(key_offset as u32).to_le_bytes()); // key entry: offset
+            buf.extend_from_slice(&3u16.to_le_bytes()); // key entry: length
+            buf.push(JsonType::Literal as u8); // value entry: type = Literal
+            // Literal value entry: 1 byte literal + 3 bytes padding (U32_LEN - LITERAL_LEN)
+            buf.push(JSON_LITERAL_TRUE);
+            buf.extend_from_slice(&[0u8; 3]);
+            buf.extend_from_slice(&[0xff, 0xfe, 0xfd]); // key data: invalid UTF-8
+            buf
+        };
+
+        let json = Json::new(JsonType::Object, value);
+
+        // Must not panic — the key is lossy-converted to U+FFFD chars.
+        let result = json.to_string_value();
+        assert!(
+            result.contains('\u{FFFD}'),
+            "expected U+FFFD replacement char in object key: {}",
             result
         );
     }

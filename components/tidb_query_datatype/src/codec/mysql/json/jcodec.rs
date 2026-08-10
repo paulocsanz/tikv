@@ -255,6 +255,12 @@ pub trait JsonDecoder: NumberDecoder {
         let value = match tp {
             JsonType::Object | JsonType::Array => {
                 let value = self.bytes();
+                if value.len() < ELEMENT_COUNT_LEN + 4 {
+                    return Err(box_err!(
+                        "json object/array value too short: {} bytes",
+                        value.len()
+                    ));
+                }
                 let data_size = NumberCodec::decode_u32_le(&value[ELEMENT_COUNT_LEN..]) as usize;
                 self.read_bytes(data_size)?
             }
@@ -267,6 +273,9 @@ pub trait JsonDecoder: NumberDecoder {
             JsonType::Literal => self.read_bytes(LITERAL_LEN)?,
             JsonType::Opaque => {
                 let value = self.bytes();
+                if value.is_empty() {
+                    return Err(box_err!("json opaque value is empty"));
+                }
                 // the first byte of opaque stores the MySQL type code
                 let (opaque_bytes_len, len_len) = NumberCodec::try_decode_var_u64(&value[1..])?;
                 self.read_bytes(opaque_bytes_len as usize + len_len + 1)?
@@ -317,6 +326,63 @@ mod tests {
             let input_str = json.to_string();
             let output_str = output.to_string();
             assert_eq!(input_str, output_str);
+        }
+    }
+
+    /// Regression test for the bounds checks added in `read_json`.
+    /// Every JSON type code with a truncated or empty payload must return
+    /// `Err` — it must never panic or read past the buffer.
+    #[test]
+    fn test_read_json_malformed_payloads() {
+        // Empty input must error.
+        let empty: Vec<u8> = vec![];
+        assert!(empty.as_slice().read_json().is_err());
+
+        // Object (0x01) and Array (0x03) need at least ELEMENT_COUNT_LEN + 4 = 8
+        // bytes of payload. Without the bounds check, decode_u32_le would read
+        // past a short slice — UB.
+        for &type_byte in &[0x01u8, 0x03] {
+            for payload_len in 0..8usize {
+                let mut data = vec![type_byte];
+                data.resize(payload_len + 1, 0xFF);
+                assert!(
+                    data.as_slice().read_json().is_err(),
+                    "type 0x{:02x} with {} payload bytes should error",
+                    type_byte,
+                    payload_len
+                );
+            }
+        }
+
+        // Opaque (0x0d) needs at least 1 byte for the MySQL type code, then a
+        // var_u64 length. An empty payload must error — previously it panicked
+        // on &value[1..].
+        assert!(vec![0x0d].as_slice().read_json().is_err());
+
+        // Number types (I64=0x09, U64=0x0a, Double=0x0b) need NUMBER_LEN (8)
+        // bytes. Short payloads must error.
+        for &type_byte in &[0x09u8, 0x0a, 0x0b] {
+            for payload_len in 0..8usize {
+                let mut data = vec![type_byte];
+                data.resize(payload_len + 1, 0x00);
+                assert!(
+                    data.as_slice().read_json().is_err(),
+                    "number type 0x{:02x} with {} payload bytes should error",
+                    type_byte,
+                    payload_len
+                );
+            }
+        }
+
+        // Literal (0x04) needs 1 byte. Date/Datetime/Timestamp (0x0e-0x10) need
+        // TIME_LEN bytes. Time (0x11) needs DURATION_LEN bytes.
+        // An empty payload for any of these must error.
+        for &type_byte in &[0x04u8, 0x0e, 0x0f, 0x10, 0x11] {
+            assert!(
+                vec![type_byte].as_slice().read_json().is_err(),
+                "type 0x{:02x} with empty payload should error",
+                type_byte
+            );
         }
     }
 }

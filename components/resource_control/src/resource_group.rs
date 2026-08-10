@@ -1,7 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    cell::Cell,
     cmp::{max, min},
     collections::HashSet,
     sync::{
@@ -1054,17 +1053,12 @@ pub struct ResourceController {
     // the latest min vt, this value is used to init new added group vt
     last_min_vt: AtomicU64,
     // the last time min vt is overflow
-    last_rest_vt_time: Cell<Instant>,
+    last_rest_vt_time: Mutex<Instant>,
     // whether the settings are customized by user
     customized: AtomicBool,
     // Shared config. Read on the hot path to check enable_fair_scheduling.
     config: Arc<VersionTrack<Config>>,
 }
-
-// we are ensure to visit the `last_rest_vt_time` by only 1 thread so it's
-// thread safe.
-unsafe impl Send for ResourceController {}
-unsafe impl Sync for ResourceController {}
 
 impl ResourceController {
     fn new(name: String, is_read: bool, config: Arc<VersionTrack<Config>>) -> Self {
@@ -1074,7 +1068,7 @@ impl ResourceController {
             resource_consumptions: RwLock::new(HashMap::default()),
             last_min_vt: AtomicU64::new(0),
             max_ru_quota: Mutex::new(DEFAULT_MAX_RU_QUOTA),
-            last_rest_vt_time: Cell::new(Instant::now_coarse()),
+            last_rest_vt_time: Mutex::new(Instant::now_coarse()),
             customized: AtomicBool::new(false),
             config,
         }
@@ -1260,11 +1254,12 @@ impl ResourceController {
             });
         if near_overflow {
             let end = Instant::now_coarse();
+            let prev = *self.last_rest_vt_time.lock().unwrap();
             info!("all resource groups' virtual time are near overflow, do reset";
                 "min" => min_vt, "max" => max_vt, "dur" => ?end.duration_since(start),
-                "reset_dur" => ?end.duration_since(self.last_rest_vt_time.get()));
+                "reset_dur" => ?end.duration_since(prev));
             max_vt -= RESET_VT_THRESHOLD;
-            self.last_rest_vt_time.set(end);
+            *self.last_rest_vt_time.lock().unwrap() = end;
         }
         // max_vt is actually a little bigger than the current min vt, but we don't
         // need totally accurate here.
