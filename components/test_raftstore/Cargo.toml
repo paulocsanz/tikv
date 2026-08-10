@@ -7,8 +7,9 @@ license = "Apache-2.0"
 
 [features]
 default = ["test-engine-kv-rocksdb", "test-engine-raft-raft-engine"]
-# Pure-Rust DST: cooperative batch-system + logical Instant + virtual net queue.
-dst = ["raftstore/dst", "tikv_util/dst"]
+# Pure-Rust DST: cooperative batch-system + logical Instant + virtual net queue
+# + deterministic per-node disk I/O control (engine_rocks::det_env).
+dst = ["raftstore/dst", "tikv_util/dst", "engine_rocks/dst"]
 test-engine-kv-rocksdb = [
   "raftstore/test-engine-kv-rocksdb"
 ]

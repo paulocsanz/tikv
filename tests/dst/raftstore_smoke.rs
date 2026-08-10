@@ -14516,3 +14516,110 @@ fn test_deep_model_delete_range() {
     eprintln!("DST_DEEP190 OK");
 }
 
+// ─── Disk I/O determinism: engine_rocks::det_env, now actually wired ──
+//
+// det_env.rs existed since early in this project but its `raw_env()` was a
+// silent pass-through -- nothing ever reached RocksDB's I/O path, and
+// nothing outside its own module ever constructed a `DetEnv`. Fixed
+// 2026-08-10: wired via the same `Env::new_file_system_inspected_env` shim
+// production already uses for I/O rate limiting. This test proves it end to
+// end at full `Cluster` scope: stall one node's real disk I/O mid-run,
+// confirm the cluster still makes progress through the other two (Raft only
+// needs a quorum), then unstall and confirm the previously-stalled node
+// converges once its disk is responsive again.
+
+#[test]
+fn test_dst_disk_stall_det_env() {
+    let seed = 0x0DE7_5EA1u64;
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Baseline write before any stall.
+    cluster.must_put(b"ds_pre", b"before_stall");
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Attach DetEnv to node 3 (a follower, not the leader) via the same
+    // stop/restart-engine/run sequence any real engine restart uses
+    // (test_titan.rs's failpoint cases, for one) -- get_det_env wires the
+    // I/O hook, it doesn't touch what's already on disk.
+    let det = engine_rocks::det_env::DetEnv::new();
+    det.set_log_enabled(true);
+    cluster.stop_node(3);
+    // Under the dst feature, raftstore's batch-system fsms (including the
+    // ones holding the raft engine's Arc) are driven cooperatively by the
+    // hybrid driver thread rather than joined synchronously by stop_node --
+    // give it time to actually tick the shutdown through and release the
+    // raft engine's file lock before reopening, or the reopen races the
+    // still-live lock (os error 35) and start_test_engine's panic drops (and
+    // deletes) the node's TempDir before a retry could reuse it.
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cluster.restart_engine_with_det_env(3, det.clone());
+    cluster.run_node(3).unwrap();
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    det.set_paused(true);
+
+    // Cluster must still make progress via the (1, 2) quorum while node 3's
+    // disk is stalled -- this is the actual point of DetEnv over just
+    // stopping the node outright: node 3 stays up and reachable, its disk
+    // specifically is what's frozen.
+    let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(b"ds_during_stall", b"during_stall");
+    }));
+    assert!(
+        write_result.is_ok(),
+        "SAFETY VIOLATION: cluster failed to make progress with one node's disk stalled -- should tolerate this via quorum"
+    );
+
+    // Unstall; node 3 should catch up on its own.
+    det.set_paused(false);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // ORACLE: both keys converge everywhere, including on the node whose
+    // disk was stalled.
+    assert_eq!(
+        cluster.must_get(b"ds_pre"),
+        Some(b"before_stall".to_vec()),
+        "pre-stall write did not survive"
+    );
+    assert_eq!(
+        cluster.must_get(b"ds_during_stall"),
+        Some(b"during_stall".to_vec()),
+        "during-stall write did not converge after unstall"
+    );
+
+    let log = det.drain_log();
+    eprintln!(
+        "DST_DISK_STALL OK: {} I/O ops observed through DetEnv on node 3 (proves the hook actually fired, not just constructible)",
+        log.len()
+    );
+    assert!(
+        !log.is_empty(),
+        "DetEnv logged zero I/O -- the wiring regressed back to a no-op"
+    );
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+}
+
