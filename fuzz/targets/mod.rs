@@ -323,3 +323,25 @@ pub fn fuzz_coprocessor_codec_row_v2_binary_search(data: &[u8]) -> Result<()> {
 
     Ok(())
 }
+
+/// DST fault-injection plane's delivery-log classifiers
+/// (`components/test_raftstore/src/dst_net.rs`): parse the harness's own
+/// `"from>to:region:msgtype:term:index"` log format. The only string-parsing
+/// surface in the DST fault-injection plane -- mask decoding and schedule
+/// generation elsewhere are pure bitwise/arithmetic, panic-free by
+/// construction, so there's nothing to fuzz there. This is a real semantic
+/// oracle, not just "doesn't panic": `is_noise_log_entry` (HUP/HEARTBEAT/
+/// HEARTBEAT_RESP) and `is_app_path_log_entry` (APP/APP_RESP) classify
+/// disjoint message-type sets by definition -- an entry can never be both. A
+/// future change that adds an overlapping constant, or a bug in the match
+/// arms, is exactly what this catches.
+pub fn fuzz_dst_log_entry_classify(data: &[u8]) -> Result<()> {
+    let entry = String::from_utf8_lossy(data);
+    let noise = test_raftstore::is_noise_log_entry(&entry);
+    let app = test_raftstore::is_app_path_log_entry(&entry);
+    anyhow::ensure!(
+        !(noise && app),
+        "log entry classified as both noise and app-path: {entry:?}"
+    );
+    Ok(())
+}
