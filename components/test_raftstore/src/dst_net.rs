@@ -152,6 +152,16 @@ pub struct DstNetworkQueue {
     max_delay: u32,
     /// Probability (0..=100) of duplicating each released message.
     dup_rate_pct: u32,
+    /// FoundationDB-BUGGIFY-style baseline fault probability (0..=100),
+    /// rolled *independently* of and in addition to `drop_rate_pct` /
+    /// `dup_rate_pct` -- including when those are 0. A fault mask that
+    /// schedules nothing still gets this tiny chance of a drop or
+    /// duplicate, so recovery/retry paths that only scheduled faults ever
+    /// reach get exercised on "should never matter" runs too. 0 (the
+    /// default) reproduces the exact prior rng-call sequence: every check
+    /// below short-circuits before touching `rng`, so existing tests are
+    /// byte-for-byte unaffected.
+    buggify_pct: u32,
     /// Reorder mode for delivery schedule.
     reorder: ReorderMode,
     /// Partitioned peer pairs: messages between these (from, to) store IDs
@@ -173,6 +183,7 @@ impl DstNetworkQueue {
             drop_rate_pct: 0,
             max_delay: 0,
             dup_rate_pct: 0,
+            buggify_pct: 0,
             reorder: ReorderMode::default(),
             partitioned: Arc::new(Mutex::new(Vec::new())),
             rng: Arc::new(Mutex::new(SeededRng::new(seed.wrapping_add(NET_SEED_TAG)))),
@@ -184,6 +195,15 @@ impl DstNetworkQueue {
 
     pub fn with_drop_rate(mut self, pct: u32) -> Self {
         self.drop_rate_pct = pct.min(100);
+        self
+    }
+
+    /// Arm baseline BUGGIFY-style perturbation (drop + duplicate), rolled
+    /// independently of and on top of `with_drop_rate`/`with_dup_rate`. See
+    /// the `buggify_pct` field doc for why 0 (never calling this) preserves
+    /// every existing test's exact rng-call sequence.
+    pub fn with_buggify(mut self, pct: u32) -> Self {
+        self.buggify_pct = pct.min(100);
         self
     }
 
@@ -288,13 +308,16 @@ impl DstNetworkQueue {
         for m in ready {
             delayed.push(Buffered { msg: m, delay: 0 });
         }
-        // Apply duplication: seed-stable dup of released messages.
-        let out = if self.dup_rate_pct > 0 {
+        // Apply duplication: seed-stable dup of released messages, plus an
+        // independent BUGGIFY-style roll (see `buggify_pct` field doc).
+        let out = if self.dup_rate_pct > 0 || self.buggify_pct > 0 {
             let mut rng = self.rng.lock().unwrap();
             let mut expanded = Vec::with_capacity(out.len() * 2);
             for m in out {
                 expanded.push(m.clone());
-                if rng.gen_range(100) < self.dup_rate_pct {
+                let scheduled_dup = self.dup_rate_pct > 0 && rng.gen_range(100) < self.dup_rate_pct;
+                let buggified_dup = self.buggify_pct > 0 && rng.gen_range(100) < self.buggify_pct;
+                if scheduled_dup || buggified_dup {
                     expanded.push(m);
                 }
             }
@@ -401,9 +424,12 @@ impl DstNetworkQueue {
                 }
                 continue;
             }
-            if self.drop_rate_pct > 0 && rng.gen_range(100) < self.drop_rate_pct {
+            let scheduled_drop = self.drop_rate_pct > 0 && rng.gen_range(100) < self.drop_rate_pct;
+            let buggified_drop = self.buggify_pct > 0 && rng.gen_range(100) < self.buggify_pct;
+            if scheduled_drop || buggified_drop {
                 if recording {
-                    log.push(format!("DROP:{entry}"));
+                    let tag = if scheduled_drop { "DROP" } else { "BUGGIFY_DROP" };
+                    log.push(format!("{tag}:{entry}"));
                 }
                 continue;
             }
