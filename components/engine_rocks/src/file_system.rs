@@ -25,7 +25,13 @@ pub(crate) fn get_env(
 }
 
 pub struct WrappedFileSystemInspector<T: FileSystemInspector> {
-    inspector: T,
+    pub(crate) inspector: T,
+}
+
+impl<T: FileSystemInspector> WrappedFileSystemInspector<T> {
+    pub(crate) fn new(inspector: T) -> Self {
+        WrappedFileSystemInspector { inspector }
+    }
 }
 
 impl<T: FileSystemInspector> DBFileSystemInspector for WrappedFileSystemInspector<T> {

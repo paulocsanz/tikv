@@ -285,6 +285,46 @@ impl<T: Simulator> Cluster<T> {
                 &self.cfg,
                 &self.force_partition_mgr,
                 path,
+                #[cfg(feature = "dst")]
+                None,
+            );
+        self.dbs.insert(idx, engines);
+        self.key_managers.insert(idx, key_manager);
+        self.paths.insert(idx, dir);
+        self.sst_workers.insert(idx, sst_worker);
+        self.kv_statistics.insert(idx, kv_statistics);
+        self.raft_statistics.insert(idx, raft_statistics);
+        self.engines
+            .insert(node_id, self.dbs.last().unwrap().clone());
+    }
+
+    /// Same as [`restart_engine`](Self::restart_engine), except the node's
+    /// RocksDB `Env` is wired through `det` (see `engine_rocks::det_env`):
+    /// `det.set_paused(true)`/`set_delay_ms(n)` afterward pause/delay this
+    /// node's real disk I/O without touching the other nodes'. Data survives
+    /// the restart exactly like a normal `restart_engine` -- this only
+    /// changes how I/O to the *existing* on-disk state is timed, not what's
+    /// on disk.
+    #[cfg(feature = "dst")]
+    pub fn restart_engine_with_det_env(&mut self, node_id: u64, det: engine_rocks::det_env::DetEnv) {
+        let idx = node_id as usize - 1;
+        let path = self.paths.remove(idx);
+        {
+            self.dbs.remove(idx);
+            self.key_managers.remove(idx);
+            self.sst_workers.remove(idx);
+            self.kv_statistics.remove(idx);
+            self.raft_statistics.remove(idx);
+            self.engines.remove(&node_id);
+        }
+        let (engines, key_manager, dir, sst_worker, kv_statistics, raft_statistics) =
+            start_test_engine(
+                None,
+                self.io_rate_limiter.clone(),
+                &self.cfg,
+                &self.force_partition_mgr,
+                path,
+                Some(det),
             );
         self.dbs.insert(idx, engines);
         self.key_managers.insert(idx, key_manager);

@@ -739,7 +739,15 @@ pub fn create_test_engine(
     Option<Arc<RocksStatistics>>,
 ) {
     let dir = test_util::temp_dir("test_cluster", cfg.prefer_mem);
-    start_test_engine(router, limiter, cfg, force_partition_mgr, dir)
+    start_test_engine(
+        router,
+        limiter,
+        cfg,
+        force_partition_mgr,
+        dir,
+        #[cfg(feature = "dst")]
+        None,
+    )
 }
 
 pub fn start_test_engine(
@@ -749,6 +757,10 @@ pub fn start_test_engine(
     cfg: &Config,
     force_partition_mgr: &ForcePartitionRangeManager,
     dir: TempDir,
+    // Per-node deterministic I/O control (pause/delay/log real disk I/O via
+    // engine_rocks::det_env). None everywhere except the one DST call site
+    // that wants it -- see Cluster::restart_engine_with_det_env.
+    #[cfg(feature = "dst")] det_env: Option<engine_rocks::det_env::DetEnv>,
 ) -> (
     Engines<RocksEngine, RaftTestEngine>,
     Option<Arc<DataKeyManager>>,
@@ -766,6 +778,12 @@ pub fn start_test_engine(
             .unwrap()
             .map(Arc::new);
     let cache = cfg.storage.block_cache.build_shared_cache();
+    #[cfg(feature = "dst")]
+    let env = match det_env {
+        Some(det) => engine_rocks::det_env::get_det_env(key_manager.clone(), det).unwrap(),
+        None => cfg.build_shared_rocks_env(key_manager.clone(), limiter).unwrap(),
+    };
+    #[cfg(not(feature = "dst"))]
     let env = cfg
         .build_shared_rocks_env(key_manager.clone(), limiter)
         .unwrap();
