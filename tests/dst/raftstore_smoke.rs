@@ -11904,3 +11904,483 @@ fn test_dst_cascade_fault_matrix() {
     );
     assert_eq!(passed, total, "cascade fault matrix had failures");
 }
+
+// ─── Batch 19: SST boundaries, snapshot recovery, raft-log GC stress ─────
+
+/// SST FILE BOUNDARIES: Write data, flush (creating SST file 1), write more,
+/// flush (SST file 2), then scan across the file boundary. All data should
+/// be consistent regardless of how many SST files exist underneath.
+#[test]
+fn test_deep_sst_boundary_scan() {
+    let seed = 0x19u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Phase 1: write 10 keys, flush.
+    for i in 0u32..10 {
+        cluster.must_put(format!("sb_{i:03}").as_bytes(), format!("phase1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_flush_cf("default", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Phase 2: write 10 more keys, flush.
+    for i in 10u32..20 {
+        cluster.must_put(format!("sb_{i:03}").as_bytes(), format!("phase2_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.must_flush_cf("default", true);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Phase 3: overwrite some keys from phase 1.
+    for i in 0u32..5 {
+        cluster.must_put(format!("sb_{i:03}").as_bytes(), format!("phase3_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Scan across all keys — spanning multiple SST files.
+    let engine = cluster.get_engine(1);
+    let mut found: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let _ = engine.scan("default", b"zsb_000", b"zsb_999", false, |k, v| {
+        found.push((k[1..].to_vec(), v.to_vec())); // strip 'z' prefix
+        Ok(true)
+    });
+
+    assert_eq!(found.len(), 20, "BUG: expected 20 keys across SST boundary, found {}", found.len());
+
+    // Verify values: keys 0-4 have phase3, keys 5-9 have phase1, keys 10-19 have phase2.
+    for (k, v) in &found {
+        let idx: u32 = String::from_utf8_lossy(k)[3..].parse().unwrap_or(999);
+        let expected = if idx < 5 {
+            format!("phase3_{idx}")
+        } else if idx < 10 {
+            format!("phase1_{idx}")
+        } else {
+            format!("phase2_{idx}")
+        };
+        assert_eq!(v, &expected.into_bytes(),
+            "BUG: key {} has wrong value across SST boundary", String::from_utf8_lossy(k));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP151 OK");
+}
+
+/// SNAPSHOT RECOVERY: Stop a node, write enough data to trigger raft log
+/// compaction (so the node can't catch up via log replication — needs
+/// snapshot). Restart node, verify it gets a snapshot and catches up.
+#[test]
+fn test_deep_snapshot_recovery() {
+    let seed = 0x29u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write initial batch.
+    for i in 0u32..10 {
+        cluster.must_put(format!("snap_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write a lot of data while node 3 is down. This will cause raft log
+    // to grow and eventually be GC'd, so node 3 needs a snapshot on restart.
+    for i in 0u32..100 {
+        cluster.must_put(format!("snap_bulk_{i:03}").as_bytes(), format!("bulk_{i}").as_bytes());
+    }
+    // Compact to trigger raft log GC.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write more after compaction.
+    for i in 0u32..10 {
+        cluster.must_put(format!("snap_post_{i:02}").as_bytes(), format!("post_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3 — it should need a snapshot to catch up.
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // Verify node 3 has ALL data (initial + bulk + post).
+    let engine = cluster.get_engine(3);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"z", b"zz", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert!(count >= 120,
+        "BUG: node 3 has {count} keys after snapshot recovery, expected >= 120");
+
+    // Verify specific keys from each phase.
+    assert_eq!(cluster.must_get(b"snap_00"), Some(b"v0".to_vec()));
+    assert_eq!(cluster.must_get(b"snap_bulk_050"), Some(b"bulk_50".to_vec()));
+    assert_eq!(cluster.must_get(b"snap_post_05"), Some(b"post_5".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP152 OK");
+}
+
+/// RAFT LOG GC STRESS: Write enough entries to trigger multiple rounds of
+/// raft log GC, then verify all data is still consistent.
+#[test]
+fn test_deep_raft_log_gc_stress() {
+    let seed = 0x39u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write 200 keys in small batches to create many raft entries.
+    for i in 0u32..200 {
+        cluster.must_put(format!("rgc_{i:03}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Compact data (triggers raft log GC).
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Write 200 more (after GC, creating new raft entries).
+    for i in 200u32..400 {
+        cluster.must_put(format!("rgc_{i:03}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Compact again.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Verify ALL 400 keys survived multiple raft log GC rounds.
+    let mut errors = 0;
+    for i in 0u32..400 {
+        let v = cluster.must_get(format!("rgc_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("v{i}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/400 keys lost after raft log GC stress");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP153 OK");
+}
+
+/// CONCURRENT SPLIT + COMPACTION: Trigger a region split while compaction
+/// is running. Both operations should complete correctly without data loss.
+#[test]
+fn test_deep_concurrent_split_compact() {
+    let seed = 0x49u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 0u32..30 {
+        cluster.must_put(format!("csc_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Trigger compaction, then immediately split.
+    cluster.compact_data();
+    let region = cluster.get_region(b"csc_00");
+    cluster.must_split(&region, b"csc_15");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write to both sides.
+    cluster.must_put(b"csc_00", b"left_new");
+    cluster.must_put(b"csc_20", b"right_new");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify all 30 original keys + 2 updates.
+    assert_eq!(cluster.must_get(b"csc_00"), Some(b"left_new".to_vec()));
+    assert_eq!(cluster.must_get(b"csc_20"), Some(b"right_new".to_vec()));
+    for i in 1u32..30 {
+        if i == 20 { continue; }
+        let v = cluster.must_get(format!("csc_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
+            "BUG: csc_{i:02} lost during concurrent split+compact");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP154 OK");
+}
+
+/// DELETE RANGE + IMMEDIATE READ: Delete a range and immediately read keys
+/// from that range with no sleep. The deleted keys should be gone instantly.
+#[test]
+fn test_deep_delete_range_immediate_read() {
+    let seed = 0x59u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    for i in 0u32..20 {
+        cluster.must_put(format!("dir_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete range and immediately read — no sleep.
+    cluster.must_delete_range_cf("default", b"dir_05", b"dir_15");
+
+    // Immediate reads: keys 0-4 should exist, 5-14 gone, 15-19 exist.
+    for i in 0u32..5 {
+        assert!(cluster.must_get(format!("dir_{i:02}").as_bytes()).is_some(),
+            "BUG: dir_{i:02} should exist after immediate delete range");
+    }
+    for i in 5u32..15 {
+        assert!(cluster.must_get(format!("dir_{i:02}").as_bytes()).is_none(),
+            "BUG: dir_{i:02} should be deleted immediately after delete range");
+    }
+    for i in 15u32..20 {
+        assert!(cluster.must_get(format!("dir_{i:02}").as_bytes()).is_some(),
+            "BUG: dir_{i:02} should exist after immediate delete range");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP155 OK");
+}
+
+/// VERY LARGE BATCH (200 KEYS): Write 200 puts in a single Raft proposal.
+/// This tests the maximum batch size the raft pipeline can handle.
+#[test]
+fn test_deep_batch_200_keys() {
+    let seed = 0x69u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let n = 200u32;
+    let reqs: Vec<_> = (0..n)
+        .map(|i| new_put_cmd(format!("b2k_{i:03}").as_bytes(), format!("val_{i:03}").as_bytes()))
+        .collect();
+    let result = cluster.batch_put(b"b2k_000", reqs);
+    assert!(result.is_ok(), "BUG: 200-key batch failed: {:?}", result.err());
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut errors = 0;
+    for i in 0u32..n {
+        let v = cluster.must_get(format!("b2k_{i:03}").as_bytes());
+        if v.as_deref() != Some(format!("val_{i:03}").as_bytes()) {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "BUG: {errors}/{n} keys missing after 200-key batch");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP156 OK");
+}
+
+/// INTERLEAVED MULTI-REGION WRITES: After split, rapidly alternate writes
+/// between the two regions. This tests region routing under rapid switching.
+#[test]
+fn test_deep_interleaved_multi_region() {
+    let seed = 0x79u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write initial data.
+    for i in 0u32..20 {
+        cluster.must_put(format!("imr_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split at imr_10.
+    let region = cluster.get_region(b"imr_00");
+    cluster.must_split(&region, b"imr_10");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Interleaved writes to both regions.
+    for round in 0u32..5 {
+        let right_idx = round + 10;
+        // Write to left region.
+        cluster.must_put(format!("imr_{round:02}_L").as_bytes(), format!("L{round}").as_bytes());
+        // Write to right region.
+        cluster.must_put(format!("imr_{right_idx:02}_R").as_bytes(), format!("R{round}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify interleaved writes.
+    for round in 0u32..5 {
+        let right_idx = round + 10;
+        assert_eq!(
+            cluster.must_get(format!("imr_{round:02}_L").as_bytes()),
+            Some(format!("L{round}").into_bytes()),
+            "BUG: left region interleaved write {round} missing"
+        );
+        assert_eq!(
+            cluster.must_get(format!("imr_{right_idx:02}_R").as_bytes()),
+            Some(format!("R{round}").into_bytes()),
+            "BUG: right region interleaved write {round} missing"
+        );
+    }
+
+    // Original keys still intact.
+    for i in 0u32..20 {
+        let v = cluster.must_get(format!("imr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()));
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP157 OK");
+}
+
+/// KEY COUNT AFTER COMPLEX OPERATIONS: Multi-phase write/delete/split/compact,
+/// then verify exact key count via engine scan.
+#[test]
+fn test_deep_exact_key_count_complex() {
+    let seed = 0x89u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 1: write 30 keys.
+    for i in 0u32..30 {
+        cluster.must_put(format!("ekc_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 2: split.
+    let region = cluster.get_region(b"ekc_00");
+    cluster.must_split(&region, b"ekc_15");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Phase 3: delete 10 keys.
+    for i in [2u32, 5, 8, 12, 18, 22, 25, 28, 3, 7] {
+        cluster.must_delete(format!("ekc_{i:02}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 4: write 5 new keys.
+    for i in 30u32..35 {
+        cluster.must_put(format!("ekc_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Phase 5: compact.
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Expected: 30 - 10 (deleted) + 5 (new) = 25 keys.
+    let engine = cluster.get_engine(1);
+    let mut count = 0u32;
+    let _ = engine.scan("default", b"zekc_00", b"zekc_99", false, |_k, _v| {
+        count += 1;
+        Ok(true)
+    });
+    assert_eq!(count, 25, "BUG: expected 25 keys after complex ops, found {count}");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP158 OK");
+}
+
+/// OVERWRITE + DELETE RANGE INTERLEAVED: Write keys, overwrite some, then
+/// delete range. Verify the range delete removes all versions correctly.
+#[test]
+fn test_deep_overwrite_then_delete_range() {
+    let seed = 0x99u64;
+    let mut cluster = bootstrap_hybrid(seed);
+
+    // Write 20 keys.
+    for i in 0u32..20 {
+        cluster.must_put(format!("odr_{i:02}").as_bytes(), format!("v1_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Overwrite keys 5-14 three times.
+    for round in 2..=4u32 {
+        for i in 5u32..15 {
+            cluster.must_put(format!("odr_{i:02}").as_bytes(), format!("v{round}_{i}").as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Delete range 5-15.
+    cluster.must_delete_range_cf("default", b"odr_05", b"odr_15");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify: keys 0-4 have v1 values, keys 5-14 deleted, keys 15-19 have v1 values.
+    for i in 0u32..5 {
+        let v = cluster.must_get(format!("odr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v1_{i}").as_bytes()),
+            "BUG: odr_{i:02} wrong value after overwrite+delete range");
+    }
+    for i in 5u32..15 {
+        assert!(cluster.must_get(format!("odr_{i:02}").as_bytes()).is_none(),
+            "BUG: odr_{i:02} should be deleted (had multiple versions)");
+    }
+    for i in 15u32..20 {
+        let v = cluster.must_get(format!("odr_{i:02}").as_bytes());
+        assert_eq!(v.as_deref(), Some(format!("v1_{i}").as_bytes()),
+            "BUG: odr_{i:02} wrong value after overwrite+delete range");
+    }
+
+    // Compact and verify again (tombstones shouldn't resurrect keys).
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 5u32..15 {
+        assert!(cluster.must_get(format!("odr_{i:02}").as_bytes()).is_none(),
+            "BUG: odr_{i:02} resurrected after compaction");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP159 OK");
+}
+
+/// SNAPSHOT + SPLIT: Write data, stop node, split region, restart node.
+/// The node needs to catch up via snapshot AND learn about the new region.
+#[test]
+fn test_deep_snapshot_plus_split() {
+    let seed = 0xA9u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write initial data.
+    for i in 0u32..15 {
+        cluster.must_put(format!("sps_{i:02}").as_bytes(), format!("v{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop node 3.
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Write bulk data (to trigger snapshot on restart).
+    for i in 0u32..80 {
+        cluster.must_put(format!("sps_bulk_{i:03}").as_bytes(), format!("bulk_{i}").as_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Compact (triggers raft log GC).
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Split while node 3 is still down.
+    let region = cluster.get_region(b"sps_00");
+    cluster.must_split(&region, b"sps_08");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Write to both child regions.
+    cluster.must_put(b"sps_00", b"left_post_split");
+    cluster.must_put(b"sps_12", b"right_post_split");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Restart node 3 — needs snapshot + needs to learn about split.
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Verify data accessible.
+    assert_eq!(cluster.must_get(b"sps_00"), Some(b"left_post_split".to_vec()));
+    assert_eq!(cluster.must_get(b"sps_12"), Some(b"right_post_split".to_vec()));
+
+    // Verify bulk data survived.
+    assert_eq!(cluster.must_get(b"sps_bulk_040"), Some(b"bulk_40".to_vec()));
+    assert_eq!(cluster.must_get(b"sps_bulk_079"), Some(b"bulk_79".to_vec()));
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP160 OK");
+}
+
