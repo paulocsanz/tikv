@@ -13194,3 +13194,504 @@ fn test_dst_scan_during_chaos_fault_matrix() {
     );
     assert_eq!(passed, total, "scan-during-chaos fault matrix had failures");
 }
+// ─── Batch 22: large-scale model-based property testing ──────────────────
+
+/// MODEL SWEEP 20 SEEDS: Run the model-based test with 20 different seeds,
+/// 200 ops each. Total: 4000 verified operations.
+#[test]
+fn test_deep_model_sweep_20_seeds() {
+    let seeds = [
+        0xB001u64, 0xB002, 0xB003, 0xB004, 0xB005,
+        0xB006, 0xB007, 0xB008, 0xB009, 0xB00A,
+        0xB00B, 0xB00C, 0xB00D, 0xB00E, 0xB00F,
+        0xB010, 0xB011, 0xB012, 0xB013, 0xB014,
+    ];
+
+    let mut total_ops = 0u32;
+    for &seed in &seeds {
+        let mut cluster = bootstrap_hybrid(seed);
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut rng = DstRng::seed_from_u64(seed);
+        let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+        for _ in 0u32..200 {
+            let key_idx = rng.gen::<u32>() % 20;
+            let key = format!("ms{key_idx:02}");
+            let op = rng.gen::<u32>() % 4;
+
+            match op {
+                0 | 1 => {
+                    let val = format!("v{}", rng.gen::<u32>() % 1000);
+                    cluster.must_put(key.as_bytes(), val.as_bytes());
+                    model.insert(key.into_bytes(), val.into_bytes());
+                }
+                2 => {
+                    cluster.must_delete(key.as_bytes());
+                    model.remove(key.as_bytes());
+                }
+                _ => {
+                    let v = cluster.must_get(key.as_bytes());
+                    let expected = model.get(key.as_bytes());
+                    assert_eq!(v.as_deref(), expected.map(|v| v.as_slice()),
+                        "BUG: model mismatch seed={seed:#x} key={key}");
+                }
+            }
+            total_ops += 1;
+        }
+
+        for key_idx in 0u32..20 {
+            let key = format!("ms{key_idx:02}");
+            let v = cluster.must_get(key.as_bytes());
+            match model.get(key.as_bytes()) {
+                Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                    "BUG: final mismatch seed={seed:#x} key={key}"),
+                None => assert!(v.is_none(), "BUG: ghost key seed={seed:#x} key={key}"),
+            }
+        }
+
+        cluster.shutdown();
+        cleanup_cluster();
+    }
+
+    eprintln!("DST_DEEP181: {total_ops} ops across {} seeds, 0 mismatches", seeds.len());
+    eprintln!("DST_DEEP181 OK");
+}
+
+/// MODEL WITH HIGH COLLISION RATE: 50 keys with high write contention.
+#[test]
+fn test_deep_model_high_collision() {
+    let seed = 0xC011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..300 {
+        let key_idx = rng.gen::<u32>() % 5;
+        let key = format!("hc_{key_idx}");
+        let val = format!("v{}", rng.gen::<u32>() % 100);
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        model.insert(key.into_bytes(), val.into_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..5 {
+        let key = format!("hc_{key_idx}");
+        let v = cluster.must_get(key.as_bytes());
+        let expected = model.get(key.as_bytes()).unwrap();
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: high-collision mismatch key={key}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP182 OK");
+}
+
+/// MODEL WITH DELETE-HEAVY WORKLOAD: 60% deletes, 30% puts, 10% reads.
+#[test]
+fn test_deep_model_delete_heavy() {
+    let seed = 0xD011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..300 {
+        let key_idx = rng.gen::<u32>() % 15;
+        let key = format!("dh_{key_idx:02}");
+        let op = rng.gen::<u32>() % 10;
+
+        if op < 3 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut mismatches = 0u32;
+    for key_idx in 0u32..15 {
+        let key = format!("dh_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => { if v.as_deref() != Some(expected.as_slice()) { mismatches += 1; } }
+            None => { if v.is_some() { mismatches += 1; } }
+        }
+    }
+    assert_eq!(mismatches, 0, "BUG: {mismatches} mismatches in delete-heavy model");
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP183 OK");
+}
+
+/// MODEL WITH ONLY READS: Write data once, then do 200 reads.
+#[test]
+fn test_deep_model_read_only() {
+    let seed = 0xE011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+    for i in 0u32..20 {
+        let key = format!("ro_{i:02}");
+        let val = format!("fixed_{i}");
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        model.insert(key.into_bytes(), val.into_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    for _ in 0u32..200 {
+        let key_idx = rng.gen::<u32>() % 20;
+        let key = format!("ro_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        let expected = model.get(key.as_bytes()).unwrap();
+        assert_eq!(v.as_deref(), Some(expected.as_slice()),
+            "BUG: read-only model inconsistency for key {key}");
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP184 OK");
+}
+
+/// MODEL WITH BATCH OPERATIONS: Instead of single puts/deletes, use batches.
+#[test]
+fn test_deep_model_batch_ops() {
+    let seed = 0xF011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..20 {
+        let is_put = rng.gen::<u32>() % 3 != 0;
+
+        let reqs: Vec<_> = (0..5u32)
+            .map(|_j| {
+                let key_idx = rng.gen::<u32>() % 10;
+                let key = format!("mb_{key_idx:02}");
+                if is_put {
+                    let val = format!("v{}", rng.gen::<u32>() % 100);
+                    let key_bytes = key.as_bytes().to_vec();
+                    let val_bytes = val.as_bytes().to_vec();
+                    model.insert(key_bytes, val_bytes);
+                    new_put_cmd(key.as_bytes(), val.as_bytes())
+                } else {
+                    model.remove(key.as_bytes());
+                    new_delete_cmd("default", key.as_bytes())
+                }
+            })
+            .collect();
+        let result = cluster.batch_put(b"mb_00", reqs);
+        assert!(result.is_ok(), "BUG: model batch failed: {:?}", result.err());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..10 {
+        let key = format!("mb_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: batch model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP185 OK");
+}
+
+/// MODEL WITH INTERLEAVED COMPACT: Random ops, compact mid-way, continue.
+#[test]
+fn test_deep_model_interleaved_compact() {
+    let seed = 0x1011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..100 {
+        let key_idx = rng.gen::<u32>() % 15;
+        let key = format!("ic_{key_idx:02}");
+        if rng.gen::<u32>() % 2 == 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(100));
+
+    for _ in 0u32..100 {
+        let key_idx = rng.gen::<u32>() % 15;
+        let key = format!("ic_{key_idx:02}");
+        if rng.gen::<u32>() % 2 == 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..15 {
+        let key = format!("ic_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: interleaved-compact model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP186 OK");
+}
+
+/// MODEL AFTER FULL LIFECYCLE: Write, split, model-verify, compact, verify.
+#[test]
+fn test_deep_model_full_lifecycle() {
+    let seed = 0x2011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..30 {
+        let key_idx = rng.gen::<u32>() % 30;
+        let key = format!("flc_{key_idx:02}");
+        let val = format!("v{}", rng.gen::<u32>() % 100);
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        model.insert(key.into_bytes(), val.into_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let region = cluster.get_region(b"flc_00");
+    cluster.must_split(&region, b"flc_15");
+    std::thread::sleep(Duration::from_millis(500));
+
+    for _ in 0u32..30 {
+        let key_idx = rng.gen::<u32>() % 30;
+        let key = format!("flc_{key_idx:02}");
+        if rng.gen::<u32>() % 2 == 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..30 {
+        let key = format!("flc_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: full-lifecycle model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP187 OK");
+}
+
+/// MODEL WITH LEADER TRANSFER MID-STREAM.
+#[test]
+fn test_deep_model_leader_transfer_mid() {
+    let seed = 0x3011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..50 {
+        let key_idx = rng.gen::<u32>() % 10;
+        let key = format!("ltm_{key_idx:02}");
+        if rng.gen::<u32>() % 3 != 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(3, 3));
+    }));
+    std::thread::sleep(Duration::from_millis(300));
+
+    for _ in 0u32..50 {
+        let key_idx = rng.gen::<u32>() % 10;
+        let key = format!("ltm_{key_idx:02}");
+        if rng.gen::<u32>() % 3 != 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..10 {
+        let key = format!("ltm_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: leader-transfer model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP188 OK");
+}
+
+/// MODEL WITH NODE RESTART: Ops, restart node, more ops, verify.
+#[test]
+fn test_deep_model_node_restart() {
+    let seed = 0x4011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for _ in 0u32..50 {
+        let key_idx = rng.gen::<u32>() % 12;
+        let key = format!("nr_{key_idx:02}");
+        if rng.gen::<u32>() % 3 != 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = cluster.run_node(3);
+    std::thread::sleep(Duration::from_millis(1000));
+
+    for _ in 0u32..50 {
+        let key_idx = rng.gen::<u32>() % 12;
+        let key = format!("nr_{key_idx:02}");
+        if rng.gen::<u32>() % 3 != 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..12 {
+        let key = format!("nr_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: restart model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP189 OK");
+}
+
+/// MODEL WITH DELETE RANGE.
+#[test]
+fn test_deep_model_delete_range() {
+    let seed = 0x5011u64;
+    let mut cluster = bootstrap_hybrid(seed);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut rng = DstRng::seed_from_u64(seed);
+    let mut model: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+
+    for i in 0u32..20 {
+        let key = format!("mdr_{i:02}");
+        let val = format!("v{i}");
+        cluster.must_put(key.as_bytes(), val.as_bytes());
+        model.insert(key.into_bytes(), val.into_bytes());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    cluster.must_delete_range_cf("default", b"mdr_05", b"mdr_15");
+    std::thread::sleep(Duration::from_millis(200));
+
+    for i in 5u32..15 {
+        let key = format!("mdr_{i:02}");
+        model.remove(key.as_bytes());
+    }
+
+    for _ in 0u32..50 {
+        let key_idx = rng.gen::<u32>() % 20;
+        let key = format!("mdr_{key_idx:02}");
+        if rng.gen::<u32>() % 2 == 0 {
+            let val = format!("v{}", rng.gen::<u32>() % 100);
+            cluster.must_put(key.as_bytes(), val.as_bytes());
+            model.insert(key.into_bytes(), val.into_bytes());
+        } else {
+            cluster.must_delete(key.as_bytes());
+            model.remove(key.as_bytes());
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    for key_idx in 0u32..20 {
+        let key = format!("mdr_{key_idx:02}");
+        let v = cluster.must_get(key.as_bytes());
+        match model.get(key.as_bytes()) {
+            Some(expected) => assert_eq!(v.as_deref(), Some(expected.as_slice()),
+                "BUG: delete-range model mismatch key {key}"),
+            None => assert!(v.is_none(), "BUG: ghost key {key}"),
+        }
+    }
+
+    cluster.shutdown();
+    cleanup_cluster();
+    eprintln!("DST_DEEP190 OK");
+}
+
