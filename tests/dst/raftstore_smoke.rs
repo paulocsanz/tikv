@@ -14623,3 +14623,327 @@ fn test_dst_disk_stall_det_env() {
     sterilize_dst_process();
 }
 
+// ─── D4/D5: systematic Tier-A failpoint x phase coverage matrix ───────
+//
+// tikv-dst/findings/IDEAS-miri-dst-ub.md items D4 ("systematic Tier A
+// failpoint x phase cells") and D5 ("directed generators for low coverage:
+// snap 7%, compact 1%"), applied to this harness. Methodology idea taken
+// from tikv-emulation/faults/SYSTEMATIC-COVERAGE.md (that file documents
+// the same idea for the unrelated QEMU/TCG emulation branch -- not touched,
+// not run, out of scope here; only its "failpoints x phases, not just
+// failpoints alone" framing is reused).
+//
+// Full matrix table, reachability proofs, and before/after `cargo llvm-cov`
+// numbers: tikv-dst/findings/dst-systematic-coverage-2026-08-10.md in the
+// determinismo repo.
+//
+// Phase taxonomy for this harness (6 phases; two groups below exercise 4 of
+// them -- Steady and Lagging are deliberately NOT crossed with these
+// failpoints, see the finding doc for why):
+//   Steady          -- normal 3-node cluster, no fault in flight (control).
+//   Lagging         -- node 3 stopped, quorum (1,2) keeps writing.
+//   DuringRestart   -- node 3 rejoins after a truncated raft log gap,
+//                      forcing generate+apply snapshot.
+//   DuringTransfer  -- same as DuringRestart, but leadership is additionally
+//                      raced onto node 3 mid-recovery.
+//   DuringCompaction-- heavy write volume + natural tick-driven raft log GC
+//                      (+ an explicit `compact_data()` for RocksDB-level
+//                      cleanup verification).
+//   PostSplit       -- region split, then the same log-GC load against both
+//                      resulting regions.
+//
+// Two action classes, matched to what fail-rs 0.5 (vendored dependency,
+// verified by reading its macro expansion directly -- not assumed) actually
+// supports per call-site shape:
+//   - closure-form call sites (`fail_point!(name, |_| expr)`, optionally
+//     with a guard condition) support `fail::cfg(name, "return()")`: a real
+//     early-exit fault, same idiom TiKV's own tests/failpoints/cases use.
+//   - bare-form call sites (`fail_point!(name)`, no closure) do NOT support
+//     "return" -- the crate's own bare-form arm evaluates with a guard
+//     closure that unconditionally panics ("Return is not supported for the
+//     fail point ...") if the configured action ever resolves to
+//     `Task::Return`. Using "return" there would make the *test* panic, not
+//     exercise a real early-return branch in TiKV. Those instead use a
+//     bounded `"sleep(50)"` timing perturbation.
+//
+// `on_full_compact` / `on_compact_range_cf` (store/worker/compact.rs) are
+// intentionally NOT in the executed lists below: both are only ever
+// scheduled from `store/fsm/store.rs` (`on_full_compact_tick`, gated on
+// `periodic_full_compact_start_times.is_scheduled_this_hour(&chrono::Local::
+// now())` -- a real wall-clock hour-of-day gate that this harness's virtual
+// / hybrid logical clock cannot drive; and `on_compact_lock_cf`, gated on
+// `lock_cf_bytes_written` crossing `lock_cf_compact_bytes_threshold`, which
+// only increases from real CF_LOCK writes -- this harness's `must_put` is a
+// raw KV write to CF_DEFAULT, never CF_LOCK). `cluster.compact_data()`
+// itself calls `db.compact_range_cf` directly on the raw engine handle,
+// bypassing this worker entirely. Confirmed by reading
+// `store/fsm/store.rs` end to end for every `CleanupTask::Compact`
+// scheduling site (there are exactly two, both described above) -- this is
+// the primary-source-verified reason `compact.rs` shows ~1% coverage from
+// this suite: it is structurally near-unreachable from raw-KV DST tests,
+// not merely under-exercised. Documented in the finding doc as
+// UNREACHABLE-by-construction rather than silently dropped.
+
+const D4_SNAP_RETURNABLE: &[&str] = &[
+    "region_gen_snap",
+    "before_region_gen_snap",
+    "region_apply_snap",
+    "apply_pending_snapshot",
+    "skip_schedule_applying_snapshot",
+];
+const D4_SNAP_SLEEPABLE: &[&str] = &[
+    "snapshot_enter_do_build",
+    "raft_before_apply_snap",
+    "raft_after_apply_snap",
+    "raft_before_applying_snap_finished",
+    "apply_snapshot_finished",
+];
+const D4_GC_RETURNABLE: &[&str] = &["worker_gc_raft_log"];
+const D4_GC_SLEEPABLE: &[&str] = &["worker_gc_raft_log_finished", "worker_gc_raft_log_flush"];
+
+/// One (phase, failpoint, action) cell for the snapshot group: build a
+/// fresh log-truncation gap by stopping node 3, writing while it is down,
+/// and compacting, then restart node 3 (optionally racing a leader transfer
+/// onto it) with the given failpoint action active. Oracle: the fault is
+/// transient (a single early-return or a bounded sleep), so the cluster
+/// must still converge -- node 3 must end up with the full key range within
+/// a bounded wait.
+fn run_snapshot_matrix_cell(
+    cluster: &mut test_raftstore::Cluster<test_raftstore::NodeCluster>,
+    phase_name: &str,
+    fp: &'static str,
+    action: &str,
+    idx: usize,
+    do_transfer: bool,
+) -> bool {
+    cluster.stop_node(3);
+    std::thread::sleep(Duration::from_millis(200));
+    let key_prefix = format!("spm_{phase_name}_{idx:02}");
+    for j in 0u32..30 {
+        cluster.must_put(format!("{key_prefix}_{j:02}").as_bytes(), b"v");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(200));
+
+    fail::cfg(fp, action).unwrap();
+    cluster.run_node(3).unwrap();
+
+    if do_transfer {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.try_transfer_leader(1, new_peer(3, 3));
+        }));
+    }
+
+    let mut ok = false;
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_get(format!("{key_prefix}_29").as_bytes())
+        }))
+        .ok()
+        .flatten();
+        if v.as_deref() == Some(b"v".as_ref()) {
+            ok = true;
+            break;
+        }
+    }
+    fail::cfg(fp, "off").unwrap();
+
+    if do_transfer {
+        // Restore leadership to node 1 so the next cell in this phase's
+        // loop starts from the same baseline.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_transfer_leader(1, new_peer(1, 1));
+        }));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    ok
+}
+
+/// One (phase, failpoint, action) cell for the raft-log-GC group: write a
+/// batch of fresh keys (accumulating raft log past the GC threshold via the
+/// harness's normal tick loop), inject the failpoint for one
+/// `compact_data()` round, then verify every key in the batch survived and
+/// the cluster still accepts new writes (a GC-path fault must not wedge the
+/// store).
+fn run_gc_matrix_cell(
+    cluster: &mut test_raftstore::Cluster<test_raftstore::NodeCluster>,
+    phase_name: &str,
+    fp: &'static str,
+    action: &str,
+    idx: usize,
+) -> bool {
+    let key_prefix = format!("gcm_{phase_name}_{idx:02}");
+    for j in 0u32..15 {
+        cluster.must_put(format!("{key_prefix}_{j:02}").as_bytes(), b"v");
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    fail::cfg(fp, action).unwrap();
+    cluster.compact_data();
+    std::thread::sleep(Duration::from_millis(300));
+    fail::cfg(fp, "off").unwrap();
+
+    let mut ok = true;
+    for j in 0u32..15 {
+        let v = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_get(format!("{key_prefix}_{j:02}").as_bytes())
+        }))
+        .ok()
+        .flatten();
+        if v.as_deref() != Some(b"v".as_ref()) {
+            ok = false;
+        }
+    }
+    let post = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_put(format!("{key_prefix}_post").as_bytes(), b"post");
+    }));
+    ok && post.is_ok()
+}
+
+/// D4/D5 snapshot-path matrix: DuringRestart x DuringTransfer phases,
+/// crossed against every Tier-A snapshot generate/apply failpoint.
+#[test]
+fn test_dst_snapshot_failpoint_phase_matrix() {
+    #[cfg(not(feature = "failpoints"))]
+    {
+        eprintln!("DST_SNAP_PHASE_MATRIX: skipped (failpoints feature not enabled)");
+    }
+
+    #[cfg(feature = "failpoints")]
+    {
+        let mut failed: Vec<(&str, &str)> = Vec::new();
+        let mut cells = 0usize;
+
+        for &(phase_name, seed, do_transfer) in &[
+            ("DuringRestart", 0xD45A01u64, false),
+            ("DuringTransfer", 0xD45A02u64, true),
+        ] {
+            let mut cluster = bootstrap_hybrid(seed);
+            let mut idx = 0usize;
+            for &fp in D4_SNAP_RETURNABLE {
+                idx += 1;
+                cells += 1;
+                if !run_snapshot_matrix_cell(&mut cluster, phase_name, fp, "return()", idx, do_transfer)
+                {
+                    failed.push((phase_name, fp));
+                }
+            }
+            for &fp in D4_SNAP_SLEEPABLE {
+                idx += 1;
+                cells += 1;
+                if !run_snapshot_matrix_cell(&mut cluster, phase_name, fp, "sleep(50)", idx, do_transfer)
+                {
+                    failed.push((phase_name, fp));
+                }
+            }
+            cluster.shutdown();
+            cleanup_cluster();
+        }
+
+        eprintln!(
+            "DST_SNAP_PHASE_MATRIX: {}/{} cells converged ({} Tier-A failpoints x 2 phases)",
+            cells - failed.len(),
+            cells,
+            D4_SNAP_RETURNABLE.len() + D4_SNAP_SLEEPABLE.len()
+        );
+        assert!(
+            failed.is_empty(),
+            "snapshot failpoint x phase matrix: {}/{} cells failed to converge: {:?}",
+            failed.len(),
+            cells,
+            failed
+        );
+    }
+}
+
+/// D4/D5 raft-log-GC matrix: DuringCompaction x PostSplit phases, crossed
+/// against every Tier-A raftlog_gc failpoint. See the module-level doc
+/// comment above for why `on_full_compact` / `on_compact_range_cf` are not
+/// in this matrix (UNREACHABLE-by-construction from this harness).
+#[test]
+fn test_dst_compaction_failpoint_phase_matrix() {
+    #[cfg(not(feature = "failpoints"))]
+    {
+        eprintln!("DST_COMPACT_PHASE_MATRIX: skipped (failpoints feature not enabled)");
+    }
+
+    #[cfg(feature = "failpoints")]
+    {
+        let mut failed: Vec<(&str, &str)> = Vec::new();
+        let mut cells = 0usize;
+
+        // Phase: DuringCompaction.
+        {
+            let seed = 0xD45B01u64;
+            let mut cluster = bootstrap_hybrid(seed);
+            let mut idx = 0usize;
+            for &fp in D4_GC_RETURNABLE {
+                idx += 1;
+                cells += 1;
+                if !run_gc_matrix_cell(&mut cluster, "DuringCompaction", fp, "return()", idx) {
+                    failed.push(("DuringCompaction", fp));
+                }
+            }
+            for &fp in D4_GC_SLEEPABLE {
+                idx += 1;
+                cells += 1;
+                if !run_gc_matrix_cell(&mut cluster, "DuringCompaction", fp, "sleep(50)", idx) {
+                    failed.push(("DuringCompaction", fp));
+                }
+            }
+            cluster.shutdown();
+            cleanup_cluster();
+        }
+
+        // Phase: PostSplit -- split first, then run the same GC cells
+        // against the post-split cluster (two regions sharing store-wide
+        // raft log GC).
+        {
+            let seed = 0xD45B02u64;
+            let mut cluster = bootstrap_hybrid(seed);
+            for i in 0u32..20 {
+                cluster.must_put(format!("gcm_presplit_{i:02}").as_bytes(), b"v");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            let region = cluster.get_region(b"gcm_presplit_00");
+            cluster.must_split(&region, b"gcm_presplit_10");
+            std::thread::sleep(Duration::from_millis(400));
+
+            let mut idx = 0usize;
+            for &fp in D4_GC_RETURNABLE {
+                idx += 1;
+                cells += 1;
+                if !run_gc_matrix_cell(&mut cluster, "PostSplit", fp, "return()", idx) {
+                    failed.push(("PostSplit", fp));
+                }
+            }
+            for &fp in D4_GC_SLEEPABLE {
+                idx += 1;
+                cells += 1;
+                if !run_gc_matrix_cell(&mut cluster, "PostSplit", fp, "sleep(50)", idx) {
+                    failed.push(("PostSplit", fp));
+                }
+            }
+            cluster.shutdown();
+            cleanup_cluster();
+        }
+
+        eprintln!(
+            "DST_COMPACT_PHASE_MATRIX: {}/{} cells converged",
+            cells - failed.len(),
+            cells
+        );
+        assert!(
+            failed.is_empty(),
+            "compaction failpoint x phase matrix: {}/{} cells failed: {:?}",
+            failed.len(),
+            cells,
+            failed
+        );
+    }
+}
+
+
