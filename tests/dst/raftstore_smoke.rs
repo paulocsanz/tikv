@@ -8607,6 +8607,349 @@ fn test_dst_continuous_property_check() {
     }
 }
 
+// ─── Elle-style isolation-anomaly checker: dependency-cycle detection ──
+//
+// Records a real operation history from concurrent racing clients and
+// checks whether it admits ANY valid linearization -- a cycle in the
+// dependency graph (real-time precedence + per-key commit order + what
+// each read observed) means it does not. This is Jepsen/Elle's own
+// technique (a dependency-graph formulation per Adya et al.), scoped to
+// what this harness's raw single-key KV ops can actually produce: there is
+// no multi-key transaction API here (`cluster.must_put`/`get` are
+// individual raftstore ops, not 2PC), so the parts of Adya's taxonomy that
+// need anti-dependencies *across formal transaction boundaries* (full G0,
+// G2, G-nonadjacent) don't have anything to attach to. What DOES apply,
+// and is exactly as real a correctness property, is whether the recorded
+// history of individual reads/writes across multiple keys and multiple
+// concurrent clients is consistent with *some* single global order --
+// linearizability (Herlihy & Wing), checked the same way Elle checks
+// isolation: build the dependency graph, find a cycle.
+//
+// Edges:
+//   real-time:  A.complete < B.invoke   =>  A -> B   (any two ops, any keys)
+//   per-key ww: same key, ordered by completion time  (write, write)
+//   wr:         a read observed write W's value       =>  W -> R
+//   rw (anti):  read R on key K observed W; a later write W' to K (later
+//               in that key's commit order) that R did *not* observe
+//               => R -> W'
+//
+// A cycle in this graph is a genuine linearizability violation -- some op
+// would have to both precede and follow another. Real-time edges are what
+// make this a meaningful *cross-key* check even without formal
+// transactions: two ops on different keys are still constrained relative
+// to each other whenever one's client-visible completion precedes the
+// other's invocation, exactly Herlihy & Wing's definition.
+
+#[derive(Clone, Debug)]
+struct HistOp {
+    client: u32,
+    key: Vec<u8>,
+    /// Exactly one of write_val / read_val is Some.
+    write_val: Option<Vec<u8>>,
+    /// Some(observed) for a read; observed is None if the read saw nothing.
+    read_val: Option<Option<Vec<u8>>>,
+    invoke: u64,
+    complete: u64,
+}
+
+impl HistOp {
+    fn is_write(&self) -> bool {
+        self.write_val.is_some()
+    }
+}
+
+/// Build the dependency graph over `history` and return the first cycle
+/// found, as op indices in cycle order -- or None if the history
+/// linearizes cleanly.
+fn find_linearization_violation(history: &[HistOp]) -> Option<Vec<usize>> {
+    let n = history.len();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    // Real-time precedence: any op that finished before another started.
+    for i in 0..n {
+        for j in 0..n {
+            if i != j && history[i].complete < history[j].invoke {
+                edges[i].push(j);
+            }
+        }
+    }
+
+    // Per-key: ww chain by completion time, plus wr + anti-dependency (rw)
+    // for reads against that same per-key order.
+    let mut by_key: std::collections::HashMap<&[u8], Vec<usize>> = std::collections::HashMap::new();
+    for (idx, op) in history.iter().enumerate() {
+        by_key.entry(op.key.as_slice()).or_default().push(idx);
+    }
+    for idxs in by_key.values() {
+        let mut writes: Vec<usize> = idxs.iter().copied().filter(|&i| history[i].is_write()).collect();
+        writes.sort_by_key(|&i| history[i].complete);
+        for w in writes.windows(2) {
+            edges[w[0]].push(w[1]);
+        }
+        for &r in idxs.iter().filter(|&&i| !history[i].is_write()) {
+            if let Some(Some(observed)) = &history[r].read_val {
+                if let Some(w_pos) = writes
+                    .iter()
+                    .position(|&w| history[w].write_val.as_deref() == Some(observed.as_slice()))
+                {
+                    edges[writes[w_pos]].push(r);
+                    for &later in &writes[w_pos + 1..] {
+                        edges[r].push(later);
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    fn dfs(u: usize, edges: &[Vec<usize>], color: &mut [Color], stack: &mut Vec<usize>) -> Option<Vec<usize>> {
+        color[u] = Color::Gray;
+        stack.push(u);
+        for &v in &edges[u] {
+            match color[v] {
+                Color::White => {
+                    if let Some(cycle) = dfs(v, edges, color, stack) {
+                        return Some(cycle);
+                    }
+                }
+                Color::Gray => {
+                    let pos = stack.iter().position(|&x| x == v).unwrap();
+                    return Some(stack[pos..].to_vec());
+                }
+                Color::Black => {}
+            }
+        }
+        stack.pop();
+        color[u] = Color::Black;
+        None
+    }
+
+    let mut color = vec![Color::White; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if color[start] == Color::White {
+            if let Some(cycle) = dfs(start, &edges, &mut color, &mut stack) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+fn run_elle_isolation_cell(mask: u32, seed: u64) -> usize {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(2, 1);
+        net.add_partition(2, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Two racing writer "clients" (2 keys, alternating) plus a reader
+    // client, all issuing blocking calls on this single deterministic
+    // thread -- chaos happens underneath at the message level via
+    // DstNetworkQueue regardless of whether the driver's own calls are
+    // sync or async, so invoke/complete around each blocking call already
+    // brackets genuine real-time uncertainty about apply order.
+    let keys: [&[u8]; 2] = [b"el_k0", b"el_k1"];
+    let mut seq: u64 = 0;
+    let mut next_seq = move || {
+        let s = seq;
+        seq += 1;
+        s
+    };
+    let mut history: Vec<HistOp> = Vec::new();
+    const ROUNDS: usize = 6;
+
+    for round in 0..ROUNDS {
+        let k0 = keys[round % 2];
+        let val0 = format!("el_c0_r{round}_{mask}_{seed}").into_bytes();
+        let invoke = next_seq();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cluster.must_put(k0, &val0)));
+        let complete = next_seq();
+        history.push(HistOp {
+            client: 0,
+            key: k0.to_vec(),
+            write_val: Some(val0),
+            read_val: None,
+            invoke,
+            complete,
+        });
+
+        let k1 = keys[(round + 1) % 2];
+        let val1 = format!("el_c1_r{round}_{mask}_{seed}").into_bytes();
+        let invoke = next_seq();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cluster.must_put(k1, &val1)));
+        let complete = next_seq();
+        history.push(HistOp {
+            client: 1,
+            key: k1.to_vec(),
+            write_val: Some(val1),
+            read_val: None,
+            invoke,
+            complete,
+        });
+
+        for k in &keys {
+            let invoke = next_seq();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cluster.get(k)))
+                .ok()
+                .flatten();
+            let complete = next_seq();
+            history.push(HistOp {
+                client: 2,
+                key: k.to_vec(),
+                write_val: None,
+                read_val: Some(got),
+                invoke,
+                complete,
+            });
+        }
+    }
+
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let n_ops = history.len();
+    if let Some(cycle) = find_linearization_violation(&history) {
+        let detail: Vec<String> = cycle
+            .iter()
+            .map(|&i| {
+                let op = &history[i];
+                format!(
+                    "[{i}] client={} key={} {} invoke={} complete={}",
+                    op.client,
+                    String::from_utf8_lossy(&op.key),
+                    if op.is_write() {
+                        format!("write={:?}", String::from_utf8_lossy(op.write_val.as_ref().unwrap()))
+                    } else {
+                        format!("read={:?}", op.read_val.as_ref().unwrap().as_ref().map(|v| String::from_utf8_lossy(v).to_string()))
+                    },
+                    op.invoke,
+                    op.complete,
+                )
+            })
+            .collect();
+        panic!(
+            "LINEARIZATION VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} cycle:\n  {}",
+            mask,
+            fault_mask_name(mask),
+            detail.join("\n  ")
+        );
+    }
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+
+    n_ops
+}
+
+#[test]
+fn test_dst_elle_isolation_check() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_ELLE_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_ELLE_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
+    let n_seeds: usize = std::env::var("DST_ELLE_SEEDS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(2);
+
+    let mut passed = 0usize;
+    let mut total_ops = 0usize;
+    let mut failed_cells: Vec<(u32, u64)> = Vec::new();
+
+    for &mask in &masks {
+        for seed in 0..n_seeds as u64 {
+            let seed_val = seed.wrapping_add(0x4000 * mask as u64).wrapping_add(0xE11E);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_elle_isolation_cell(mask, seed_val)));
+            match result {
+                Ok(n_ops) => {
+                    passed += 1;
+                    total_ops += n_ops;
+                }
+                Err(_) => {
+                    failed_cells.push((mask, seed_val));
+                    eprintln!(
+                        "DST_ELLE FAIL mask=0b{:05b} ({}) seed={seed_val:#x}",
+                        mask, fault_mask_name(mask)
+                    );
+                    if std::env::var("DST_ELLE_REPLAY").is_ok() {
+                        panic!("elle isolation replay fail");
+                    }
+                }
+            }
+        }
+    }
+
+    let total = masks.len() * n_seeds;
+    eprintln!(
+        "DST_ELLE done: {passed}/{total} cells passed, {} failed, {total_ops} ops checked for linearization",
+        failed_cells.len()
+    );
+
+    if !failed_cells.is_empty() {
+        let hints: Vec<String> = failed_cells.iter().map(|(m, s)| format!("mask={m} seed={s:#x}")).collect();
+        eprintln!("Replay with: DST_ELLE_REPLAY=<mask>");
+        panic!(
+            "elle isolation check failed: {}/{total} cells. Replay hints: {}",
+            failed_cells.len(),
+            hints.join(", ")
+        );
+    }
+}
+
 // ─── Batch 12: multi-seed sweep + deep infrastructure tests ──────────
 
 /// MULTI-SEED MODEL SWEEP: Run the model-based property test across 10
