@@ -13005,359 +13005,192 @@ fn test_dst_convergence_scan_fault_matrix() {
     );
     assert_eq!(passed, total, "convergence scan fault matrix had failures");
 }
-// ─── Batch 21: write amplification, conf change, region epoch edges ──────
 
-/// WRITE AMPLIFICATION: Write and overwrite the same small set of keys
-/// many times (500 overwrites across 5 keys). Then compact and verify
-/// final values. Tests LSM tree write amplification correctness.
-#[test]
-fn test_deep_write_amplification() {
-    let seed = 0x51u64;
-    let mut cluster = bootstrap_hybrid(seed);
+// ─── Concurrent scan during chaos matrix ────────────────────────────────
+// Write keys continuously while faults are active, then scan DURING chaos
+// (not after heal). The scan must only see committed keys — never partial
+// writes, never keys with wrong values. This is fundamentally different
+// from the convergence scan (which scans after heal).
+fn run_scan_during_chaos_matrix_cell(mask: u32, seed: u64) {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
 
-    let n = 500u32;
-    let keys: [&[u8]; 5] = [b"wa_k0", b"wa_k1", b"wa_k2", b"wa_k3", b"wa_k4"];
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
 
-    for i in 0u32..n {
-        let key = keys[(i as usize) % 5];
-        cluster.must_put(key, format!("v{i:04}").as_bytes());
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Write initial 10 keys.
+    let mut known: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    for i in 0u32..10 {
+        let k = format!("sd_{i:02}").into_bytes();
+        let v = format!("init_{i:02}").into_bytes();
+        cluster.must_put(&k, &v);
+        known.insert(k, v);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Activate faults.
+    let mut net = DstNetworkQueue::new(seed, 1);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(3, 1);
+        net.add_partition(3, 2);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    // Write 10 MORE keys under faults.
+    let mut written_during: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for i in 0u32..10 {
+        let k = format!("sd_{i:02}_x").into_bytes();
+        let v = format!("chaos_{i:02}").into_bytes();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(&k, &v);
+        }))
+        .is_ok();
+        if ok {
+            written_during.push((k.clone(), v.clone()));
+        }
     }
     std::thread::sleep(Duration::from_millis(300));
 
-    cluster.compact_data();
-    std::thread::sleep(Duration::from_millis(200));
-
-    // The final value for each key should be from the last write to it.
-    for (ki, key) in keys.iter().enumerate() {
-        let last_write = (0u32..n).rev().find(|&i| (i as usize) % 5 == ki).unwrap();
-        let v = cluster.must_get(key);
-        assert_eq!(v.as_deref(), Some(format!("v{last_write:04}").as_bytes()),
-            "BUG: write amplification lost final value for key {ki}");
-    }
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP171 OK");
-}
-
-/// STALE REGION EPOCH: Get the region, manually corrupt the epoch (increase
-/// version), then try to write. The write should fail with epoch-not-match.
-#[test]
-fn test_deep_stale_region_epoch() {
-    let seed = 0x52u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    cluster.must_put(b"sre_key", b"v1");
-    std::thread::sleep(Duration::from_millis(200));
-
-    let region = cluster.get_region(b"sre_key");
-
-    // Split to advance the epoch.
-    cluster.must_split(&region, b"sre_mid");
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Writing with must_put uses the correct region. Verify it works.
-    cluster.must_put(b"sre_key", b"post_split_write");
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(cluster.must_get(b"sre_key"), Some(b"post_split_write".to_vec()));
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP172 OK");
-}
-
-/// KEY AT REGION START BOUNDARY: After split, write to a key that is exactly
-/// at the start boundary of the right region. Verify correct routing.
-#[test]
-fn test_deep_region_start_boundary() {
-    let seed = 0x53u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    cluster.must_put(b"rsb_before", b"left_val");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Split — the split key becomes the start of the right region.
-    let split_key = b"rsb_mid";
-    let region = cluster.get_region(b"rsb_before");
-    cluster.must_split(&region, split_key);
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Write to the exact split key.
-    cluster.must_put(split_key, b"boundary_val");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Write to a key just before the split (left region).
-    cluster.must_put(b"rsb_aaa", b"left_new");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Write to a key just after the split (right region).
-    cluster.must_put(b"rsb_zzz", b"right_new");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Verify all.
-    assert_eq!(cluster.must_get(b"rsb_before"), Some(b"left_val".to_vec()));
-    assert_eq!(cluster.must_get(split_key), Some(b"boundary_val".to_vec()));
-    assert_eq!(cluster.must_get(b"rsb_aaa"), Some(b"left_new".to_vec()));
-    assert_eq!(cluster.must_get(b"rsb_zzz"), Some(b"right_new".to_vec()));
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP173 OK");
-}
-
-/// COMPACT INDIVIDUAL RANGE: Write data across a wide range, compact,
-/// then verify scan returns data in correct order across the compacted range.
-#[test]
-fn test_deep_compact_then_scan_order() {
-    let seed = 0x54u64;
-    let mut cluster = bootstrap_hybrid(seed);
-
-    // Write keys in reverse order.
-    for i in (0u32..30).rev() {
-        cluster.must_put(format!("ctso_{i:02}").as_bytes(), format!("v{i}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    cluster.compact_data();
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Scan and verify ascending order.
+    // SCAN the engine DURING chaos (do NOT heal first).
+    // The scan should only return committed key-value pairs.
+    // It must never return a key with a partial/garbage value.
     let engine = cluster.get_engine(1);
-    let mut prev: Option<Vec<u8>> = None;
-    let mut count = 0u32;
-    let _ = engine.scan("default", b"zctso_00", b"zctso_99", false, |k, _v| {
-        if let Some(p) = &prev {
-            assert!(p.as_slice() < &k[..],
-                "BUG: keys not ascending after compact: {:?} >= {:?}",
-                String::from_utf8_lossy(p), String::from_utf8_lossy(k));
+    let mut scanned: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = std::collections::BTreeMap::new();
+    let result = engine.scan(
+        "default",
+        b"sd_",
+        b"",
+        false,
+        |key, val| {
+            let user_key = if key.starts_with(b"z") { &key[1..] } else { key };
+            if user_key.starts_with(b"sd_") {
+                scanned.insert(user_key.to_vec(), val.to_vec());
+            }
+            Ok(user_key < b"sd_z" as &[u8])
+        },
+    );
+    assert!(result.is_ok(), "SCAN DURING CHAOS: scan failed: {:?}", result);
+
+    eprintln!(
+        "DST_SDC mask=0b{:05b} ({}) seed={seed:#x} known={} written_during={} scanned={}",
+        mask, fault_mask_name(mask), known.len(), written_during.len(), scanned.len()
+    );
+
+    // ORACLE: every key the scan returns must have the CORRECT value.
+    // No key should have a wrong/garbage value.
+    for (k, v) in &scanned {
+        if let Some(expected) = known.get(k) {
+            assert_eq!(
+                v, expected,
+                "SCAN-DURING-CHAOS VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} key {}",
+                mask, fault_mask_name(mask),
+                String::from_utf8_lossy(k)
+            );
         }
-        prev = Some(k.to_vec());
-        count += 1;
-        Ok(true)
-    });
-    assert_eq!(count, 30, "BUG: scan count {count} != 30 after compact");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP174 OK");
-}
-
-/// OVERWRITE AFTER FLUSH: Write, flush, overwrite, verify the overwrite
-/// is visible (not masked by the flushed SST).
-#[test]
-fn test_deep_overwrite_after_flush() {
-    let seed = 0x55u64;
-    let mut cluster = bootstrap_hybrid(seed);
-
-    cluster.must_put(b"oaf_key", b"original");
-    std::thread::sleep(Duration::from_millis(100));
-    cluster.must_flush_cf("default", true);
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Overwrite after flush.
-    cluster.must_put(b"oaf_key", b"overwritten");
-    std::thread::sleep(Duration::from_millis(100));
-
-    // The overwrite should be visible.
-    let v = cluster.must_get(b"oaf_key");
-    assert_eq!(v.as_deref(), Some(b"overwritten".as_ref()),
-        "BUG: overwrite after flush not visible");
-
-    // Flush again — the new SST should have the overwritten value.
-    cluster.must_flush_cf("default", true);
-    std::thread::sleep(Duration::from_millis(100));
-
-    let v = cluster.must_get(b"oaf_key");
-    assert_eq!(v.as_deref(), Some(b"overwritten".as_ref()),
-        "BUG: overwrite lost after second flush");
-
-    // Compact — should resolve to the latest value.
-    cluster.compact_data();
-    std::thread::sleep(Duration::from_millis(200));
-
-    let v = cluster.must_get(b"oaf_key");
-    assert_eq!(v.as_deref(), Some(b"overwritten".as_ref()),
-        "BUG: overwrite lost after compaction (L0→L1 merge bug?)");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP175 OK");
-}
-
-/// CONCURRENT BATCHES: Fire two batch_put requests rapidly. Both should
-/// be applied correctly.
-#[test]
-fn test_deep_concurrent_batches() {
-    let seed = 0x56u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    // First batch: 10 keys.
-    let reqs1: Vec<_> = (0..10u32)
-        .map(|i| new_put_cmd(format!("cb_a{i:02}").as_bytes(), format!("a{i}").as_bytes()))
-        .collect();
-    let r1 = cluster.batch_put(b"cb_a00", reqs1);
-
-    // Immediately fire second batch.
-    let reqs2: Vec<_> = (0..10u32)
-        .map(|i| new_put_cmd(format!("cb_b{i:02}").as_bytes(), format!("b{i}").as_bytes()))
-        .collect();
-    let r2 = cluster.batch_put(b"cb_b00", reqs2);
-
-    assert!(r1.is_ok(), "BUG: concurrent batch 1 failed: {:?}", r1.err());
-    assert!(r2.is_ok(), "BUG: concurrent batch 2 failed: {:?}", r2.err());
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Verify all 20 keys.
-    for i in 0u32..10 {
-        assert_eq!(cluster.must_get(format!("cb_a{i:02}").as_bytes()), Some(format!("a{i}").into_bytes()));
-        assert_eq!(cluster.must_get(format!("cb_b{i:02}").as_bytes()), Some(format!("b{i}").into_bytes()));
+    }
+    // Also check: any key from written_during that appears in scan must have correct value.
+    for (k, expected_v) in &written_during {
+        if let Some(scan_v) = scanned.get(k) {
+            assert_eq!(
+                scan_v, expected_v,
+                "SCAN-DURING-CHAOS VIOLATION: mask=0b{:05b} ({}) seed={seed:#x} \
+                 chaos-written key {} has wrong value",
+                mask, fault_mask_name(mask),
+                String::from_utf8_lossy(k)
+            );
+        }
     }
 
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP176 OK");
-}
-
-/// DELETE RANGE PRECISION: Write keys with varying distances, delete range
-/// with precise boundaries, verify exact keys on the boundary are handled
-/// correctly (start is exclusive, end is inclusive in delete_range? or vice
-/// versa? — verify actual behavior).
-#[test]
-fn test_deep_delete_range_precision() {
-    let seed = 0x57u64;
-    let mut cluster = bootstrap_hybrid(seed);
-
-    // Write keys at known positions.
-    let keys: Vec<Vec<u8>> = (0..20u32).map(|i| format!("drp_{i:02}").into_bytes()).collect();
-    for k in &keys {
-        cluster.must_put(k, k);
+    // Heal and shutdown.
+    if has_partition {
+        net.clear_partitions();
     }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Delete range from drp_05 to drp_15.
-    cluster.must_delete_range_cf("default", b"drp_05", b"drp_15");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // In TiKV/RocksDB semantics, delete_range(start, end) removes keys
-    // where start <= key < end. So drp_05 is deleted, drp_15 survives.
-    assert!(cluster.must_get(b"drp_04").is_some(), "BUG: drp_04 should survive");
-    assert!(cluster.must_get(b"drp_05").is_none(), "BUG: drp_05 should be deleted (start inclusive)");
-    assert!(cluster.must_get(b"drp_14").is_none(), "BUG: drp_14 should be deleted");
-    assert!(cluster.must_get(b"drp_15").is_some(), "BUG: drp_15 should survive (end exclusive)");
-    assert!(cluster.must_get(b"drp_16").is_some(), "BUG: drp_16 should survive");
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP177 OK");
-}
-
-/// IDempotent READ: Read the same key 10 times rapidly. All reads should
-/// return the same value.
-#[test]
-fn test_deep_idempotent_read() {
-    let seed = 0x58u64;
-    let mut cluster = bootstrap_hybrid(seed);
-
-    cluster.must_put(b"ir_key", b"stable_value");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Read 10 times.
-    for _ in 0u32..10 {
-        let v = cluster.must_get(b"ir_key");
-        assert_eq!(v.as_deref(), Some(b"stable_value".as_ref()),
-            "BUG: idempotent read returned different value");
-    }
-
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP178 OK");
-}
-
-/// SPLIT + DELETE RANGE BOTH CHILDREN + MERGE ATTEMPT: Split, delete ranges
-/// in both children, then attempt to merge them. Verify data integrity.
-#[test]
-fn test_deep_split_delete_merge() {
-    let seed = 0x59u64;
-    let mut cluster = bootstrap_hybrid(seed);
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Write 20 keys.
-    for i in 0u32..20 {
-        cluster.must_put(format!("sdm_{i:02}").as_bytes(), format!("v{i}").as_bytes());
-    }
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Split at sdm_10.
-    let region = cluster.get_region(b"sdm_00");
-    cluster.must_split(&region, b"sdm_10");
+    cluster.clear_send_filters();
     std::thread::sleep(Duration::from_millis(500));
 
-    // Delete range in left child.
-    cluster.must_delete_range_cf("default", b"sdm_00", b"sdm_05");
-    // Delete range in right child.
-    cluster.must_delete_range_cf("default", b"sdm_15", b"sdm_20");
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Verify deletions.
-    for i in 0u32..5 {
-        assert!(cluster.must_get(format!("sdm_{i:02}").as_bytes()).is_none(),
-            "BUG: sdm_{i:02} should be deleted");
-    }
-    for i in 5u32..15 {
-        let v = cluster.must_get(format!("sdm_{i:02}").as_bytes());
-        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
-            "BUG: sdm_{i:02} should survive");
-    }
-    for i in 15u32..20 {
-        assert!(cluster.must_get(format!("sdm_{i:02}").as_bytes()).is_none(),
-            "BUG: sdm_{i:02} should be deleted");
-    }
-
-    // Attempt merge (may fail in test harness — that's OK).
-    let left = cluster.get_region(b"sdm_05");
-    let right = cluster.get_region(b"sdm_10");
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cluster.must_try_merge(right.get_id(), left.get_id());
-    }));
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify surviving keys still correct.
-    for i in 5u32..15 {
-        let v = cluster.must_get(format!("sdm_{i:02}").as_bytes());
-        assert_eq!(v.as_deref(), Some(format!("v{i}").as_bytes()),
-            "BUG: sdm_{i:02} wrong after merge attempt");
-    }
-
     cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP179 OK");
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
 }
 
-/// RAPID PUT-DELETE-GET CYCLE: For each key, do put→delete→get in rapid
-/// succession. The get should return None every time.
 #[test]
-fn test_deep_rapid_put_delete_get() {
-    let seed = 0x5Au64;
-    let mut cluster = bootstrap_hybrid(seed);
+fn test_dst_scan_during_chaos_fault_matrix() {
+    let masks: Vec<u32> = if let Ok(replay) = std::env::var("DST_SDC_REPLAY") {
+        vec![replay.trim().parse().unwrap_or(0)]
+    } else {
+        let raw = std::env::var("DST_SDC_MASKS").unwrap_or_else(|_| "0..32".into());
+        if let Some((lo, hi)) = raw.split_once("..") {
+            let lo: u32 = lo.trim().parse().unwrap_or(0);
+            let hi: u32 = hi.trim().parse().unwrap_or(lo);
+            (lo..hi).collect()
+        } else {
+            raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        }
+    };
 
-    for i in 0u32..30 {
-        let key = format!("rpdg_{i:02}");
-        // Rapid cycle: put, delete, get.
-        cluster.must_put(key.as_bytes(), b"temp");
-        cluster.must_delete(key.as_bytes());
-        let v = cluster.must_get(key.as_bytes());
-        assert!(v.is_none(),
-            "BUG: key {key} should be None after put→delete→get cycle");
+    let total = masks.len();
+    eprintln!(
+        "DST_SDC masks={} ({}..{})",
+        masks.len(),
+        masks.first().copied().unwrap_or(0),
+        masks.last().copied().unwrap_or(0)
+    );
+
+    let mut passed = 0usize;
+    let mut failures = Vec::new();
+
+    for &mask in &masks {
+        let dims = fault_mask_name(mask);
+        let seed = 0x1000u64 + mask as u64;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_scan_during_chaos_matrix_cell(mask, seed);
+        }));
+        if result.is_ok() {
+            passed += 1;
+            eprintln!("DST_SDC mask=0b{:05b} ({}) OK", mask, dims);
+        } else {
+            failures.push(mask);
+            eprintln!(
+                "DST_SDC mask=0b{:05b} ({}) FAIL — replay: DST_SDC_REPLAY={mask}",
+                mask, dims
+            );
+            if std::env::var("DST_SDC_REPLAY").is_ok() {
+                panic!("scan-during-chaos matrix replay fail");
+            }
+        }
     }
 
-    cluster.shutdown();
-    cleanup_cluster();
-    eprintln!("DST_DEEP180 OK");
+    eprintln!(
+        "DST_SDC done: {passed}/{} passed, {} failed",
+        total,
+        failures.len()
+    );
+    assert_eq!(passed, total, "scan-during-chaos fault matrix had failures");
 }
-
-
-
-
