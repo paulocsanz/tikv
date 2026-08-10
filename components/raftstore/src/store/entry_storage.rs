@@ -736,11 +736,25 @@ pub fn init_applied_term<ER: RaftEngine>(
 
     match raft_engine.get_entry(region.get_id(), apply_state.applied_index)? {
         Some(e) => Ok(e.term),
-        None => Err(box_err!(
-            "[region {}] entry at apply index {} doesn't exist, may lose data.",
-            region.get_id(),
-            apply_state.applied_index
-        )),
+        None => {
+            // The raft log entry at the applied index is entirely missing.
+            // This can happen when raft-log GC (`raftlog_gc.rs`) calls
+            // `kv.sync()` which lies (volatile write-back cache), and the
+            // worker truthfully deletes raft entries that a stale apply_state
+            // still references.  Instead of hard-erroring — which turns a
+            // single-node data-loss event into a permanent cluster outage —
+            // accept the loss and fall back to `apply_state.commit_term`.
+            // The Raft leader will replay missing entries via AppendEntries.
+            warn!(
+                "raft log entry at applied index is missing; \
+                 accepting loss and deferring to Raft leader for catch-up";
+                "region_id" => region.get_id(),
+                "applied_index" => apply_state.applied_index,
+                "last_index" => raft_state.get_last_index(),
+                "commit_index" => raft_state.get_hard_state().get_commit(),
+            );
+            Ok(apply_state.commit_term)
+        }
     }
 }
 
