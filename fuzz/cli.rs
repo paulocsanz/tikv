@@ -304,24 +304,42 @@ fn run_libfuzzer(target: &str) -> Result<()> {
     let seed_dir = get_seed_dir(target);
     let corpus_dir = create_corpus_dir(fuzzer.directory(), target)?;
 
-    #[cfg(target_os = "macos")]
+    // Host arch, not hardcoded x86_64 -- this used to always target
+    // x86_64-apple-darwin on macOS regardless of host arch, which fails to
+    // even compile a dependency graph on Apple Silicon (no x86_64-apple-darwin
+    // target installed by default; running under Rosetta isn't the fix
+    // either since it's a cross-compile, not an emulated-binary problem).
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     let target_platform = "x86_64-apple-darwin";
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let target_platform = "aarch64-apple-darwin";
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let target_platform = "x86_64-unknown-linux-gnu";
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    panic!("libfuzzer-sys only supports Linux and macOS");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let target_platform = "aarch64-unknown-linux-gnu";
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+    )))]
+    panic!("libfuzzer-sys only supports Linux and macOS on x86_64/aarch64");
 
     // FIXME: The -C codegen-units=1 and -C incremental=..
     // below seem to workaround some difficult issues in Rust nightly
     // https://github.com/rust-lang/rust/issues/53945.
     // If this is ever fixed remember to remove the fuzz-incremental
     // entry from .gitignore.
+    //
+    // `sancov` (legacy LLVM pass manager) was renamed `sancov-module` under
+    // the new pass manager current nightly toolchains use -- the old name
+    // fails with "unknown pass name 'sancov'".
     let mut rust_flags = env::var("RUSTFLAGS").unwrap_or_default();
     rust_flags.push_str(
         "--cfg fuzzing \
          -C codegen-units=1 \
          -C incremental=fuzz-incremental \
-         -C passes=sancov \
+         -C passes=sancov-module \
          -C llvm-args=-sanitizer-coverage-level=4 \
          -C llvm-args=-sanitizer-coverage-trace-compares \
          -C llvm-args=-sanitizer-coverage-inline-8bit-counters \

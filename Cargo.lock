@@ -3042,6 +3042,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "byteorder",
+ "test_raftstore",
  "tidb_query_datatype",
  "tikv_util",
 ]
