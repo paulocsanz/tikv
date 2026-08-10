@@ -4126,6 +4126,185 @@ fn test_dst_buggified_matrix() {
     }
 }
 
+// ─── Bit-exact replay audit: comprehensive execution fingerprint ──────
+//
+// Adversarially checks App-DST's core premise (same seed => same execution)
+// under real faults + the real hybrid-clock driver thread + real OS-thread
+// batch-system polling, not just "same final state." Mirrors
+// `run_buggified_matrix_cell` exactly (same setup, same fault wiring, same
+// safety oracle) but additionally captures and hashes an ordered raft
+// message delivery log (`DstNetworkQueue::delivery_log` -- already-existing
+// infra, no parallel logging mechanism), leader identity, per-store
+// applied-index checkpoints, and final KV+region state, each hashed
+// separately (FNV-1a, same construction as this file's existing
+// `salt_hash`) so a divergence across runs can be localized to one layer
+// instead of only detected as "final state differs."
+//
+// Intended use: run the SAME seed N times as SEPARATE OS processes (not an
+// in-process loop -- process-level rerun is what exposes OS-scheduler-level
+// nondeterminism: ASLR, real thread scheduling, page cache state) and diff
+// the printed DST_FP_*_HASH / DST_FP_MSGLOG lines. See
+// tikv-dst/findings/app-dst-bitexact-replay-audit-2026-08-10.md for the
+// audit this was built for, results, and methodology.
+//
+//   DST_FP_SEED=0x424954455841435 DST_FP_MASK=31 DST_FP_BUGGIFY_PCT=5 \
+//     cargo test -p tests --features "dst,testexport" --test dst_raftstore \
+//     test_dst_bitexact_replay_fingerprint -- --exact --nocapture
+
+/// FNV-1a 64-bit -- self-contained, no new crate dep, matches the FNV
+/// offset-basis/prime already inlined in `salt_hash` above.
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn run_fingerprinted_matrix_cell(mask: u32, seed: u64, buggify_pct: u32) -> String {
+    tikv_util::dst_init::dst_init(seed);
+    time::dst_set_manual_only(false);
+    time::dst_start_hybrid_driver(Duration::from_millis(1));
+    batch_system::set_manual_drive(false);
+
+    let mut cluster = new_node_cluster(seed, 3);
+    dst_setup_cluster(&mut cluster);
+    test_raftstore::configure_for_lease_read(&mut cluster.cfg, Some(50), Some(10));
+    cluster.run();
+
+    assert!(wait_leader(&mut cluster, 100));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cluster.must_transfer_leader(1, new_peer(1, 1));
+    }));
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let leader = cluster.leader_of_region(1);
+    let leader_trace = format!(
+        "leader_id={} leader_store={}",
+        leader.as_ref().map(|p| p.get_id()).unwrap_or(0),
+        leader.as_ref().map(|p| p.get_store_id()).unwrap_or(0)
+    );
+
+    let mut net = DstNetworkQueue::new(seed, 1).with_buggify(buggify_pct);
+    if mask & 1 != 0 {
+        net = net.with_reorder(test_raftstore::ReorderMode::Adversarial(seed));
+    }
+    if mask & 2 != 0 {
+        net = net.with_dup_rate(15);
+    }
+    if mask & 4 != 0 {
+        net = net.with_drop_rate(10);
+    }
+    if mask & 8 != 0 {
+        net = net.with_max_delay(2);
+    }
+    let has_partition = mask & 16 != 0;
+    if has_partition {
+        net.add_partition(2, 1);
+        net.add_partition(2, 3);
+    }
+    cluster.add_send_filter(CloneFilterFactory(net.clone()));
+    net.clear_log();
+
+    let mut applied_trace: Vec<String> = Vec::new();
+    let keys: [&[u8]; 3] = [b"bg_1", b"bg_2", b"bg_3"];
+    for (i, k) in keys.iter().enumerate() {
+        let val = format!("bgv_{mask}_{seed}_{i}");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cluster.must_put(*k, val.as_bytes());
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+        for store in [1u64, 2, 3] {
+            let idx = cluster.apply_state(1, store).applied_index;
+            applied_trace.push(format!("put{i}:store{store}={idx}"));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    if has_partition {
+        net.clear_partitions();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    cluster.clear_send_filters();
+    std::thread::sleep(Duration::from_millis(400));
+
+    for store in [1u64, 2, 3] {
+        let idx = cluster.apply_state(1, store).applied_index;
+        applied_trace.push(format!("final:store{store}={idx}"));
+    }
+
+    let stable = rich_fingerprint_stable(&mut cluster, &keys);
+    for (i, k) in keys.iter().enumerate() {
+        let expected = format!("{}=bgv_{mask}_{seed}_{i}", String::from_utf8_lossy(k));
+        assert!(
+            stable.contains(&expected),
+            "BIT-EXACT REPLAY AUDIT: safety violated mask=0b{:05b} seed={seed:#x} key {} missing: {stable}",
+            mask,
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    let msglog = net.delivery_log().join("|");
+    let msglog_len = net.delivery_log().len();
+    let applied_str = applied_trace.join(",");
+
+    let leader_hash = fnv1a64(&leader_trace);
+    let msglog_hash = fnv1a64(&msglog);
+    let applied_hash = fnv1a64(&applied_str);
+    let final_hash = fnv1a64(&stable);
+    let combined_hash = fnv1a64(&format!(
+        "{leader_hash:016x}|{msglog_hash:016x}|{applied_hash:016x}|{final_hash:016x}"
+    ));
+
+    cluster.shutdown();
+    batch_system::set_manual_drive(false);
+    time::dst_set_manual_only(false);
+    sterilize_dst_process();
+
+    format!(
+        "DST_FP_SEED={seed:#x} DST_FP_MASK={mask} DST_FP_BUGGIFY_PCT={buggify_pct}\n\
+         DST_FP_LEADER_HASH={leader_hash:016x}\n\
+         DST_FP_MSGLOG_HASH={msglog_hash:016x}\n\
+         DST_FP_MSGLOG_LEN={msglog_len}\n\
+         DST_FP_APPLIED_HASH={applied_hash:016x}\n\
+         DST_FP_FINAL_HASH={final_hash:016x}\n\
+         DST_FP_COMBINED_HASH={combined_hash:016x}\n\
+         DST_FP_LEADER={leader_trace}\n\
+         DST_FP_APPLIED={applied_str}\n\
+         DST_FP_FINAL={stable}\n\
+         DST_FP_MSGLOG={msglog}"
+    )
+}
+
+#[test]
+fn test_dst_bitexact_replay_fingerprint() {
+    let seed: u64 = std::env::var("DST_FP_SEED")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim();
+            if let Some(hex) = s.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse().ok()
+            }
+        })
+        .unwrap_or(0x424954_4558_4143_54u64); // "BITEXACT" ascii-ish tag, arbitrary fixed default
+    let mask: u32 = std::env::var("DST_FP_MASK")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(31); // all 5 fault dims on by default: max adversarial pressure
+    let buggify_pct: u32 = std::env::var("DST_FP_BUGGIFY_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(5);
+
+    let out = run_fingerprinted_matrix_cell(mask, seed, buggify_pct);
+    println!("{out}");
+}
+
 // ─── Deep fault batch 3: edge-case safety oracles ────────────────────
 
 /// Transfer leadership to a lagging follower (node 3), which is behind
